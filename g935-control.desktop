@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=G935 Control
+Comment=Sidetone, EQ and lighting control for the Logitech G935
+# Assumes install to ~/.local/bin (in PATH on most distros); else use an absolute path:
+Exec=g935-control.py
+Icon=audio-headset
+Terminal=false
+Categories=AudioVideo;Audio;Settings;
+StartupNotify=false
+StartupWMClass=g935-control

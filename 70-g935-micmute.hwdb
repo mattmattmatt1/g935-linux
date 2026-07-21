@@ -1,0 +1,11 @@
+# Stop the desktop from reacting to the G935's mic-mute button (KEY_MICMUTE).
+# The headset already handles its own mute; the desktop's toggle of the host
+# capture switch fights it (out-of-phase "press twice to unmute" symptom).
+# HID usage: telephony page 0x0b, Phone Mute 0x2f -> scancode b002f.
+#
+# Install:
+#   sudo cp 70-g935-micmute.hwdb /etc/udev/hwdb.d/
+#   sudo systemd-hwdb update
+#   sudo udevadm trigger --sysname-match="event*"
+evdev:input:b0003v046Dp0A87*
+ KEYBOARD_KEY_b002f=reserved

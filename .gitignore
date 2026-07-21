@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.claude/
+*.log
+shot.png
+
+# local files — not shipped
+notes/

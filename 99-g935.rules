@@ -1,0 +1,7 @@
+# Logitech G935 wireless receiver: let the logged-in user talk HID++ over hidraw.
+# Install:  sudo cp 99-g935.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger
+# then unplug/replug the receiver (or reboot).
+ACTION!="add|change", GOTO="g935_end"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0a87", TAG+="uaccess"
+LABEL="g935_end"

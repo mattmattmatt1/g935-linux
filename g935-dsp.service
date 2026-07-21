@@ -1,0 +1,11 @@
+[Unit]
+Description=G935 DSP soundstage auto-enable (re-sends 11ff052b01 on headset power-on)
+
+[Service]
+# Install: cp g935-dspd.py ~/.local/bin/  (or adjust the path below)
+ExecStart=/usr/bin/python3 %h/.local/bin/g935-dspd.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
