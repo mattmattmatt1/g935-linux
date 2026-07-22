@@ -24,6 +24,8 @@ Full control of the Logitech G935 wireless headset over raw HID
 
 ![Settings: device visibility and volumes](screenshots/settings.png)
 
+![Battery Health: live remaining, expect-vs-actual graphs](screenshots/battery.png)
+
 ## ⚠️ Tested on exactly one setup
 
 This has only been tested on:
