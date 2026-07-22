@@ -3,6 +3,8 @@ __pycache__/
 .claude/
 *.log
 shot.png
+.pytest_cache/
+*.egg-info/
 
-# local files — not shipped
+# local research notes / captures — not shipped
 notes/

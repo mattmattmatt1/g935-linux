@@ -2,46 +2,57 @@
 """
 g935-control.py - GTK control panel for the Logitech G935 (HID++ over hidraw).
 
-Feature map (enumerated from the headset's own IFeatureSet, 2026-07-20):
+Feature map (from the headset IFeatureSet, 2026-07-20):
   idx 04 = 0x8070 COLOR_LED_EFFECTS   2 zones: 0=logo, 1=front strip
-  idx 05 = 0x8010 G-KEYS / "G HUB MODE"  052b 01/00. getCount (050b) = 3 = the G-keys.
-           Enabling software mode ALSO switches the headset globally into "G HUB
-           connected" behavior: the DSP soundstage turns on AND mic handling moves
-           from firmware to host. Write-only state; confirmed by listening bisection.
-  idx 06 = 0x8310 EQUALIZER           10 bands 32Hz-16kHz, +/-12 dB, on-device
+  idx 05 = 0x8010 G-KEYS / "G HUB MODE"  052b 01/00
+  idx 06 = 0x8310 EQUALIZER           10 bands 32Hz-16kHz, +/-12 dB
   idx 07 = 0x8300 SIDETONE            0-100
-  idx 08 = 0x1f20 ADC/BATTERY         voltage mV + flags (bit0=valid, bit1=charging)
+  idx 08 = 0x1f20 ADC/BATTERY         voltage mV + flags
 
-Mic behavior by mode (mapped live 2026-07-20 - three mute layers exist):
-  hardware mode (052b00): boom up = mute, boom down = unmute, button toggles.
-      All on-device, no reports to host. Flat/stock sound. Everything just works.
-  G HUB mode (052b01): boom up sets a device mute flag AND emits report 0810;
-      boom down only emits 0820 - the flag stays set (G HUB-style software is
-      expected to deal with it; a fast USB-audio SET_CUR MUTE pulse does NOT
-      clear it, nor does a mode flip). The mic button clears the flag and emits 0801
-      (declared telephony Phone Mute -> kernel KEY_MICMUTE -> the desktop
-      toggles host mute out of phase => unmuting needs TWO presses).
-  Host mute layer: ALSA 'Mic Capture Switch' numid=3 on card "Headset"
-      (= UAC SET_CUR MUTE on feature unit 3). Device LED/sidetone reflect
-      device-flag OR host-mute.
+Mode is persisted in ~/.config/g935/mode ("ghub"/"hardware"). While g935-dspd
+is running it owns power-on DSP enable and boom-mic handling; the GUI drives
+EQ, lighting, sidetone, and the mode toggle. Default mode is hardware (stock)
+until the user opts in.
 
-Mode is persisted in ~/.config/g935/mode ("ghub"/"hardware"); g935-dspd reads it
-on headset power-on so the chosen mode survives power cycles.
-
-G HUB mode on/off:                    11 ff 05 2b <01|00>
-Set-EQ format (verified by readback): 11 ff 06 3b 02 <10 signed dB bytes>
-Sidetone:                             11 ff 07 1b <0-100>
-Lighting fixed:                       11 ff 04 3b <zone> 01 <r g b> 02
-Lighting breathing:                   11 ff 04 3b <zone> 02 <r g b> <period16> 00 <brt>
-Lighting off:                         11 ff 04 3b <zone> 00
-
-Needs r/w on the hidraw node (logind ACL usually grants it). Run: python3 g935-control.py
+Needs r/w on the hidraw node. Run: python3 g935-control.py
 """
-import os, glob, json, queue, re, select, shutil, statistics, subprocess, threading, time, fcntl
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+# Allow `python3 g935-control.py` from a git checkout without install.
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk, Gio, Pango
+
+from g935.battery import (
+    HEALTH_DEFAULTS, HealthTracker, batt_percent, batt_state,
+    merge_discharge_sessions, session_full_runtime_h,
+)
+from g935.charts import (
+    ChargeHistoryChart, DrainProfileChart, ExpectActualChart,
+    HealthGaugeChart, SessionRuntimeChart,
+    build_expected_overlay, build_history_points,
+)
+from g935.daemon_status import daemon_running
+from g935.hidpp import ERROR_CODES, HidWorker, find_headset, open_hidraw
+from g935.mic import (
+    BOOM_UP, BOOM_DOWN, BUTTON, read_boom, read_host_mic_switch, set_host_mic_switch,
+)
+from g935.mode import load_mode, save_mode
+from g935.paths import config_dir, ensure_config_dir, runtime_dir
 
 # Ubuntu/Debian/Fedora ship the Ayatana fork; some distros still ship the
 # original namespace. Either works; without both we run windowed only.
@@ -54,10 +65,9 @@ for _ns in ("AyatanaAppIndicator3", "AppIndicator3"):
     except (ValueError, ImportError, AttributeError):
         continue
 
+
 def sni_watcher_present():
-    """True if a StatusNotifier tray host is on the session bus. Without one
-    (e.g. stock GNOME, no extension) an indicator would silently render
-    nowhere - and close-to-tray would strand the window."""
+    """True if a StatusNotifier tray host is on the session bus."""
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         res = bus.call_sync(
@@ -69,16 +79,12 @@ def sni_watcher_present():
     except Exception:
         return False
 
-# On Wayland the taskbar icon comes from matching the window's app-id against a
+
+# On Wayland the taskbar icon comes from matching the window\'s app-id against a
 # .desktop file name — so the program name must equal "g935-control" (.desktop).
 GLib.set_prgname("g935-control")
 
-HID_ID_RE = re.compile(r"HID_ID=0003:0000046D:0000([0-9A-Fa-f]{4})")
-HIDPP_PAGE = b"\x06\x43\xff"   # usage page 0xFF43 (HID++) in the report descriptor
-
-# HID++ 2.0 features this app knows how to drive. Indices are discovered live
-# from the device at startup (IRoot getFeature, IFeatureSet fallback) - only
-# the 16-bit feature IDs are universal across Logitech devices.
+# HID++ 2.0 features this app knows how to drive. Indices are discovered live.
 FEATURES = [
     ("devinfo",  0x0003),
     ("gkeys",    0x8010),   # + the G935 "G HUB mode" side effect
@@ -88,78 +94,27 @@ FEATURES = [
     ("battery",  0x1f20),
 ]
 
-MODE_FILE = os.path.expanduser("~/.config/g935/mode")
-UI_FILE = os.path.expanduser("~/.config/g935/ui.json")
+UI_FILE = os.path.join(config_dir(), "ui.json")
 ALSA_USBID = "046d:0a87"    # reassigned from the device profile in main()
 MIC_SWITCH_NAME = "Mic Capture Switch"
 
-def find_alsa_card():
-    """ALSA card index whose USB id matches the headset, or None. Addressing
-    the card by index and the control by name survives enumeration order —
-    numids shift across kernels and the literal card id 'Headset' collides
-    with any other USB headset present."""
-    for p in glob.glob("/proc/asound/card*/usbid"):
-        try:
-            if open(p).read().strip().lower() == ALSA_USBID:
-                return os.path.basename(os.path.dirname(p))[4:]
-        except OSError:
-            continue
-    return None
 
-def load_mode():
-    try:
-        return open(MODE_FILE).read().strip() or "ghub"
-    except OSError:
-        return "ghub"
+def _read_host_mic():
+    return read_host_mic_switch(ALSA_USBID, MIC_SWITCH_NAME)
 
-def save_mode(mode):
-    os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
-    open(MODE_FILE, "w").write(mode + "\n")
 
-def read_host_mic_switch():
-    """True = capture on (mic live host-side), False = host-muted, None = unknown."""
-    card = find_alsa_card()
-    if card is None:
-        return None
-    try:
-        out = subprocess.run(["amixer", "-c", card, "cget",
-                              "name=" + MIC_SWITCH_NAME],
-                             capture_output=True, text=True,
-                             env={**os.environ, "LC_ALL": "C"}).stdout
-    except FileNotFoundError:
-        return None
-    for line in out.splitlines():
-        if ": values=" in line:
-            return line.strip().endswith("=on")
-    return None
+def _set_host_mic(on):
+    set_host_mic_switch(on, ALSA_USBID, MIC_SWITCH_NAME)
 
-def set_host_mic_switch(on):
-    card = find_alsa_card()
-    if card is None:
-        return
-    try:
-        subprocess.run(["amixer", "-q", "-c", card, "cset",
-                        "name=" + MIC_SWITCH_NAME, "on" if on else "off"],
-                       check=False, env={**os.environ, "LC_ALL": "C"})
-    except FileNotFoundError:
-        pass
-
-ERROR_CODES = {
-    0x01: "unknown", 0x02: "invalid argument", 0x03: "out of range",
-    0x04: "hardware error", 0x05: "not allowed", 0x06: "invalid feature index",
-    0x07: "invalid function", 0x08: "busy", 0x09: "unsupported",
-}
 
 EQ_BANDS = ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
 EQ_PRESETS = {
     "Flat":          [0] * 10,
-    "G HUB baseline": [0, 0, 0, -1, 3, 4, 3, 3, 1, 0],   # curve found on-device
+    "G HUB baseline": [0, 0, 0, -1, 3, 4, 3, 3, 1, 0],
     "Bass boost":    [6, 5, 3, 1, 0, 0, 0, 0, 0, 0],
     "V-shape":       [4, 3, 1, -1, -2, -2, -1, 2, 4, 5],
 }
 
-# G HUB's connect-time burst as (feature_attr, function, params) - rendered
-# through the discovered feature indices (verified working order)
 G935_CONNECT_BURST = [
     ("devinfo", 1, ""), ("battery", 0, ""), ("lighting", 0, ""),
     ("lighting", 1, "00"),
@@ -174,197 +129,12 @@ G935_CONNECT_BURST = [
     ("lighting", 4, "0001"), ("battery", 1, ""), ("eq", 2, ""),
 ]
 
-BATT_CURVE = [(4200, 100), (4060, 90), (3980, 80), (3920, 70), (3870, 60),
-              (3820, 50), (3790, 40), (3760, 30), (3730, 20), (3670, 10),
-              (3500, 0)]
-
-def batt_state(flags):
-    """(text, charging?) from the flags byte of the 0x1f20 battery reply.
-
-    Standard 0x1f20 ADC_MEASUREMENT mapping: bit0 = measurement valid,
-    bit1 = charging. Observed live: flags 0x03 on the charger
-    (at 3874 mV and 4145 mV alike), 0x01 idle. The old bit7 test could never
-    fire, so the panel was stuck on "discharging". charging is None when bit0
-    says the reading is invalid (don't trust the mV either)."""
-    if not flags & 0x01:
-        return ("unknown", None)
-    return ("charging", True) if flags & 0x02 else ("discharging", False)
-
-def batt_percent(mv):
-    if mv >= BATT_CURVE[0][0]: return 100
-    if mv <= BATT_CURVE[-1][0]: return 0
-    for (v1, p1), (v2, p2) in zip(BATT_CURVE, BATT_CURVE[1:]):
-        if v2 <= mv <= v1:
-            return round(p2 + (p1 - p2) * (mv - v2) / (v1 - v2))
-    return 0
-
-# ---------- battery health tracking ----------
-# Only voltage + charging flag exist (no coulomb counter), so health is an
-# honest extrapolation: observed %/hour over discharge sessions -> projected
-# full-to-empty runtime, compared against the rated runtime spec.
-HEALTH_FILE = os.path.expanduser("~/.config/g935/health.json")
-HEALTH_DEFAULTS = {
-    "tracking": True,
-    "design_capacity_mah": 1100,       # stock cell 533-000132; aftermarket claim up to 2500
-    "rated_runtime_h_rgb_on": 8.0,     # Logitech spec, default RGB lighting, 50% vol
-    "rated_runtime_h_rgb_off": 12.0,   # lighting off, 50% vol
-    "full_mv": 4200,
-    "empty_mv": 3500,
-    "runtime_profile": "rgb_on",
-}
-SEG_GAP_S = 30        # a poll hole this big (headset off / suspend) closes the segment
-SEG_DEBOUNCE = 2      # consecutive samples needed to believe a charging-flag flip
-SEG_MIN_HOURS = 0.5   # discharge segments shorter/flatter than this are context,
-SEG_MIN_PCT = 10      # ...not evidence
-RECENT_DECIM_S = 60
-RECENT_MAX = 1440     # ~24 h of 1/min samples
-SEG_MAX = 200
-PEAKS_MAX = 50
-SAVE_EVERY_S = 300
-
-def segment_rate(seg):
-    """%/hour for a quality-gated discharge segment, else None."""
-    if seg["type"] != "discharge":
-        return None
-    dt_h = (seg["t_end"] - seg["t_start"]) / 3600.0
-    dpct = seg["pct_start"] - seg["pct_end"]
-    if dt_h < SEG_MIN_HOURS or dpct < SEG_MIN_PCT:
-        return None
-    return dpct / dt_h
-
-def projected_runtime_h(seg):
-    r = segment_rate(seg)
-    return (100.0 / r) if r else None
-
-def health_estimate(segments, rated_runtime_h, n_recent=8):
-    """(health% capped at 120, segments used) or (None, 0). Median of the last
-    n_recent usable discharge sessions' projected runtimes vs the spec."""
-    runtimes = [h for h in (projected_runtime_h(s) for s in segments) if h]
-    if not runtimes:
-        return None, 0
-    used = runtimes[-n_recent:]
-    med = statistics.median(used)
-    return min(120.0, 100.0 * med / rated_runtime_h), len(used)
-
-
-class HealthTracker:
-    """Charge/discharge session recorder fed one sample per battery poll.
-    Everything runs on the GLib main loop, so no locking. Segments close on
-    debounced charging-flag flips, sample gaps, headset-off, or tracking-off."""
-
-    def __init__(self):
-        data = self._load()
-        self.settings = data["settings"]
-        self.segments = data["segments"]
-        self.peaks = data["peak_charge_mv"]
-        self.recent = data["recent"]
-        self.cur = None
-        self.cur_mvs = []
-        self.pending_flip = 0
-        self.last_t = 0
-        self.last_recent_t = 0
-        self.last_save = time.time()
-        self.dirty = False
-
-    def add_sample(self, t, mv, charging):
-        if not self.settings["tracking"]:
-            return
-        if self.last_t and t - self.last_t > SEG_GAP_S:
-            self.close_segment("gap")
-        self.last_t = t
-        seg_type = "charge" if charging else "discharge"
-
-        if self.cur is None:
-            self._open(seg_type, t, mv)
-        elif seg_type != self.cur["type"]:
-            self.pending_flip += 1
-            if self.pending_flip >= SEG_DEBOUNCE:
-                self.close_segment("flag flip")
-                self._open(seg_type, t, mv)
-        else:
-            self.pending_flip = 0
-
-        # endpoint smoothing: the ADC wobbles ~±10 mV
-        self.cur_mvs = (self.cur_mvs + [mv])[-5:]
-        smoothed = int(statistics.median(self.cur_mvs))
-        self.cur["t_end"] = int(t)
-        self.cur["mv_end"] = smoothed
-        self.cur["pct_end"] = batt_percent(smoothed)
-        self.cur["samples"] += 1
-        if self.cur["type"] == "charge":
-            self.cur["mv_peak"] = max(self.cur.get("mv_peak") or 0, mv)
-
-        if t - self.last_recent_t >= RECENT_DECIM_S:
-            self.recent.append([int(t), mv, 1 if charging else 0])
-            del self.recent[:-RECENT_MAX]
-            self.last_recent_t = t
-            self.dirty = True
-        if self.dirty and t - self.last_save > SAVE_EVERY_S:
-            self.save()
-
-    def _open(self, seg_type, t, mv):
-        self.cur = {"type": seg_type, "t_start": int(t), "t_end": int(t),
-                    "mv_start": mv, "mv_end": mv,
-                    "pct_start": batt_percent(mv), "pct_end": batt_percent(mv),
-                    "samples": 1, "mv_peak": mv if seg_type == "charge" else None}
-        self.cur_mvs = [mv]
-        self.pending_flip = 0
-
-    def close_segment(self, reason):
-        if self.cur is None:
-            return
-        seg, self.cur, self.cur_mvs = self.cur, None, []
-        self.pending_flip = 0
-        seg["reason"] = reason
-        if seg["samples"] >= 3:   # ignore blips
-            if seg["type"] == "charge" and seg["mv_peak"]:
-                self.peaks.append([seg["t_end"], seg["mv_peak"]])
-                del self.peaks[:-PEAKS_MAX]
-            self.segments.append(seg)
-            del self.segments[:-SEG_MAX]
-        self.save()
-
-    def mark_offline(self):
-        """Battery poll went unanswered - headset off. Close what was open."""
-        self.close_segment("headset off")
-        self.last_t = 0
-
-    def save(self):
-        os.makedirs(os.path.dirname(HEALTH_FILE), exist_ok=True)
-        data = {"version": 1, "settings": self.settings, "segments": self.segments,
-                "peak_charge_mv": self.peaks, "recent": self.recent}
-        tmp = HEALTH_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, HEALTH_FILE)
-        self.last_save = time.time()
-        self.dirty = False
-
-    @staticmethod
-    def _load():
-        try:
-            with open(HEALTH_FILE) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            data = {}
-        return {
-            "settings": {**HEALTH_DEFAULTS, **data.get("settings", {})},
-            "segments": data.get("segments", []),
-            "peak_charge_mv": data.get("peak_charge_mv", []),
-            "recent": data.get("recent", []),
-        }
-
-
 # ---------- device profiles ----------
-# Model-specific data keyed by the receiver's USB PID. Anything not listed here
-# runs on GENERIC_PROFILE: features are discovered live, zone/band counts are
-# queried from the device, and G935-only quirks (boom mic, connect burst,
-# brightness magic bytes) are simply skipped.
 DEVICE_PROFILES = {
     0x0A87: {
         "name": "G935",
         "zones": ["Logo", "Strip"],
-        "zone_brt": {0: 0x08, 1: 0x07},   # trailing byte G HUB sends per zone
+        "zone_brt": {0: 0x08, 1: 0x07},
         "eq_bands": EQ_BANDS,
         "eq_presets": EQ_PRESETS,
         "health_defaults": HEALTH_DEFAULTS,
@@ -375,38 +145,17 @@ DEVICE_PROFILES = {
     },
 }
 GENERIC_PROFILE = {
-    "name": None,            # falls back to uevent HID_NAME
-    "zones": None,           # discovered from 0x8070 getInfo, else 1 zone
+    "name": None,
+    "zones": None,
     "zone_brt": {},
-    "eq_bands": None,        # discovered from 0x8310 getInfo, else EQ hidden
-    "eq_presets": {"Flat": None},   # None = all-zeros at whatever band count
+    "eq_bands": None,
+    "eq_presets": {"Flat": None},
     "health_defaults": HEALTH_DEFAULTS,
     "has_boom_mic": False,
     "alsa_usbid": None,
     "mic_switch_name": None,
     "connect_burst": [],
 }
-
-
-def find_headset():
-    """First Logitech hidraw whose report descriptor carries the HID++ vendor
-    usage page (0xFF43). Known-profile PIDs win over unknown Logitech devices.
-    Returns (path, pid, hid_name) or None."""
-    cands = []
-    for d in glob.glob("/sys/class/hidraw/hidraw*"):
-        try:
-            uevent = open(os.path.join(d, "device", "uevent")).read()
-            rdesc = open(os.path.join(d, "device", "report_descriptor"), "rb").read()
-        except OSError:
-            continue
-        m = HID_ID_RE.search(uevent)
-        if not m or HIDPP_PAGE not in rdesc:
-            continue
-        nm = re.search(r"HID_NAME=(.*)", uevent)
-        name = nm.group(1).strip() if nm else "Logitech headset"
-        cands.append(("/dev/" + os.path.basename(d), int(m.group(1), 16), name))
-    cands.sort(key=lambda c: c[1] not in DEVICE_PROFILES)
-    return cands[0] if cands else None
 
 
 UI_DEFAULTS = {"hidden_sinks": [], "hidden_sources": [], "lighting": {}}
@@ -424,7 +173,7 @@ class AppSettings:
         self.data = {**UI_DEFAULTS, **{k: data[k] for k in UI_DEFAULTS if k in data}}
 
     def save(self):
-        os.makedirs(os.path.dirname(UI_FILE), exist_ok=True)
+        ensure_config_dir()
         tmp = UI_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"version": 1, **self.data}, f)
@@ -532,126 +281,6 @@ class AudioControl:
                 pass
 
 
-MIC_REPORT = 0x08
-# Measured 2026-07-21 with nothing managing the mute: boom up reads 0x11 and the
-# headset mutes itself, boom down reads 0x21.
-BOOM_UP, BOOM_DOWN, BUTTON = 0x10, 0x20, 0x01
-
-def hidiocginput(length):
-    """_IOC(_IOC_READ|_IOC_WRITE, 'H', 0x0A, length)"""
-    return (3 << 30) | (length << 16) | (ord("H") << 8) | 0x0A
-
-def read_boom(fd):
-    """Where the boom is right now, straight from the headset: True=down,
-    False=up. The 0x08 event stream can't be trusted for this - a host mute
-    write echoes back as an identical-looking report - but this never lies."""
-    buf = bytearray(2)
-    buf[0] = MIC_REPORT
-    try:
-        fcntl.ioctl(fd, hidiocginput(len(buf)), buf, True)
-    except OSError:
-        return None
-    if buf[1] & BOOM_DOWN:
-        return True
-    if buf[1] & BOOM_UP:
-        return False
-    return None
-
-
-class HidWorker(threading.Thread):
-    """Serializes all hidraw I/O on one thread; results come back via GLib.idle_add."""
-    daemon = True
-    MIC_POLL_S = 0.25
-
-    def __init__(self, path, log_cb, mic_cb=None, boom_cb=None, poll_boom=True):
-        super().__init__()
-        self.path = path
-        self.log_cb = log_cb
-        self.mic_cb = mic_cb
-        self.boom_cb = boom_cb
-        self.poll_boom = poll_boom
-        self.q = queue.Queue()
-        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-        self._boom = None
-
-    def submit(self, hx, done_cb=None):
-        self.q.put((hx.replace(" ", "").lower(), done_cb))
-
-    def run(self):
-        while True:
-            try:
-                hx, done_cb = self.q.get(timeout=self.MIC_POLL_S)
-            except queue.Empty:
-                self._drain()
-            else:
-                status, reply = self._transact(hx)
-                GLib.idle_add(self.log_cb, hx, status, reply)
-                if done_cb:
-                    GLib.idle_add(done_cb, status, reply)
-            self._poll_boom()
-
-    def _drain(self):
-        """Read what arrived while we were idle. Without this the fd is only
-        emptied inside a transaction, so mic events surfaced up to one battery
-        poll (5 s) late."""
-        while True:
-            r, _, _ = select.select([self.fd], [], [], 0)
-            if not r:
-                return
-            try:
-                buf = os.read(self.fd, 64)
-            except OSError:
-                return
-            if len(buf) >= 2 and buf[0] == MIC_REPORT and self.mic_cb:
-                GLib.idle_add(self.mic_cb, buf[1])
-
-    def _poll_boom(self):
-        if not self.poll_boom:
-            return
-        down = read_boom(self.fd)
-        if down is not None and down != self._boom:
-            self._boom = down
-            if self.boom_cb:
-                GLib.idle_add(self.boom_cb, down)
-
-    def _transact(self, hx, timeout=1.0):
-        # A dead worker thread takes the whole app with it (silently), so
-        # nothing here may raise: bad console input -> BADHEX, device gone or
-        # rejecting the report -> GONE, and the run loop keeps going.
-        try:
-            rpt = bytes.fromhex(hx)
-        except ValueError:
-            return "BADHEX", None
-        if not 4 <= len(rpt) <= 20:
-            return "BADHEX", None
-        rpt += b"\x00" * (20 - len(rpt))
-        feat, fnsw = rpt[2], rpt[3]
-        try:
-            os.write(self.fd, rpt)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                r, _, _ = select.select([self.fd], [], [], deadline - time.time())
-                if not r:
-                    break
-                buf = os.read(self.fd, 64)
-                if len(buf) < 2:
-                    continue
-                if buf[0] != 0x11:
-                    # mic events arrive on report id 0x08 (20 boom-up, 10 boom-down, 01 button)
-                    if buf[0] == 0x08 and self.mic_cb:
-                        GLib.idle_add(self.mic_cb, buf[1])
-                    continue
-                if len(buf) < 5:
-                    continue
-                if buf[2] == 0xFF and buf[3] == feat and buf[4] == fnsw:
-                    return "ERR", buf[5]
-                if buf[2] == feat and buf[3] == fnsw:
-                    return "ACK", buf
-        except OSError:
-            return "GONE", None
-        return "TIMEOUT", None
-
-
 class App(Gtk.Window):
     def __init__(self, dev_path, pid, hid_name):
         self.profile = {**GENERIC_PROFILE,
@@ -660,6 +289,7 @@ class App(Gtk.Window):
         self.set_default_size(720, 860)
         self.set_icon_name("audio-headset")
         self.connected = None   # None = unknown, True/False after first battery poll
+        self.pid = pid
 
         self.settings = AppSettings()
         self.features = {}        # feature attr -> discovered index
@@ -671,12 +301,20 @@ class App(Gtk.Window):
         self.tray_batt_item = None
         self._vol_pending = {}    # (kind, name) -> debounce source id
         self._vol_containers = []
+        self._daemon_poll = None
 
         boom = self.profile["has_boom_mic"]
-        self.worker = HidWorker(dev_path, self.log_traffic,
-                                self.on_mic_event if boom else None,
-                                self.on_boom_change if boom else None,
-                                poll_boom=boom)
+        self.worker = HidWorker(
+            dev_path, self.log_traffic,
+            mic_cb=self.on_mic_event if boom else None,
+            boom_cb=self.on_boom_change if boom else None,
+            poll_boom=boom,
+            on_link=self.on_link_change,
+            prefer_pid=pid,
+            known_pids=set(DEVICE_PROFILES),
+            boom_reader=read_boom if boom else None,
+            idle_add=GLib.idle_add,
+        )
         self.worker.start()
         self.audio = AudioControl(self._on_audio_change)
 
@@ -752,21 +390,18 @@ class App(Gtk.Window):
             row.pack_start(Gtk.Label(label="Host capture switch (ALSA / USB-audio mute layer)",
                                      xalign=0), True, True, 0)
             self.hostmic_sw = Gtk.Switch()
-            self.hostmic_sw.set_active(read_host_mic_switch() is not False)
+            self.hostmic_sw.set_active(_read_host_mic() is not False)
             self.hostmic_sw.connect("notify::active", self.on_hostmic_toggle)
             row.pack_end(self.hostmic_sw, False, False, 0)
             mic.pack_start(row, False, False, 0)
             b = Gtk.Button(label="Unstick mic (force host unmute)")
-            b.connect("clicked", lambda *_: (set_host_mic_switch(True),
+            b.connect("clicked", lambda *_: (_set_host_mic(True),
                                              self._refresh_hostmic()))
             mic.pack_start(b, False, False, 0)
-            note = Gtk.Label(xalign=0)
-            note.set_line_wrap(True)
-            note.set_markup("<small>Muted if the headset's own boom flag OR the host switch "
-                            "says so. G HUB mode: g935-dspd clears the boom flag with a slow "
-                            "host-mute pulse ~2s after boom-down, and implements the button "
-                            "toggle. Hardware mode: fully self-managed on-device.</small>")
-            mic.pack_start(note, False, False, 0)
+            self.mic_note = Gtk.Label(xalign=0)
+            self.mic_note.set_line_wrap(True)
+            mic.pack_start(self.mic_note, False, False, 0)
+            self._update_mic_note()
         else:
             self.mic_label.set_no_show_all(True)
             self.mic_label.set_visible(False)
@@ -800,12 +435,61 @@ class App(Gtk.Window):
         row.pack_end(self.track_sw, False, False, 0)
         hp.pack_start(row, False, False, 0)
 
-        live = self._frame(hp, "Live")
+        live = self._frame(hp, "Live · remaining runtime")
         self.health_live = Gtk.Label(xalign=0)
         self.health_live.set_markup("<span size='large'>…</span>")
+        self.health_live.set_line_wrap(True)
         live.pack_start(self.health_live, False, False, 2)
 
-        spec = self._frame(hp, "Battery specification (stock G935 defaults - edit for "
+        # ---- Graphs (battery-manager style) ----
+        graphs = self._frame(hp, "Graphs")
+        # top row: history (wide) 
+        self.chart_history = ChargeHistoryChart()
+        graphs.pack_start(self.chart_history, False, False, 4)
+        # second row: gauge + expect/actual side by side
+        row = Gtk.Box(spacing=8)
+        self.chart_gauge = HealthGaugeChart()
+        self.chart_gauge.set_size_request(180, 140)
+        self.chart_gauge.set_hexpand(False)
+        row.pack_start(self.chart_gauge, False, False, 0)
+        self.chart_expect = ExpectActualChart()
+        row.pack_start(self.chart_expect, True, True, 0)
+        graphs.pack_start(row, False, False, 4)
+        # sessions + drain profile
+        self.chart_sessions = SessionRuntimeChart()
+        graphs.pack_start(self.chart_sessions, False, False, 4)
+        self.chart_profile = DrainProfileChart()
+        graphs.pack_start(self.chart_profile, False, False, 4)
+
+        est = self._frame(hp, "Expect vs real · degradation")
+        self.health_est = Gtk.Label(xalign=0)
+        self.health_est.set_markup("<span size='x-large'>—</span>  <small>no data yet</small>")
+        self.health_est.set_line_wrap(True)
+        est.pack_start(self.health_est, False, False, 2)
+        self.health_detail = Gtk.Label(xalign=0)
+        self.health_detail.set_line_wrap(True)
+        est.pack_start(self.health_detail, False, False, 0)
+        note = Gtk.Label(xalign=0)
+        note.set_line_wrap(True)
+        note.set_markup(
+            "<small>Blue = measured from your datapoints. Amber = rated/expected "
+            "spec. Green segments on the history chart are charging. Health % = "
+            "learned full runtime ÷ rated. Short discharge sessions stitch across "
+            "brief headset-off gaps.</small>")
+        est.pack_start(note, False, False, 0)
+
+        prof = self._frame(hp, "Learned drain profile")
+        self.health_profile = Gtk.Label(xalign=0)
+        self.health_profile.set_line_wrap(True)
+        self.health_profile.set_markup("<small>collecting discharge datapoints…</small>")
+        prof.pack_start(self.health_profile, False, False, 0)
+
+        hist = self._frame(hp, "Recent usage sessions")
+        self.health_hist = Gtk.Label(xalign=0)
+        self.health_hist.set_markup("<tt>no sessions recorded</tt>")
+        hist.pack_start(self.health_hist, False, False, 0)
+
+        spec = self._frame(hp, "Battery specification (stock G935 defaults — edit for "
                                "aftermarket cells)")
         self.spec_spins = {}
         for key, label, lo, hi, step in (
@@ -839,33 +523,14 @@ class App(Gtk.Window):
         spec.pack_start(b, False, False, 0)
         note = Gtk.Label(xalign=0)
         note.set_line_wrap(True)
-        note.set_markup("<small>Stock cell: 1100 mAh 3.7 V Li-Po (part 533-000132), "
-                        "4200 mV full / 3500 mV empty, rated 8 h with default RGB or "
-                        "12 h lights-off at 50% volume. Aftermarket 533-000132 cells "
-                        "claim up to 2500 mAh. These fields feed the health comparison "
-                        "only, not the % readout curve.</small>")
+        note.set_markup(
+            "<small>Stock cell: 1100 mAh 3.7 V Li-Po (part 533-000132), "
+            "4200 mV full / 3500 mV empty, rated 8 h with default RGB or "
+            "12 h lights-off at 50% volume. Aftermarket cells claim up to "
+            "2500 mAh. Spec fields set the <i>expected</i> side of the "
+            "comparison; measured drain builds the <i>real</i> side.</small>")
         spec.pack_start(note, False, False, 0)
 
-        est = self._frame(hp, "Health estimate")
-        self.health_est = Gtk.Label(xalign=0)
-        self.health_est.set_markup("<span size='x-large'>—</span>  <small>no data yet</small>")
-        est.pack_start(self.health_est, False, False, 2)
-        self.health_detail = Gtk.Label(xalign=0)
-        self.health_detail.set_line_wrap(True)
-        est.pack_start(self.health_detail, False, False, 0)
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup("<small>Voltage-only estimate: each discharge session ≥30 min "
-                        "spanning ≥10% is extrapolated to a full-to-empty runtime and "
-                        "compared against the rated spec (median of recent sessions, "
-                        "capped at 120%). Drain rate varies with volume/RGB/usage, so "
-                        "expect scatter between sessions.</small>")
-        est.pack_start(note, False, False, 0)
-
-        hist = self._frame(hp, "Recent sessions")
-        self.health_hist = Gtk.Label(xalign=0)
-        self.health_hist.set_markup("<tt>no sessions recorded</tt>")
-        hist.pack_start(self.health_hist, False, False, 0)
         self._refresh_health_display(None, None, "…")
         self.section_frames["battery"] = self.stack.get_child_by_name("health")
 
@@ -920,6 +585,7 @@ class App(Gtk.Window):
         # headset is off and polls battery once it's known.
         self._start_discovery()
         GLib.timeout_add_seconds(5, self.heartbeat)
+        GLib.timeout_add_seconds(3, self._poll_daemon_status)
         self._setup_tray()
         self.connect("delete-event", self.on_delete_event)
         GLib.idle_add(self._on_audio_change)   # first tray/settings population
@@ -1130,8 +796,16 @@ class App(Gtk.Window):
             w.set_visible(False)
 
     def _assert_device_state(self, initial):
-        """The single re-assert path, used after discovery and on power-on."""
-        self.send("gkeys", 2, f"{1 if self.dsp_sw.get_active() else 0:02x}")
+        """The single re-assert path, used after discovery and on power-on.
+
+        When g935-dspd is running it owns power-on DSP enable; the GUI only
+        re-applies panel-owned state (lighting / sidetone / EQ). Mode toggle
+        by the user still sends gkeys immediately via on_dsp_toggle.
+        """
+        if not daemon_running():
+            self.send("gkeys", 2, f"{1 if self.dsp_sw.get_active() else 0:02x}")
+        else:
+            self.log("--- dspd running: leaving power-on mode enable to the daemon ---")
         self._apply_saved_lighting()
         if initial:
             self.send("sidetone", 0, cb=self.got_sidetone)
@@ -1139,6 +813,21 @@ class App(Gtk.Window):
         else:
             self._apply_sidetone()
             self.on_eq_apply(None)
+
+    def on_link_change(self, up):
+        """HidWorker reopened (or lost) the hidraw node after unplug/replug."""
+        if up:
+            self.log("--- receiver link up: rediscovering ---")
+            self.discovered = False
+            self._discovering = False
+            self.features = {}
+            self._start_discovery()
+        else:
+            self.log("--- receiver link down ---")
+            self.discovered = False
+            self._discovering = False
+            self.features = {}
+            self._mark_disconnected()
 
     def log(self, text):
         self.logbuf.insert(self.logbuf.get_end_iter(), text + "\n")
@@ -1171,23 +860,49 @@ class App(Gtk.Window):
         self.send("gkeys", 2, f"{1 if on else 0:02x}")
         save_mode("ghub" if on else "hardware")
         self._update_mode_note()
+        self._update_mic_note()
 
     def _update_mode_note(self):
         if self.dsp_sw.get_active():
-            self.mode_note.set_markup(
-                "<small>G HUB mode: open soundstage ON. Mic is host-managed: g935-dspd "
-                "auto-unmutes ~2s after boom-down and handles the button.</small>")
+            if daemon_running():
+                self.mode_note.set_markup(
+                    "<small>G HUB mode: open soundstage ON. Mic is host-managed by "
+                    "<b>g935-dspd</b> (auto-unmutes ~2s after boom-down; handles the "
+                    "button).</small>")
+            else:
+                self.mode_note.set_markup(
+                    "<small><span foreground='#e01b24'><b>G HUB mode without g935-dspd:</b> "
+                    "boom mute will stick until the daemon is running.</span> "
+                    "Start it with: <tt>systemctl --user enable --now g935-dsp</tt></small>")
         else:
             self.mode_note.set_markup(
-                "<small>Hardware mode: stock flat sound; mic is fully self-managed "
-                "(boom up = mute, boom down = unmute, button toggles).</small>")
+                "<small>Hardware mode (default): stock flat sound; mic is fully "
+                "self-managed (boom up = mute, boom down = unmute, button toggles). "
+                "Flip the switch for the open G HUB soundstage.</small>")
+
+    def _update_mic_note(self):
+        if not hasattr(self, "mic_note"):
+            return
+        if not self.dsp_sw.get_active():
+            self.mic_note.set_markup(
+                "<small>Hardware mode: boom mute is fully on-device. Host switch is a "
+                "separate mute layer.</small>")
+        elif daemon_running():
+            self.mic_note.set_markup(
+                "<small>G HUB mode: g935-dspd clears the boom flag with a slow host-mute "
+                "pulse ~2s after boom-down, and implements the button toggle.</small>")
+        else:
+            self.mic_note.set_markup(
+                "<small><span foreground='#e01b24'>Daemon not running — boom mute will "
+                "stick after raising the mic. Start g935-dsp, or use Unstick / hardware "
+                "mode.</span></small>")
 
     # ---------- host mic switch ----------
     def on_hostmic_toggle(self, sw, _pspec):
-        set_host_mic_switch(sw.get_active())
+        _set_host_mic(sw.get_active())
 
     def _refresh_hostmic(self):
-        state = read_host_mic_switch()
+        state = _read_host_mic()
         if state is None:
             return
         self.hostmic_sw.handler_block_by_func(self.on_hostmic_toggle)
@@ -1388,6 +1103,10 @@ class App(Gtk.Window):
             return
         self._quitting = True
         self.audio.stop()
+        try:
+            self.worker.stop()
+        except Exception:
+            pass
         self.health.save()
         self.settings.save()
         Gtk.main_quit()
@@ -1531,8 +1250,28 @@ class App(Gtk.Window):
 
     @staticmethod
     def _dur(seconds):
-        m = int(seconds) // 60
-        return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+        if seconds is None:
+            return "—"
+        seconds = int(seconds)
+        if seconds < 0:
+            seconds = 0
+        m = seconds // 60
+        if m >= 60:
+            return f"{m // 60}h{m % 60:02d}m"
+        if m > 0:
+            return f"{m}m"
+        return f"{seconds}s"
+
+    @staticmethod
+    def _dur_h(hours):
+        if hours is None:
+            return "—"
+        if hours <= 0:
+            return "0m"
+        total_m = int(round(hours * 60))
+        if total_m >= 60:
+            return f"{total_m // 60}h{total_m % 60:02d}m"
+        return f"{total_m}m"
 
     def _rated_runtime(self):
         key = ("rated_runtime_h_rgb_on"
@@ -1542,70 +1281,197 @@ class App(Gtk.Window):
 
     def _refresh_health_display(self, mv=None, pct=None, state=""):
         h = self.health
+        rated = self._rated_runtime()
+        a = h.analysis(mv=mv, rated_runtime_h=rated)
 
-        # live line: current reading + open-session summary
+        # --- Live: reading + session + remaining ---
         if mv is None:
-            live = f"<span size='large'>{state}</span>"
+            live = f"<span size='large'>{GLib.markup_escape_text(state or '…')}</span>"
         else:
-            live = f"<span size='large'>{mv} mV · {pct}% · {state}</span>"
+            live = (f"<span size='large'>{mv} mV · {pct}% · "
+                    f"{GLib.markup_escape_text(state)}</span>")
+
+        lines = []
         if h.cur:
             seg = h.cur
             dt = seg["t_end"] - seg["t_start"]
-            line = (f"\n<small>session: {seg['type']} {self._dur(dt)}, "
+            line = (f"session: {seg['type']} {self._dur(dt)}, "
                     f"{seg['mv_start']}→{seg['mv_end']} mV "
                     f"({seg['pct_start']}→{seg['pct_end']}%)")
             if seg["type"] == "discharge" and dt >= 600:
                 rate = (seg["pct_start"] - seg["pct_end"]) / (dt / 3600.0)
-                line += f", −{rate:.1f}%/h"
-            live += line + "</small>"
+                if rate > 0:
+                    line += f", −{rate:.1f}%/h"
+            lines.append(line)
+
+        if a["live_rate_pct_per_h"] is not None:
+            lines.append(
+                f"live drain: −{a['live_rate_pct_per_h']:.1f}%/h "
+                f"over {self._dur(a['live_rate_span_s'])} "
+                f"({a['live_rate_points']} pts)")
+        elif mv is not None and state == "discharging":
+            lines.append("live drain: collecting… (need ~10 min discharge)")
+
+        if a["remain_best_h"] is not None:
+            src = a["remain_source"] or "estimate"
+            lines.append(
+                f"<b>remaining (from data): {self._dur_h(a['remain_best_h'])}</b> "
+                f"via {src}")
+            if (a["remain_profile_h"] is not None
+                    and a["remain_source"] != "profile"
+                    and a["profile_summary"].get("ready")):
+                lines.append(
+                    f"profile-shaped remaining: {self._dur_h(a['remain_profile_h'])}")
+        if a["remain_expected_h"] is not None and mv is not None:
+            delta = ""
+            if a["remain_best_h"] is not None and a["remain_expected_h"] > 0:
+                rel = 100.0 * (a["remain_best_h"] / a["remain_expected_h"] - 1.0)
+                sign = "+" if rel >= 0 else "−"
+                delta = f"  ({sign}{abs(rel):.0f}% vs rated for this level)"
+            lines.append(
+                f"expected at rated health: {self._dur_h(a['remain_expected_h'])}"
+                f"{delta}")
+
+        if lines:
+            live += "\n<small>" + "\n".join(lines) + "</small>"
         self.health_live.set_markup(live)
 
-        # health estimate
-        rated = self._rated_runtime()
-        est, n = health_estimate(h.segments, rated)
-        if est is None:
-            self.health_est.set_markup(
-                "<span size='x-large'>—</span>  <small>collecting data; needs a "
-                "discharge session ≥30 min spanning ≥10%</small>")
-        else:
-            conf = "low confidence" if n < 3 else f"median of {n} sessions"
-            eff = int(est / 100.0 * h.settings["design_capacity_mah"])
-            self.health_est.set_markup(
-                f"<span size='x-large'>≈ {est:.0f}%</span>  <small>of rated capacity "
-                f"({conf}, {rated:g} h spec) · effective ≈ {eff} mAh</small>")
+        # --- Graphs ---
+        self._update_health_charts(a, rated)
 
-        # secondary indicators
+        # --- Expect vs real / degradation ---
+        if a["health_pct"] is None:
+            self.health_est.set_markup(
+                "<span size='x-large'>—</span>  <small>collecting data — need "
+                "merged discharge ≥30 min spanning ≥8% (short sessions stitch "
+                "across brief offs)</small>")
+        else:
+            conf = ("low confidence" if a["n_sessions"] < 3
+                    else f"median of {a['n_sessions']} sessions")
+            learned = a["learned_full_runtime_h"]
+            eff = a["effective_mah"]
+            self.health_est.set_markup(
+                f"<span size='x-large'>≈ {a['health_pct']:.0f}%</span>  "
+                f"<small>health · {conf}</small>\n"
+                f"<small>real full runtime: <b>{self._dur_h(learned)}</b>  ·  "
+                f"expected (rated): <b>{rated:g} h</b>\n"
+                f"effective capacity ≈ {eff} mAh of {a['design_mah']} mAh design"
+                f"</small>")
+
         details = []
-        if h.peaks:
-            peak = max(p[1] for p in h.peaks[-10:])
-            full = h.settings["full_mv"]
-            details.append(f"Full-charge peak (recent): {peak} mV "
-                           f"({100.0 * peak / full:.1f}% of {full} mV spec)")
+        if a.get("peak_recent_mv"):
+            peak = a["peak_recent_mv"]
+            full = a["full_mv"]
+            details.append(
+                f"Full-charge peak (recent): {peak} mV "
+                f"({100.0 * peak / full:.1f}% of {full} mV spec)")
         last_chg = next((s for s in reversed(h.segments) if s["type"] == "charge"), None)
         if last_chg:
-            details.append(f"Last charge: {self._dur(last_chg['t_end'] - last_chg['t_start'])}, "
-                           f"{last_chg['mv_start']}→{last_chg['mv_end']} mV")
-        self.health_detail.set_markup("<small>" + ("\n".join(details) or " ") + "</small>")
+            details.append(
+                f"Last charge: {self._dur(last_chg['t_end'] - last_chg['t_start'])}, "
+                f"{last_chg['mv_start']}→{last_chg['mv_end']} mV")
+        if a["remain_expected_adj_h"] is not None and a["health_pct"] is not None:
+            details.append(
+                f"Remaining if health holds: {self._dur_h(a['remain_expected_adj_h'])} "
+                f"(rated scaled by {a['health_pct']:.0f}%)")
+        self.health_detail.set_markup(
+            "<small>" + GLib.markup_escape_text("\n".join(details) or " ") + "</small>")
 
-        # history table
+        # --- Learned profile ---
+        ps = a["profile_summary"]
+        if not ps or ps.get("hours_logged", 0) <= 0:
+            self.health_profile.set_markup(
+                "<small>No discharge datapoints yet. Wear the headset off-charger; "
+                "samples land about once per minute.</small>")
+        else:
+            span = ps.get("span_mv")
+            span_s = f"{span[0]}–{span[1]} mV" if span else "—"
+            ready = "ready for profile ETA" if ps.get("ready") else "building…"
+            bins = a["profile"].get("bins") or {}
+            # Show top bins by voltage descending as a compact rate table
+            bin_bits = []
+            for b in sorted(bins.keys(), reverse=True)[:8]:
+                bin_bits.append(f"{b}mV: {bins[b]:.0f} mV/h")
+            weak = a["profile"].get("weak_bins") or {}
+            extra = f" · +{len(weak)} sparse bins" if weak else ""
+            table = ("\n" + "   ".join(bin_bits)) if bin_bits else ""
+            self.health_profile.set_markup(
+                f"<small>{ps['hours_logged']:.1f} h discharge logged · "
+                f"{ps.get('bins_filled', 0)} solid bins · span {span_s} · "
+                f"{ps.get('n_pairs', 0)} pairs · <b>{ready}</b>{extra}"
+                f"{GLib.markup_escape_text(table)}</small>")
+
+        # --- History: merged usage sessions (what health uses) ---
         rows = []
-        for seg in reversed(h.segments[-8:]):
+        sessions = merge_discharge_sessions(h.segments)
+        for sess in reversed(sessions[-8:]):
+            when = time.strftime("%m-%d %H:%M", time.localtime(sess["t_start"]))
+            dur = self._dur(sess["on_time_s"])
+            span = (f"{sess['mv_start']}→{sess['mv_end']}mV "
+                    f"{sess['pct_start']}→{sess['pct_end']}%")
+            full = session_full_runtime_h(sess)
+            if full is not None:
+                pct_of_rated = min(120.0, 100.0 * full / rated) if rated else 0
+                tail = f"→{full:.1f}h full ({pct_of_rated:.0f}% rated)"
+            else:
+                tail = "(too short)"
+            parts = f" ×{sess['parts']}" if sess["parts"] > 1 else ""
+            rows.append(f"{when}  {dur:>6}{parts}  {span}  {tail}")
+        # Also show last few charge segments briefly
+        for seg in reversed([s for s in h.segments if s["type"] == "charge"][-3:]):
             when = time.strftime("%m-%d %H:%M", time.localtime(seg["t_start"]))
             dur = self._dur(seg["t_end"] - seg["t_start"])
-            span = (f"{seg['mv_start']}→{seg['mv_end']}mV "
-                    f"{seg['pct_start']}→{seg['pct_end']}%")
-            if seg["type"] == "discharge":
-                proj = projected_runtime_h(seg)
-                tail = (f"→{proj:.1f}h ({min(120.0, 100.0 * proj / rated):.0f}%)"
-                        if proj else "--")
-                rows.append(f"{when}  dis  {dur:>6}  {span}  {tail}")
-            else:
-                rows.append(f"{when}  chg  {dur:>6}  {span}")
+            rows.append(
+                f"{when}  chg {dur:>5}  {seg['mv_start']}→{seg['mv_end']}mV")
         self.health_hist.set_markup(
             "<tt>" + GLib.markup_escape_text("\n".join(rows) or "no sessions recorded")
             + "</tt>")
 
+    def _update_health_charts(self, analysis, rated):
+        """Push latest analysis into the Cairo chart widgets."""
+        h = self.health
+        pts = build_history_points(h.recent, batt_percent)
+        expected_line = build_expected_overlay(pts, rated)
+        self.chart_history.set_data({
+            "points": pts,
+            "expected_points": expected_line,
+        })
+        self.chart_gauge.set_data({
+            "health_pct": analysis.get("health_pct"),
+            "learned_h": analysis.get("learned_full_runtime_h"),
+            "rated_h": rated,
+        })
+        self.chart_expect.set_data({
+            "expected_h": analysis.get("remain_expected_h"),
+            "actual_h": analysis.get("remain_best_h"),
+            "health_pct": analysis.get("health_pct"),
+        })
+        # Session bars: last up to 12 merged sessions with a full-runtime estimate
+        sess_rows = []
+        for sess in merge_discharge_sessions(h.segments)[-12:]:
+            full = session_full_runtime_h(sess)
+            label = time.strftime("%m/%d", time.localtime(sess["t_start"]))
+            sess_rows.append({"label": label, "hours": full})
+        self.chart_sessions.set_data({
+            "sessions": sess_rows,
+            "rated_h": rated,
+        })
+        profile = analysis.get("profile") or {}
+        self.chart_profile.set_data({
+            "bins": profile.get("bins") or {},
+            "weak_bins": profile.get("weak_bins") or {},
+        })
+
     # ---------- heartbeat / battery / connection ----------
+    def _poll_daemon_status(self):
+        """Refresh mode/mic notes if dspd appears or disappears."""
+        running = daemon_running()
+        if running != getattr(self, "_daemon_was_running", None):
+            self._daemon_was_running = running
+            self._update_mode_note()
+            self._update_mic_note()
+        return True
+
     def heartbeat(self):
         if not self.discovered:
             self._start_discovery()
@@ -1664,7 +1530,7 @@ def error_dialog(text):
 def acquire_single_instance():
     """flock guard: two instances would fight over the hidraw node (and show
     two tray icons). Returns the held lock fd, or None if already running."""
-    rundir = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.config/g935")
+    rundir = runtime_dir()
     os.makedirs(rundir, exist_ok=True)
     fd = os.open(os.path.join(rundir, "g935-control.lock"),
                  os.O_RDWR | os.O_CREAT, 0o600)
@@ -1682,7 +1548,7 @@ def main():
     if lock is None:
         error_dialog("Another instance is already running (check the tray).")
         return
-    found = find_headset()
+    found = find_headset(known_pids=set(DEVICE_PROFILES))
     if not found:
         error_dialog("No Logitech HID++ headset found (no 046D hidraw node with "
                      "a HID++ report descriptor).\nIs the receiver plugged in?")
@@ -1703,21 +1569,23 @@ def main():
     prof = {**GENERIC_PROFILE, **DEVICE_PROFILES.get(pid, {"name": name})}
     if prof["alsa_usbid"]:
         ALSA_USBID, MIC_SWITCH_NAME = prof["alsa_usbid"], prof["mic_switch_name"]
+    # Probe permissions before building the full UI (worker opens later).
     try:
-        win = App(path, pid, name)
+        probe = open_hidraw(path)
+        os.close(probe)
     except PermissionError:
         error_dialog(f"No permission to open {path}.\n\n"
-                     "Your desktop session normally grants access via logind; "
-                     "on other setups add a udev rule, e.g.\n"
-                     f'/etc/udev/rules.d/70-logitech-headset.rules:\n'
-                     f'KERNEL=="hidraw*", ATTRS{{idVendor}}=="046d", '
-                     f'ATTRS{{idProduct}}=="{pid:04x}", TAG+="uaccess"\n\n'
-                     "then replug the receiver.")
+                     "Install the udev rule from this repo:\n"
+                     "  sudo cp 99-g935.rules /etc/udev/rules.d/\n"
+                     "  sudo udevadm control --reload && sudo udevadm trigger\n"
+                     "then unplug/replug the receiver.\n\n"
+                     f"(Looking for hidraw access on {path}, PID {pid:04x}.)")
         return
     except OSError as e:
         error_dialog(f"Could not open {path}:\n{e}\n\n"
                      "Was the receiver unplugged?")
         return
+    win = App(path, pid, name)
     win.connect("destroy", win.on_quit)
     win.show_all()
     Gtk.main()

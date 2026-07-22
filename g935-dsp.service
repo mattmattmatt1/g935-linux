@@ -1,11 +1,14 @@
 [Unit]
-Description=G935 DSP soundstage auto-enable (re-sends 11ff052b01 on headset power-on)
+Description=G935 DSP soundstage + mic daemon (HID++ power-on watcher)
 
 [Service]
-# Install: cp g935-dspd.py ~/.local/bin/  (or adjust the path below)
-ExecStart=/usr/bin/python3 %h/.local/bin/g935-dspd.py
-Restart=on-failure
+# Prefer `make install-user` / `./install.sh --user`, which writes a unit with
+# the absolute path to the installed wrapper. This checked-in unit assumes the
+# wrapper is on PATH (typical after install to ~/.local/bin).
+ExecStart=%h/.local/bin/g935-dspd
+Restart=always
 RestartSec=5
+SyslogIdentifier=g935-dspd
 
 [Install]
 WantedBy=default.target

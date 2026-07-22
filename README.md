@@ -10,10 +10,11 @@ Full control of the Logitech G935 wireless headset over raw HID
 - **10-band hardware EQ** (32 Hz – 16 kHz, ±12 dB) — stored on the headset,
   survives reboots, works with any OS afterwards.
 - **Sidetone** (0–100), **RGB lighting** (logo + strip zones, persistent),
-  **battery level**, and **boom-mic mute handling** (the mic logic G HUB
-  normally runs host-side).
-- **GTK3 control panel** (`g935-control.py`) with tray icon, EQ presets,
-  lighting, sidetone, a raw HID++ console, and audio-device pickers.
+  **battery level + health graphs**, and **boom-mic mute handling** (the mic
+  logic G HUB normally runs host-side).
+- **GTK3 control panel** (`g935-control`) with tray icon, EQ presets,
+  lighting, sidetone, battery expect-vs-actual charts, a raw HID++ console,
+  and audio-device pickers.
 
 ## Screenshots
 
@@ -51,7 +52,7 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
 - `pulseaudio-utils` (`pactl`) — audio device pickers/volume (works with
   PipeWire's pulse server too; optional)
 - `python3-hid` (or `pip install hid`) — only for the standalone
-  `g935-enable.py` replay script; the GUI and daemon don't need it
+  `tools/g935-enable.py` hidapi path; the GUI and daemon don't need it
 
 ## Install
 
@@ -59,60 +60,103 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
 git clone https://github.com/mattmattmatt1/g935-linux.git
 cd g935-linux
 
-# 1. Let your user talk to the headset (udev rule, one-time):
-sudo cp 99-g935.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
+# 1. Let your user talk to the headset (udev + optional mic-mute hwdb):
+./install.sh --udev
 # then unplug/replug the receiver
 
-# 2. Run the control panel:
+# 2. Install the control panel + daemon for your user:
+./install.sh --user
+# or: make install-user
+
+# 3. Run the control panel:
+g935-control
+# from a git checkout without install:
 python3 g935-control.py
 ```
 
-Optional pieces:
+Optional daemon (required for **G HUB mode** mic handling + auto DSP on power-on):
 
 ```bash
-# Auto re-enable the DSP + mic handling on every headset power-on (daemon):
-cp g935-dspd.py ~/.local/bin/
-cp g935-dsp.service ~/.config/systemd/user/
-systemctl --user daemon-reload
 systemctl --user enable --now g935-dsp
-
-# App menu entry (assumes g935-control.py copied to ~/.local/bin, chmod +x):
-cp g935-control.py ~/.local/bin/ && chmod +x ~/.local/bin/g935-control.py
-cp g935-control.desktop ~/.local/share/applications/
-
-# Keep the desktop's mic-mute key out of the loop in G HUB mode (recommended
-# if you use the daemon; stops "press unmute twice" fights):
-sudo cp 70-g935-micmute.hwdb /etc/udev/hwdb.d/
-sudo systemd-hwdb update && sudo udevadm trigger
 ```
 
 ## The two modes
 
-The headset has a mode switch (`11 ff 05 2b 01/00`) that changes more than sound:
+The headset has a mode switch (`11 ff 05 2b 01/00`) that changes more than sound.
+**Default is hardware mode** (safe without the daemon). Flip the switch in the
+GUI for G HUB mode.
 
-| | **Hardware mode** (stock) | **G HUB mode** |
+| | **Hardware mode** (default) | **G HUB mode** |
 |---|---|---|
 | Sound | flat/narrow | DSP soundstage on |
-| Boom mute | handled fully in firmware, just works | host must manage it (the daemon plays G HUB's role) |
+| Boom mute | handled fully in firmware, just works | host must manage it (`g935-dspd`) |
 | Mic button | works on-device | only emits an event (daemon handles it) |
 
-Pick the mode in the GUI; it's remembered in `~/.config/g935/mode` and
-re-asserted by the daemon on every power-on. If you don't run the daemon,
-stay in hardware mode — in G HUB mode without it, raising the boom mutes the
-mic and nothing will unmute it.
+Mode is stored in `~/.config/g935/mode` and re-asserted by the daemon on every
+power-on. **If you use G HUB mode, run the daemon.** Without it, raising the
+boom mutes the mic and nothing will unmute it (the panel warns you).
 
-## What's in here
+### Who owns what
 
-| File | Purpose |
+| Job | Daemon running | Daemon not running |
+|---|---|---|
+| Power-on DSP enable | **daemon** | control panel |
+| Boom mute / button | **daemon** | panel shows state only (Unstick button) |
+| EQ / lighting / sidetone | control panel | control panel |
+| Mode toggle (user switch) | panel writes mode file + command | same |
+
+## Battery health
+
+The Battery Health tab logs voltage samples while the panel is open and builds:
+
+- **Live remaining runtime** from recent discharge datapoints
+- **Expected vs actual** comparison against the rated runtime spec
+- **Learned drain profile** (mV/h by voltage bin) and session history graphs
+
+Data lives in `~/.config/g935/health.json`. Health % needs longer off-charger
+sessions (merged ≥30 min / ≥8% drop); short sessions still feed live ETA and
+the profile. No coulomb counter exists — this is an honest voltage-based
+extrapolation, not a BMS.
+
+## Layout
+
+| Path | Purpose |
 |---|---|
-| `g935-control.py` | GTK3 control panel (EQ, lighting, sidetone, modes, console) |
+| `g935-control.py` | GTK3 control panel |
 | `g935-dspd.py` + `g935-dsp.service` | power-on watcher + G HUB-mode mic daemon |
+| `g935/` | shared library (HID++, mic, mode, battery, charts) |
 | `99-g935.rules` | udev rule granting hidraw access |
-| `70-g935-micmute.hwdb` | masks the headset's KEY_MICMUTE so the desktop stays out |
-| `g935-enable.py` / `g935-enable-v2.py` | standalone DSP-enable replay scripts |
-| `g935-step.py` | interactive sequence bisector (debugging tool) |
+| `70-g935-micmute.hwdb` | masks KEY_MICMUTE so the desktop stays out of G HUB mode |
+| `tools/` | research scripts (enable replay, sequence bisector) |
+| `tests/` | offline unit tests (`make test`) |
+| `install.sh` / `Makefile` | user + udev install |
 | `easyeffects-g935.json` | optional EasyEffects preset (software EQ route) |
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Permission denied on hidraw | `./install.sh --udev`, then replug receiver |
+| Tray icon missing (GNOME) | install AppIndicator extension, or run windowed |
+| Mic stuck muted after boom up | enable daemon: `systemctl --user enable --now g935-dsp`, or switch to hardware mode |
+| "press unmute twice" | install `70-g935-micmute.hwdb` via `./install.sh --udev` |
+| Sound flat after power cycle | daemon not running, or mode is hardware — enable daemon / flip G HUB mode |
+| Panel dead after unplug/replug | should auto-recover; if not, restart the panel (file a bug) |
+| `g935-control: command not found` | ensure `~/.local/bin` is on `PATH`, or run `python3 g935-control.py` |
+
+## Development
+
+```bash
+make test       # offline unit tests
+make compile    # bytecode compile check
+```
+
+Research tools (fixed feature indices from 2026-07 captures; GUI discovers live):
+
+```bash
+python3 tools/g935-enable-v2.py   # full cold-connect with ACK/ERR
+python3 tools/g935-step.py        # interactive sequence bisector
+```
 
 ## License
 
