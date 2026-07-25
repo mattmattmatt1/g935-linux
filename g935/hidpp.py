@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import glob
+import fcntl
 import os
 import queue
 import re
 import select
 import threading
 import time
+
+from g935.paths import runtime_dir
 
 LOGITECH_VID = 0x046D
 G935_PID = 0x0A87
@@ -16,6 +19,7 @@ HID_ID_RE = re.compile(r"HID_ID=0003:0000046D:0000([0-9A-Fa-f]{4})")
 # usage page 0xFF43 (Logitech vendor / HID++) in the report descriptor
 HIDPP_PAGE = b"\x06\x43\xff"
 REPORT_SIZE = 20
+TRANSACTION_LOCK_NAME = "g935-hidpp-transaction.lock"
 
 ERROR_CODES = {
     0x01: "unknown", 0x02: "invalid argument", 0x03: "out of range",
@@ -107,6 +111,29 @@ def is_hidpp_notification(buf: bytes) -> bool:
     return len(buf) >= 4 and buf[0] == 0x11 and (buf[3] & 0x0F) == 0
 
 
+def _acquire_transaction_lock():
+    """Serialize commands across the panel, daemon, and helper tools.
+
+    The receiver can accept multiple hidraw opens, but overlapping HID++
+    transactions can still steal/collide with replies and look like a headset
+    power cycle. The lock is process-scoped and automatically releases if a
+    process exits.
+    """
+    fd = None
+    try:
+        path = os.path.join(runtime_dir(), TRANSACTION_LOCK_NAME)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
 def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
              on_hidpp_notification=None):
     """Send one HID++ report and wait for its ACK/ERR.
@@ -123,6 +150,7 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
     if not 4 <= len(bytes.fromhex(clean)) <= REPORT_SIZE:
         return "BADHEX", None
     feat, fnsw = rpt[2], rpt[3]
+    lock_fd = _acquire_transaction_lock()
     try:
         os.write(fd, rpt)
         deadline = time.time() + timeout
@@ -150,6 +178,13 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
             return status, detail
     except OSError:
         return "GONE", None
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
     return "TIMEOUT", None
 
 

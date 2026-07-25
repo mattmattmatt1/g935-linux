@@ -11,10 +11,10 @@ Feature map (from the headset IFeatureSet, 2026-07-20):
   idx 07 = 0x8300 SIDETONE            0-100
   idx 08 = 0x1f20 ADC/BATTERY         voltage mV + flags
 
-Mode is persisted in ~/.config/g935/mode ("ghub"/"hardware"). While g935-dspd
-is running it owns power-on DSP enable and boom-mic handling; the GUI drives
-EQ, lighting, sidetone, and the mode toggle. Default mode is hardware (stock)
-until the user opts in.
+Mode is persisted in ~/.config/g935/mode ("ghub"/"hardware"). g935-dspd keeps
+the mode across power-ons and owns boom-mic handling; the GUI also reasserts
+the persisted mode before replaying EQ/lighting after a confirmed reconnect.
+Default mode is hardware (stock) until the user opts in.
 
 Needs r/w on the hidraw node. Run: python3 g935-control.py
 """
@@ -55,7 +55,9 @@ from g935.features import (
     parse_firmware_info, parse_frequency_page, parse_gkey_mask,
     parse_led_effect_info, parse_led_state, parse_led_zone_info,
 )
-from g935.hidpp import ERROR_CODES, HidWorker, find_headset, open_hidraw
+from g935.hidpp import (
+    ERROR_CODES, HidWorker, PollPresence, find_headset, open_hidraw,
+)
 from g935.mic import (
     BOOM_UP, BOOM_DOWN, BUTTON, read_boom, read_host_mic_switch, set_host_mic_switch,
 )
@@ -418,6 +420,7 @@ class App(Gtk.Window):
         self.set_default_size(840, 900)
         self.set_icon_name("audio-headset")
         self.connected = None   # None = unknown, True/False after first battery poll
+        self._battery_presence = PollPresence(miss_limit=3)
         self.pid = pid
 
         self.settings = AppSettings()
@@ -549,6 +552,9 @@ class App(Gtk.Window):
         row.pack_start(lbl, True, True, 0)
         self.dsp_sw = Gtk.Switch()
         self.dsp_sw.set_active(load_mode() == "ghub")
+        self.dsp_sw.set_tooltip_text(
+            "Saved target mode. The G935 exposes no readback for this state, "
+            "so software mode is reasserted after every battery reading.")
         self.dsp_sw.connect("notify::active", self.on_dsp_toggle)
         row.pack_end(self.dsp_sw, False, False, 0)
         gk.pack_start(row, False, False, 0)
@@ -775,8 +781,11 @@ class App(Gtk.Window):
             "<b>Green</b> on the history chart = charging (held SoC, not rail %).\n"
             "Short discharges stitch across brief headset-off gaps (≤15 min). "
             "A solid health evidence point needs ~30 min on-time and ≥8% drop.\n"
-            "Live remaining uses recent %/h drain; the profile integrates mV/h by "
-            "voltage bin once enough bins are filled.</small>")
+            "After 3 qualifying sessions, remaining time is anchored to the median "
+            "full-runtime history; a faster live drain can shorten it. Before then, "
+            "recent drain and the voltage-bin profile provide the early estimate. "
+            "A live rate needs ≥10 min and ≥3% movement so ADC wobble cannot create "
+            "an implausibly long ETA.</small>")
         about_box.pack_start(note, False, False, 0)
 
         # ---- Spec (collapsed for aftermarket cells) ----
@@ -1656,14 +1665,12 @@ class App(Gtk.Window):
     def _assert_device_state(self, initial):
         """The single re-assert path, used after discovery and on power-on.
 
-        When g935-dspd is running it owns power-on DSP enable; the GUI only
-        re-applies panel-owned state (lighting / sidetone / EQ). Mode toggle
-        by the user still sends gkeys immediately via on_dsp_toggle.
+        The panel and g935-dspd may both assert the same persisted mode. The
+        SET is idempotent, and sending it before lighting/EQ prevents a
+        confirmed reconnect replay from leaving the switch visually enabled
+        while the on-headset soundstage is actually flat.
         """
-        if not daemon_running():
-            self.send("gkeys", 2, f"{1 if self.dsp_sw.get_active() else 0:02x}")
-        else:
-            self.log("--- dspd running: leaving power-on mode enable to the daemon ---")
+        self.send("gkeys", 2, f"{1 if self.dsp_sw.get_active() else 0:02x}")
         self._apply_saved_lighting()
         if initial:
             self.send("sidetone", 0, cb=self.got_sidetone)
@@ -1682,6 +1689,7 @@ class App(Gtk.Window):
             self._start_discovery()
         else:
             self.log("--- receiver link down ---")
+            self._battery_presence.reset()
             self.discovered = False
             self._discovering = False
             self.features = {}
@@ -2351,7 +2359,7 @@ class App(Gtk.Window):
                     "Headset off</span>")
         elif mv is not None and state == "discharging":
             hero = ("<span size='xx-large' weight='bold'>—</span>\n"
-                    "<small>collecting live drain… ~10 min off-charger</small>")
+                    "<small>collecting live drain… need ≥10 min and ≥3% drop</small>")
         else:
             hero = ("<span size='xx-large' weight='bold'>—</span>\n"
                     "<small>waiting for battery data</small>")
@@ -2511,7 +2519,7 @@ class App(Gtk.Window):
         else:
             self._set_kpi(self.kpi_drain,
                           "<span size='large' weight='bold'>—</span>",
-                          "need ~10 min discharge")
+                          "need ≥10 min / 3% drop")
 
         if a.get("effective_mah") is not None:
             self._set_kpi(
@@ -2820,6 +2828,13 @@ class App(Gtk.Window):
 
     def got_battery(self, status, reply):
         if status == "ACK":
+            self._battery_presence.observe(True)
+            # 0x8010 has no readable state on this headset. Keep each required
+            # ADC/battery read self-healing by reasserting the saved target
+            # immediately afterward; this avoids a visually-on/actually-flat
+            # soundstage without introducing an audible off/on pulse.
+            if self.dsp_sw.get_active():
+                self.send("gkeys", 2, "01")
             mv = (reply[4] << 8) | reply[5]
             flags = reply[6]
             state, charging = batt_state(flags)
@@ -2868,10 +2883,19 @@ class App(Gtk.Window):
                     # power-on wipes on-device state - re-assert panel settings
                     self.log("--- headset powered on: re-applying panel state ---")
                     self._assert_device_state(initial=False)
-        else:
+        elif self._battery_presence.observe(False) is False:
             self._mark_disconnected()
+        else:
+            # A single missed reply is normally receiver contention/noise, not
+            # a power cycle. Keep the current state and avoid replaying
+            # lighting/EQ on the next successful battery poll.
+            self.log(
+                f"--- battery poll missed "
+                f"({self._battery_presence.misses}/"
+                f"{self._battery_presence.miss_limit}); keeping state ---")
 
     def _mark_disconnected(self):
+        self._battery_presence.reset()
         self.health.mark_offline()
         self._refresh_health_display(None, None, "headset off")
         self._update_tray_battery("headset off")

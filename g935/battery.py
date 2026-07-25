@@ -50,7 +50,7 @@ RECENT_MAX = 10080      # ~7 days of 1/min samples
 RECENT_RATE_WINDOW_S = 45 * 60   # look-back for live drain rate
 RECENT_RATE_MIN_POINTS = 8
 RECENT_RATE_MIN_SPAN_S = 10 * 60
-RECENT_RATE_MIN_DPCT = 1.0       # need at least ~1% movement
+RECENT_RATE_MIN_DPCT = 3.0       # 1–2% is commonly ADC/curve quantization noise
 
 # Voltage-bin drain profile (mV/h drop rate while discharging)
 PROFILE_BIN_MV = 50
@@ -66,6 +66,9 @@ SEG_MAX = 200
 PEAKS_MAX = 50
 SAVE_EVERY_S = 300
 N_RECENT_SESSIONS = 8            # median window for learned full runtime
+ETA_HISTORY_MIN_SESSIONS = 3     # enough evidence to anchor remaining runtime
+ETA_PROFILE_HISTORY_LO = 0.5     # reject profile ETA if it strongly disagrees
+ETA_PROFILE_HISTORY_HI = 1.5     # with qualifying session history
 
 # While charging, the 0x1f20 ADC often reads the *charger path* (charge rail /
 # cell under charge current), not open-circuit cell voltage. Captures show jumps
@@ -600,11 +603,19 @@ def build_insights(analysis, state=None, charging=None):
     if ps.get("ready"):
         span = ps.get("span_mv")
         span_s = f"{span[0]}–{span[1]} mV" if span else "the voltage range"
-        insights.append({
-            "tone": "info",
-            "text": f"Drain profile learned: {ps.get('hours_logged', 0):.1f} h off-charger, "
-                    f"{ps.get('bins_filled', 0)} voltage bins across {span_s}.",
-        })
+        if a.get("remain_profile_rejected"):
+            insights.append({
+                "tone": "info",
+                "text": f"ETA is anchored to the median of {n_sess} sessions; "
+                        "the voltage-bin estimate disagreed and was ignored.",
+            })
+        else:
+            insights.append({
+                "tone": "info",
+                "text": f"Drain profile learned: {ps.get('hours_logged', 0):.1f} h "
+                        f"off-charger, {ps.get('bins_filled', 0)} voltage bins "
+                        f"across {span_s}.",
+            })
     elif ps.get("hours_logged", 0) > 0:
         insights.append({
             "tone": "muted",
@@ -697,22 +708,51 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
     live_rate, n_pts, span_s = live_drain_rate(recent)
     remain_live = None
     remain_profile = None
+    remain_profile_raw = None
     remain_expected = None
     if mv is not None:
         if live_rate is not None:
             remain_live = remaining_runtime_h(mv, live_rate, empty_mv=empty_mv)
-        remain_profile = remaining_from_profile(mv, profile, empty_mv=empty_mv)
+        remain_profile_raw = remaining_from_profile(
+            mv, profile, empty_mv=empty_mv)
+        remain_profile = remain_profile_raw
         remain_expected = expected_remaining_h(mv, rated_runtime_h, health_frac=1.0)
         remain_expected_adj = expected_remaining_h(
             mv, rated_runtime_h, health_frac=health_frac)
     else:
         remain_expected_adj = None
 
-    # Prefer live %/h for "time left now" (stable); profile is the
-    # voltage-shaped cross-check once enough bins are filled.
+    # Once several qualifying sessions exist, their median full runtime is the
+    # most stable remaining-time anchor. A 1–2% move on the G935 voltage curve
+    # can otherwise turn an ADC plateau into wildly optimistic 3%/h live rates.
+    # Keep a genuinely heavier live drain conservative, but never let a brief
+    # slow/flat window extend a well-supported historical ETA.
+    history_ready = (
+        n_sess >= ETA_HISTORY_MIN_SESSIONS
+        and remain_expected_adj is not None
+    )
+    remain_history = remain_expected_adj if history_ready else None
+
+    # The voltage-bin profile is useful before session history matures, but it
+    # can overvalue the flat part of a LiPo curve. Hide it as an ETA cross-check
+    # when it substantially contradicts established full-runtime evidence.
+    profile_eta_rejected = False
+    if (history_ready and remain_profile is not None
+            and remain_history is not None and remain_history > 0):
+        ratio = remain_profile / remain_history
+        if not ETA_PROFILE_HISTORY_LO <= ratio <= ETA_PROFILE_HISTORY_HI:
+            remain_profile = None
+            profile_eta_rejected = True
+
     remain_best = None
     remain_source = None
-    if remain_live is not None:
+    if history_ready:
+        remain_best = remain_history
+        remain_source = "session history"
+        if remain_live is not None and remain_live < remain_history:
+            remain_best = remain_live
+            remain_source = "live rate"
+    elif remain_live is not None:
         remain_best = remain_live
         remain_source = "live rate"
     elif psum["ready"] and remain_profile is not None:
@@ -747,6 +787,9 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
         "rated_rate_pct_per_h": rated_rate,
         "remain_live_h": remain_live,
         "remain_profile_h": remain_profile,
+        "remain_profile_raw_h": remain_profile_raw,
+        "remain_profile_rejected": profile_eta_rejected,
+        "remain_history_h": remain_history,
         "remain_expected_h": remain_expected,
         "remain_expected_adj_h": remain_expected_adj,
         "remain_best_h": remain_best,

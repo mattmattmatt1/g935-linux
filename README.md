@@ -154,7 +154,7 @@ boom mutes the mic and nothing will unmute it (the panel warns you).
 
 | Job | Daemon running | Daemon not running |
 |---|---|---|
-| Power-on DSP enable | **daemon** | control panel |
+| Power-on DSP enable | **daemon**, with panel reassertion after confirmed reconnects | control panel |
 | Boom mute / button | **daemon** | panel shows state only (Unstick button) |
 | EQ / lighting / sidetone | control panel | control panel |
 | Mode toggle (user switch) | panel writes mode file + command | same |

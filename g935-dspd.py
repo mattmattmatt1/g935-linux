@@ -8,9 +8,9 @@ When mode is "ghub" (see ~/.config/g935/mode, written by g935-control):
 
 When mode is "hardware" (the safe default): leave the headset stock.
 
-Owns mic + power-on DSP while running (GUI skips those duties when this lock
-is held). Runs fine alongside g935-control.py — each hidraw fd gets its own
-copy of input reports.
+Owns mic handling and watches for power-on while running. The GUI can safely
+reassert the same persisted DSP mode after a confirmed reconnect; shared
+HID++ transactions are serialized across processes.
 
 Usage: python3 g935-dspd.py   (see g935-dsp.service for systemd --user setup)
 """
@@ -40,7 +40,10 @@ POLL_S = 5
 MIC_POLL_S = 0.25
 MISSED_POLLS_OFFLINE = 3
 ENABLE = "11ff052b01"
-BATTERY_GET = "11ff080b"
+# A root ping is answered by the USB receiver even while the wireless headset
+# is off.  G-key capability is a harmless, device-level read: it ACKs only when
+# the headset itself is reachable and avoids touching ADC/battery state.
+PRESENCE_GET = "11ff050b"
 ALSA_USBID = "046d:0a87"
 
 
@@ -92,12 +95,12 @@ def main() -> None:
             now = time.time()
             if now >= next_poll:
                 status, _ = transact(
-                    fd, BATTERY_GET,
+                    fd, PRESENCE_GET,
                     on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
                 )
                 next_poll = now + POLL_S
                 if status == "GONE":
-                    raise OSError("device gone during battery poll")
+                    raise OSError("device gone during presence poll")
                 transition = presence.observe(status == "ACK")
                 if transition is True:
                     mode = load_mode()
