@@ -180,14 +180,15 @@ class ChargeHistoryChart(_ChartBase):
     __gtype_name__ = "G935ChargeHistoryChart"
 
     def __init__(self):
-        super().__init__(title="Charge level over time", height=190)
-        self._bottom_label_h = 20
+        super().__init__(title="Charge level over time", height=200)
+        self._bottom_label_h = 22
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
         points = data.get("points") or []  # [(t, pct, charging), ...]
         if len(points) < 2:
-            _pango_fit(cr, "Collecting samples…", box["x"] + box["w"] / 2,
+            _pango_fit(cr, "Collecting samples… wear the headset with tracking on",
+                       box["x"] + box["w"] / 2,
                        box["y"] + box["h"] / 2, size=12, color=pal["muted"],
                        align="center")
             return
@@ -245,13 +246,25 @@ class ChargeHistoryChart(_ChartBase):
             cr.stroke()
             cr.set_dash([])
 
+        # Current level marker
+        last_t, last_pct, _ = points[-1]
+        lx, ly = xy(last_t, last_pct)
+        _set_source(cr, pal["text"])
+        cr.arc(lx, ly, 3.5, 0, 2 * math.pi)
+        cr.fill()
+        _pango_fit(cr, f"{last_pct}%", lx - 8, ly - 8, size=10, color=pal["text"],
+                   align="right")
+
         self._axis_frame(cr, box, pal)
 
-        # X labels
-        _pango_fit(cr, _fmt_time(t0), box["x"], box["y"] + box["h"] + 12,
+        # X labels: start, mid, end — date-aware for multi-day spans
+        mid_t = t0 + span / 2
+        _pango_fit(cr, _fmt_axis_time(t0, span), box["x"], box["y"] + box["h"] + 14,
                    size=9, color=pal["muted"])
-        _pango_fit(cr, _fmt_time(t1), box["x"] + box["w"], box["y"] + box["h"] + 12,
-                   size=9, color=pal["muted"], align="right")
+        _pango_fit(cr, _fmt_axis_time(mid_t, span), box["x"] + box["w"] / 2,
+                   box["y"] + box["h"] + 14, size=9, color=pal["muted"], align="center")
+        _pango_fit(cr, _fmt_axis_time(t1, span), box["x"] + box["w"],
+                   box["y"] + box["h"] + 14, size=9, color=pal["muted"], align="right")
 
         # Legend
         ly = box["y"] - 14
@@ -277,17 +290,17 @@ class ExpectActualChart(_ChartBase):
     __gtype_name__ = "G935ExpectActualChart"
 
     def __init__(self):
-        super().__init__(title="Remaining runtime · expected vs actual", height=170)
-        self._bottom_label_h = 32
+        super().__init__(title="Time left now · expected vs measured", height=175)
+        self._bottom_label_h = 36
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
         expected = data.get("expected_h")
         actual = data.get("actual_h")
-        health = data.get("health_pct")
+        delta_pct = data.get("delta_pct")  # actual vs expected %
 
         if expected is None and actual is None:
-            _pango_fit(cr, "Need a live discharge rate for remaining estimates",
+            _pango_fit(cr, "Discharge ~10 min off-charger for a live estimate",
                        box["x"] + box["w"] / 2, box["y"] + box["h"] / 2,
                        size=11, color=pal["muted"], align="center")
             return
@@ -295,9 +308,9 @@ class ExpectActualChart(_ChartBase):
         # bars
         items = []
         if expected is not None:
-            items.append(("Expected\n(rated)", expected, pal["expected"]))
+            items.append(("Rated\nexpect", expected, pal["expected"]))
         if actual is not None:
-            items.append(("Actual\n(data)", actual, pal["actual"]))
+            items.append(("Measured\nnow", actual, pal["actual"]))
 
         max_h = max((v for _, v, _ in items), default=1) * 1.15 or 1
         n = len(items)
@@ -330,12 +343,16 @@ class ExpectActualChart(_ChartBase):
                            box["y"] + box["h"] + 12 + li * 12,
                            size=9, color=pal["muted"], align="center")
 
-        # health badge
-        if health is not None:
-            hc = (pal["health_good"] if health >= 80
-                  else pal["health_mid"] if health >= 55
-                  else pal["health_bad"])
-            badge = f"Health ≈ {health:.0f}%"
+        # delta badge (more useful than re-stating health)
+        if delta_pct is not None:
+            sign = "+" if delta_pct >= 0 else "−"
+            if delta_pct >= 10:
+                hc = pal["health_good"]
+            elif delta_pct <= -15:
+                hc = pal["health_bad"]
+            else:
+                hc = pal["muted"]
+            badge = f"{sign}{abs(delta_pct):.0f}% vs rated"
             _pango_fit(cr, badge, box["x"] + box["w"], box["y"] - 2,
                        size=11, color=hc, align="right")
 
@@ -348,21 +365,27 @@ class SessionRuntimeChart(_ChartBase):
     __gtype_name__ = "G935SessionRuntimeChart"
 
     def __init__(self):
-        super().__init__(title="Session full-runtime estimates", height=160)
-        self._bottom_label_h = 20
+        super().__init__(title="Full-runtime from each solid session", height=165)
+        self._bottom_label_h = 22
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
-        sessions = data.get("sessions") or []  # [{label, hours, rated}]
+        # Prefer solid (qualifying) sessions only for a cleaner story
+        all_sessions = data.get("sessions") or []  # [{label, hours, ...}]
         rated = data.get("rated_h")
+        sessions = [s for s in all_sessions if s.get("hours") is not None]
+        n_short = len(all_sessions) - len(sessions)
 
         if not sessions:
-            _pango_fit(cr, "No qualifying discharge sessions yet",
+            msg = "No solid sessions yet"
+            if n_short:
+                msg = f"{n_short} short session(s) — need ≥30 min / ≥8% drop"
+            _pango_fit(cr, msg,
                        box["x"] + box["w"] / 2, box["y"] + box["h"] / 2,
                        size=11, color=pal["muted"], align="center")
             return
 
-        vals = [s["hours"] for s in sessions if s.get("hours") is not None]
+        vals = [s["hours"] for s in sessions]
         if rated:
             vals.append(rated)
         y_max = max(vals) * 1.2 if vals else 1
@@ -383,19 +406,14 @@ class SessionRuntimeChart(_ChartBase):
                        size=9, color=pal["expected"], align="right")
 
         n = len(sessions)
-        gap = 8
-        bar_w = max(6, min(36, (box["w"] - gap * (n + 1)) / max(n, 1)))
+        gap = 10
+        bar_w = max(10, min(48, (box["w"] - gap * (n + 1)) / max(n, 1)))
         total = n * bar_w + (n + 1) * gap
         x0 = box["x"] + max(0, (box["w"] - total) / 2) + gap
 
         for i, s in enumerate(sessions):
-            hours = s.get("hours")
+            hours = s["hours"]
             x = x0 + i * (bar_w + gap)
-            if hours is None:
-                _set_source(cr, pal["bar_bg"])
-                self._round_rect(cr, x, box["y"] + box["h"] - 8, bar_w, 8, 3)
-                cr.fill()
-                continue
             bh = (hours / y_max) * box["h"]
             y = box["y"] + box["h"] - bh
             # color by vs rated
@@ -407,16 +425,21 @@ class SessionRuntimeChart(_ChartBase):
                 color = pal["actual"]
             _set_source(cr, color)
             if bh > 2:
-                self._round_rect(cr, x, y, bar_w, bh, 3)
+                self._round_rect(cr, x, y, bar_w, bh, 4)
                 cr.fill()
+            # value on / above bar
+            label_y = y - 4 if bh > 22 else y + 12
+            lc = pal["text"] if bh > 22 else color
+            _pango_fit(cr, _fmt_hours(hours), x + bar_w / 2, label_y,
+                       size=9, color=lc, align="center")
 
-        # x labels (sparse)
-        step = max(1, n // 6)
+        # x labels
+        step = max(1, n // 8)
         for i, s in enumerate(sessions):
             if i % step != 0 and i != n - 1:
                 continue
             x = x0 + i * (bar_w + gap) + bar_w / 2
-            _pango_fit(cr, s.get("label", ""), x, box["y"] + box["h"] + 12,
+            _pango_fit(cr, s.get("label", ""), x, box["y"] + box["h"] + 14,
                        size=8, color=pal["muted"], align="center")
 
         self._axis_frame(cr, box, pal)
@@ -428,13 +451,14 @@ class DrainProfileChart(_ChartBase):
     __gtype_name__ = "G935DrainProfileChart"
 
     def __init__(self):
-        super().__init__(title="Learned drain profile (mV/h by voltage)", height=150)
-        self._bottom_label_h = 20
+        super().__init__(title="How hard it drains by voltage (mV/h)", height=155)
+        self._bottom_label_h = 22
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
         bins = data.get("bins") or {}  # {mv: rate}
         weak = data.get("weak_bins") or {}
+        current_mv = data.get("current_mv")
 
         all_bins = sorted(set(bins) | set(weak))
         if not all_bins:
@@ -444,30 +468,46 @@ class DrainProfileChart(_ChartBase):
             return
 
         rates = [bins.get(b) or weak.get(b) or 0 for b in all_bins]
-        y_max = max(rates) * 1.2 if rates else 1
+        y_max = max(rates) * 1.25 if rates else 1
         self._grid_y(cr, box, pal, 0, y_max, ticks=3, fmt=lambda v: f"{v:.0f}")
 
         n = len(all_bins)
         gap = 4
         bar_w = max(4, (box["w"] - gap * (n + 1)) / n)
+        bin_mv = data.get("bin_mv") or 50
+        cur_bin = None
+        if current_mv is not None:
+            cur_bin = int(round(current_mv / bin_mv) * bin_mv)
+
         for i, b in enumerate(all_bins):
             rate = bins.get(b) or weak.get(b) or 0
             solid = b in bins
             x = box["x"] + gap + i * (bar_w + gap)
             bh = (rate / y_max) * box["h"] if y_max else 0
             y = box["y"] + box["h"] - bh
-            _set_source(cr, pal["actual"] if solid else pal["actual"],
-                        0.95 if solid else 0.35)
+            # Highlight the bin matching current voltage
+            if cur_bin is not None and abs(b - cur_bin) < bin_mv / 2:
+                color = pal["expected"]
+                alpha = 1.0
+            else:
+                color = pal["actual"]
+                alpha = 0.95 if solid else 0.35
+            _set_source(cr, color, alpha)
             if bh > 1:
                 self._round_rect(cr, x, y, bar_w, bh, 2)
                 cr.fill()
 
-        # x labels ends + mid
-        for idx in {0, n // 2, n - 1}:
+        # x labels ends + mid (full → empty reads left→right if bins descend)
+        for idx in sorted({0, n // 2, n - 1}):
             b = all_bins[idx]
             x = box["x"] + gap + idx * (bar_w + gap) + bar_w / 2
-            _pango_fit(cr, f"{b}", x, box["y"] + box["h"] + 12,
+            _pango_fit(cr, f"{b}", x, box["y"] + box["h"] + 14,
                        size=8, color=pal["muted"], align="center")
+
+        # Hint under title area
+        if cur_bin is not None:
+            _pango_fit(cr, "amber = now", box["x"] + box["w"], box["y"] - 2,
+                       size=9, color=pal["expected"], align="right")
 
         self._axis_frame(cr, box, pal)
 
@@ -478,29 +518,32 @@ class HealthGaugeChart(_ChartBase):
     __gtype_name__ = "G935HealthGaugeChart"
 
     def __init__(self):
-        super().__init__(title="Battery health", height=140)
+        super().__init__(title="Battery health", height=150)
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
         health = data.get("health_pct")
         learned = data.get("learned_h")
         rated = data.get("rated_h")
+        n_sess = data.get("n_sessions")
+        mah = data.get("effective_mah")
+        design = data.get("design_mah")
 
         cx = box["x"] + box["w"] / 2
-        cy = box["y"] + box["h"] * 0.72
-        radius = min(box["w"] / 2 - 10, box["h"] * 0.85)
+        cy = box["y"] + box["h"] * 0.68
+        radius = min(box["w"] / 2 - 10, box["h"] * 0.78)
 
         # background arc (180°)
-        cr.set_line_width(12)
+        cr.set_line_width(14)
         cr.set_line_cap(1)  # ROUND
         _set_source(cr, pal["bar_bg"])
         cr.arc(cx, cy, radius, math.pi, 2 * math.pi)
         cr.stroke()
 
         if health is None:
-            _pango_fit(cr, "—", cx, cy - radius * 0.35, size=22,
+            _pango_fit(cr, "—", cx, cy - radius * 0.4, size=24,
                        color=pal["muted"], align="center")
-            _pango_fit(cr, "collecting…", cx, cy - 4, size=10,
+            _pango_fit(cr, "need solid sessions", cx, cy - 6, size=10,
                        color=pal["muted"], align="center")
             return
 
@@ -513,15 +556,31 @@ class HealthGaugeChart(_ChartBase):
         cr.arc(cx, cy, radius, math.pi, math.pi + math.pi * frac)
         cr.stroke()
 
-        _pango_fit(cr, f"{health:.0f}%", cx, cy - radius * 0.35, size=22,
+        _pango_fit(cr, f"{health:.0f}%", cx, cy - radius * 0.42, size=24,
                    color=pal["text"], align="center")
         if learned is not None and rated is not None:
             sub = f"{_fmt_hours(learned)} real · {rated:g}h rated"
-            _pango_fit(cr, sub, cx, cy - 2, size=10, color=pal["muted"],
+            _pango_fit(cr, sub, cx, cy - 8, size=10, color=pal["muted"],
+                       align="center")
+        conf = None
+        if n_sess is not None:
+            conf = f"{n_sess} session{'s' if n_sess != 1 else ''}"
+        if mah is not None and design is not None:
+            conf = (f"{conf} · ~{mah}/{design} mAh" if conf
+                    else f"~{mah}/{design} mAh")
+        if conf:
+            _pango_fit(cr, conf, cx, cy + 8, size=9, color=pal["muted"],
                        align="center")
 
 
 def _fmt_time(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def _fmt_axis_time(ts, span_s):
+    """Axis label: include date when the window spans more than ~18 hours."""
+    if span_s >= 18 * 3600:
+        return time.strftime("%m/%d %H:%M", time.localtime(ts))
     return time.strftime("%H:%M", time.localtime(ts))
 
 
@@ -536,19 +595,37 @@ def _fmt_hours(h):
     return f"{total_m}m"
 
 
-def build_history_points(recent, batt_percent_fn, max_points=400):
-    """Downsample recent samples to chart points [(t, pct, charging), ...]."""
+def build_history_points(recent, batt_percent_fn, max_points=400, full_mv=4200):
+    """Downsample recent samples to chart points [(t, pct, charging), ...].
+
+    While charging, the ADC often reports charger-path voltage (spikes to
+    ~4.3 V+). Hold the last resting cell voltage for SoC so the curve does
+    not jump to a fake 100% on plug-in.
+    """
     if not recent:
         return []
-    step = max(1, len(recent) // max_points)
+    # First pass: resolve cell mV for every sample (charging holds last rest)
+    resolved = []
+    last_rest = None
+    for t, mv, chg in recent:
+        mv = int(mv)
+        chg = bool(chg)
+        if not chg:
+            last_rest = mv
+            cell = mv
+        else:
+            cell = last_rest if last_rest is not None else min(mv, int(full_mv))
+        resolved.append((int(t), cell, chg))
+
+    step = max(1, len(resolved) // max_points)
     pts = []
-    for i in range(0, len(recent), step):
-        t, mv, chg = recent[i]
-        pts.append((int(t), int(batt_percent_fn(int(mv))), bool(chg)))
+    for i in range(0, len(resolved), step):
+        t, cell, chg = resolved[i]
+        pts.append((t, int(batt_percent_fn(cell)), chg))
     # always include last
-    t, mv, chg = recent[-1]
-    if not pts or pts[-1][0] != int(t):
-        pts.append((int(t), int(batt_percent_fn(int(mv))), bool(chg)))
+    t, cell, chg = resolved[-1]
+    if not pts or pts[-1][0] != t:
+        pts.append((t, int(batt_percent_fn(cell)), chg))
     return pts
 
 

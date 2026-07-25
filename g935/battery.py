@@ -67,6 +67,13 @@ PEAKS_MAX = 50
 SAVE_EVERY_S = 300
 N_RECENT_SESSIONS = 8            # median window for learned full runtime
 
+# While charging, the 0x1f20 ADC often reads the *charger path* (charge rail /
+# cell under charge current), not open-circuit cell voltage. Captures show jumps
+# of 200–400 mV on plug and peaks to ~4370 mV — well above 4.20 V full. SoC and
+# peak tracking must not treat those as resting cell voltage.
+CHARGE_RAIL_ABOVE_FULL_MV = 40   # raw mV > full + this while charging → rail
+POST_CHARGE_PEAK_SAMPLES = 5     # rest samples after unplug for true peak OCV
+
 
 def health_file() -> str:
     return os.path.join(config_dir(), "health.json")
@@ -92,6 +99,42 @@ def batt_percent(mv: int) -> int:
         if v2 <= mv <= v1:
             return round(p2 + (p1 - p2) * (mv - v2) / (v1 - v2))
     return 0
+
+
+def is_charge_path_mv(mv, full_mv=None, charging=True):
+    """True when a reading looks like charger-path voltage, not resting cell OCV."""
+    if not charging:
+        return False
+    full = int(full_mv if full_mv is not None else BATT_CURVE[0][0])
+    return int(mv) > full + CHARGE_RAIL_ABOVE_FULL_MV
+
+
+def cell_mv(mv, charging, last_rest_mv=None, full_mv=None):
+    """Best cell-voltage estimate for SoC.
+
+    Off-charger: trust the ADC. On-charger: hold the last resting (discharge)
+    reading so we never map charge-rail spikes (e.g. 4370 mV) to 100%.
+
+    Returns None when charging with no rest baseline and the reading is a
+    charge-rail spike (SoC unknown — do not invent 100%).
+    """
+    full = int(full_mv if full_mv is not None else BATT_CURVE[0][0])
+    mv = int(mv)
+    if not charging:
+        return mv
+    if last_rest_mv is not None:
+        return int(last_rest_mv)
+    # No rest baseline: refuse rail spikes; mild clamp otherwise
+    if is_charge_path_mv(mv, full_mv=full, charging=True):
+        return None
+    return min(mv, full)
+
+
+def sanitize_peaks(peaks, full_mv=None):
+    """Drop peak samples that are clearly charger-rail, not cell OCV."""
+    full = int(full_mv if full_mv is not None else BATT_CURVE[0][0])
+    limit = full + CHARGE_RAIL_ABOVE_FULL_MV
+    return [[int(t), int(mv)] for t, mv in peaks if int(mv) <= limit]
 
 
 def segment_rate(seg):
@@ -422,6 +465,216 @@ def profile_summary(profile):
     }
 
 
+def peak_charge_trend(peaks, full_mv=4200, n_recent=8):
+    """Summarize recent full-charge peaks for degradation signal.
+
+    Returns dict with latest/median peak, vs-spec %, and direction, or None.
+    """
+    if not peaks:
+        return None
+    vals = [int(p[1]) for p in peaks if p and len(p) >= 2]
+    if not vals:
+        return None
+    recent = vals[-n_recent:]
+    latest = recent[-1]
+    med = statistics.median(recent)
+    vs_full = 100.0 * latest / full_mv if full_mv else None
+    direction = None
+    if len(recent) >= 4:
+        mid = len(recent) // 2
+        early = statistics.median(recent[:mid])
+        late = statistics.median(recent[mid:])
+        delta = late - early
+        if abs(delta) >= 15:
+            direction = "falling" if delta < 0 else "rising"
+        else:
+            direction = "stable"
+    return {
+        "latest_mv": latest,
+        "median_mv": med,
+        "n": len(recent),
+        "vs_full_pct": vs_full,
+        "full_mv": full_mv,
+        "direction": direction,
+        "all_recent": recent,
+    }
+
+
+def build_insights(analysis, state=None, charging=None):
+    """Short, human-readable takeaways for the Battery Health hero strip.
+
+    Returns a list of insight dicts: {tone, text} where tone is
+    'good' | 'warn' | 'bad' | 'info' | 'muted'.
+    """
+    insights = []
+    a = analysis or {}
+    health = a.get("health_pct")
+    n_sess = a.get("n_sessions") or 0
+    learned = a.get("learned_full_runtime_h")
+    rated = a.get("rated_runtime_h")
+    remain = a.get("remain_best_h")
+    expect = a.get("remain_expected_h")
+    live_rate = a.get("live_rate_pct_per_h")
+    ps = a.get("profile_summary") or {}
+    peaks = a.get("peak_summary")
+
+    # Charging-first messaging
+    if charging is True or state == "charging":
+        insights.append({
+            "tone": "good",
+            "text": "Charging — remaining runtime updates once you're off the dock.",
+        })
+    elif state == "headset off" or state == "unknown":
+        insights.append({
+            "tone": "muted",
+            "text": "Headset offline. Open this page while wearing it to keep logging.",
+        })
+
+    # Health narrative
+    if health is None:
+        if n_sess == 0:
+            insights.append({
+                "tone": "info",
+                "text": "Health needs longer use: stitch ≥30 min off-charger with ≥8% drop "
+                        "(short sessions merge across brief offs).",
+            })
+    else:
+        conf = ("early read" if n_sess < 3
+                else f"median of {n_sess} sessions")
+        if health >= 90:
+            tone, vibe = "good", "in great shape"
+        elif health >= 75:
+            tone, vibe = "good", "holding up well"
+        elif health >= 55:
+            tone, vibe = "warn", "showing wear"
+        else:
+            tone, vibe = "bad", "well below rated"
+        learned_s = _fmt_h_short(learned)
+        rated_s = f"{rated:g}h" if rated else "—"
+        insights.append({
+            "tone": tone,
+            "text": f"Battery is {vibe}: ~{health:.0f}% health · {learned_s} real full "
+                    f"runtime vs {rated_s} rated ({conf}).",
+        })
+
+    # Live remaining vs rated at this level
+    if remain is not None and expect is not None and expect > 0 and charging is not True:
+        rel = 100.0 * (remain / expect - 1.0)
+        if rel >= 15:
+            insights.append({
+                "tone": "good",
+                "text": f"Right now lasting {abs(rel):.0f}% longer than rated at this "
+                        f"charge level ({_fmt_h_short(remain)} left vs "
+                        f"{_fmt_h_short(expect)} expected).",
+            })
+        elif rel <= -20:
+            insights.append({
+                "tone": "warn",
+                "text": f"Draining faster than rated (−{abs(rel):.0f}% at this level). "
+                        f"Heavy audio/RGB load, or the cell is aging.",
+            })
+        elif remain < 0.75:
+            insights.append({
+                "tone": "warn",
+                "text": f"About {_fmt_h_short(remain)} left at the current drain rate — "
+                        f"plug in soon if you need a long session.",
+            })
+
+    # Live rate context: compare to rated average drain
+    if live_rate is not None and rated and rated > 0 and charging is not True:
+        rated_rate = 100.0 / rated
+        if live_rate > rated_rate * 1.4:
+            insights.append({
+                "tone": "info",
+                "text": f"Live drain −{live_rate:.1f}%/h is heavier than the "
+                        f"−{rated_rate:.1f}%/h rated average.",
+            })
+        elif live_rate < rated_rate * 0.7:
+            insights.append({
+                "tone": "good",
+                "text": f"Light use right now (−{live_rate:.1f}%/h vs "
+                        f"−{rated_rate:.1f}%/h rated average).",
+            })
+
+    # Profile readiness
+    if ps.get("ready"):
+        span = ps.get("span_mv")
+        span_s = f"{span[0]}–{span[1]} mV" if span else "the voltage range"
+        insights.append({
+            "tone": "info",
+            "text": f"Drain profile learned: {ps.get('hours_logged', 0):.1f} h off-charger, "
+                    f"{ps.get('bins_filled', 0)} voltage bins across {span_s}.",
+        })
+    elif ps.get("hours_logged", 0) > 0:
+        insights.append({
+            "tone": "muted",
+            "text": f"Building drain profile… {ps.get('hours_logged', 0):.1f} h logged, "
+                    f"{ps.get('bins_filled', 0)} solid bins so far.",
+        })
+
+    # Peak charge degradation
+    if peaks and peaks.get("latest_mv") and peaks.get("full_mv"):
+        latest = peaks["latest_mv"]
+        full = peaks["full_mv"]
+        # Ignore ADC spikes well above full (charging noise)
+        if latest <= full + 50:
+            shortfall = full - latest
+            if shortfall >= 80:
+                insights.append({
+                    "tone": "warn",
+                    "text": f"Recent full charges top out at {latest} mV "
+                            f"({peaks['vs_full_pct']:.1f}% of {full} mV spec).",
+                })
+            elif peaks.get("direction") == "falling":
+                insights.append({
+                    "tone": "info",
+                    "text": f"Charge peaks trending down (latest {latest} mV, "
+                            f"median {peaks['median_mv']:.0f} mV over "
+                            f"{peaks['n']} charges).",
+                })
+
+    # Cap so the UI stays scannable
+    return insights[:4]
+
+
+def _fmt_h_short(hours):
+    if hours is None:
+        return "—"
+    if hours <= 0:
+        return "0m"
+    total_m = int(round(hours * 60))
+    if total_m >= 60:
+        return f"{total_m // 60}h{total_m % 60:02d}m"
+    return f"{total_m}m"
+
+
+def session_list_rows(segments, rated_runtime_h, limit=10):
+    """Rows for the recent-sessions list: label, duration, drain, full runtime, quality."""
+    rows = []
+    sessions = merge_discharge_sessions(segments)
+    for sess in reversed(sessions[-limit:]):
+        full = session_full_runtime_h(sess)
+        dpct = sess["pct_start"] - sess["pct_end"]
+        quality = "solid" if full is not None else "short"
+        pct_of_rated = None
+        if full is not None and rated_runtime_h and rated_runtime_h > 0:
+            pct_of_rated = min(120.0, 100.0 * full / rated_runtime_h)
+        rows.append({
+            "t_start": sess["t_start"],
+            "on_time_s": sess["on_time_s"],
+            "parts": sess["parts"],
+            "pct_start": sess["pct_start"],
+            "pct_end": sess["pct_end"],
+            "mv_start": sess["mv_start"],
+            "mv_end": sess["mv_end"],
+            "dpct": dpct,
+            "full_h": full,
+            "pct_of_rated": pct_of_rated,
+            "quality": quality,
+        })
+    return rows
+
+
 def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
     """Bundle expect-vs-real health + live remaining estimates.
 
@@ -471,8 +724,12 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
         int(health_pct / 100.0 * design) if health_pct is not None else None
     )
 
-    # Peak charge degradation signal
-    peaks = []  # filled by caller if needed
+    # Rated average drain (%/h) for live-rate comparison in the UI
+    rated_rate = (100.0 / rated_runtime_h) if rated_runtime_h else None
+    # Delta of measured remaining vs rated remaining at this voltage
+    remain_vs_rated_pct = None
+    if remain_best is not None and remain_expected is not None and remain_expected > 0:
+        remain_vs_rated_pct = 100.0 * (remain_best / remain_expected - 1.0)
 
     return {
         "learned_full_runtime_h": learned_h,
@@ -487,12 +744,14 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
         "live_rate_pct_per_h": live_rate,
         "live_rate_points": n_pts,
         "live_rate_span_s": span_s,
+        "rated_rate_pct_per_h": rated_rate,
         "remain_live_h": remain_live,
         "remain_profile_h": remain_profile,
         "remain_expected_h": remain_expected,
         "remain_expected_adj_h": remain_expected_adj,
         "remain_best_h": remain_best,
         "remain_source": remain_source,
+        "remain_vs_rated_pct": remain_vs_rated_pct,
         "profile": profile,
         "profile_summary": psum,
     }
@@ -503,6 +762,9 @@ class HealthTracker:
 
     Dense `recent` datapoints drive the learned drain profile and live ETA.
     Closed `segments` (and merges of them) drive full-runtime / health %.
+
+    While charging, raw ADC mV is treated as *path* voltage (often the charge
+    rail). SoC % and peak OCV use last resting cell voltage instead.
     """
 
     def __init__(self, path=None):
@@ -510,7 +772,11 @@ class HealthTracker:
         data = self._load()
         self.settings = data["settings"]
         self.segments = data["segments"]
-        self.peaks = data["peak_charge_mv"]
+        full = int(self.settings.get("full_mv", HEALTH_DEFAULTS["full_mv"]))
+        # Drop historical charger-rail peaks so health UI isn't poisoned
+        raw_peaks = data["peak_charge_mv"]
+        self.peaks = sanitize_peaks(raw_peaks, full_mv=full)
+        self._peaks_scrubbed = len(self.peaks) != len(raw_peaks)
         self.recent = data["recent"]
         self.cur = None
         self.cur_mvs = []
@@ -519,6 +785,40 @@ class HealthTracker:
         self.last_recent_t = 0
         self.last_save = time.time()
         self.dirty = False
+        self.last_rest_mv = self._infer_last_rest()
+        # After a charge that only saw rail voltages, capture peak from rest
+        self.pending_peak_from_rest = False
+        self.post_charge_mvs = []
+        if self._peaks_scrubbed:
+            self.save()
+
+    def _full_mv(self):
+        return int(self.settings.get("full_mv", HEALTH_DEFAULTS["full_mv"]))
+
+    def _infer_last_rest(self):
+        for _t, mv, chg in reversed(self.recent):
+            if not chg:
+                return int(mv)
+        return None
+
+    def reading(self, mv, charging):
+        """Interpret a raw ADC sample for display / SoC.
+
+        Returns dict: raw_mv, cell_mv, pct, charging, last_rest_mv, path_is_rail.
+        """
+        full = self._full_mv()
+        raw = int(mv)
+        chg = bool(charging)
+        rest = self.last_rest_mv
+        c_mv = cell_mv(raw, chg, last_rest_mv=rest, full_mv=full)
+        return {
+            "raw_mv": raw,
+            "cell_mv": c_mv,
+            "pct": batt_percent(c_mv) if c_mv is not None else None,
+            "charging": chg,
+            "last_rest_mv": rest,
+            "path_is_rail": is_charge_path_mv(raw, full_mv=full, charging=chg),
+        }
 
     def add_sample(self, t, mv, charging):
         if not self.settings["tracking"]:
@@ -526,7 +826,17 @@ class HealthTracker:
         if self.last_t and t - self.last_t > SEG_GAP_S:
             self.close_segment("gap")
         self.last_t = t
+        mv = int(mv)
+        charging = bool(charging)
+        full = self._full_mv()
         seg_type = "charge" if charging else "discharge"
+
+        # Update resting baseline only off-charger (true cell / OCV path)
+        if not charging:
+            self._maybe_capture_post_charge_peak(t, mv)
+            # Smoothed rest update happens below after median; seed raw first
+            if self.last_rest_mv is None:
+                self.last_rest_mv = mv
 
         if self.cur is None:
             self._open(seg_type, t, mv)
@@ -540,14 +850,21 @@ class HealthTracker:
 
         self.cur_mvs = (self.cur_mvs + [mv])[-5:]
         smoothed = int(statistics.median(self.cur_mvs))
+        c_mv = cell_mv(smoothed, charging, self.last_rest_mv, full_mv=full)
         self.cur["t_end"] = int(t)
+        # Keep raw path mV in the segment (useful diagnostics); % from cell
         self.cur["mv_end"] = smoothed
-        self.cur["pct_end"] = batt_percent(smoothed)
+        if c_mv is not None:
+            self.cur["pct_end"] = batt_percent(c_mv)
+            self.cur["cell_mv_end"] = c_mv
         self.cur["samples"] += 1
         if self.cur["type"] == "charge":
             self.cur["mv_peak"] = max(self.cur.get("mv_peak") or 0, mv)
+        elif not charging:
+            self.last_rest_mv = smoothed
 
         if t - self.last_recent_t >= RECENT_DECIM_S:
+            # Store raw ADC always; charts/SoC sanitize charging samples
             self.recent.append([int(t), int(mv), 1 if charging else 0])
             del self.recent[:-RECENT_MAX]
             self.last_recent_t = t
@@ -555,12 +872,37 @@ class HealthTracker:
         if self.dirty and t - self.last_save > SAVE_EVERY_S:
             self.save()
 
+    def _maybe_capture_post_charge_peak(self, t, mv):
+        """After a rail-only charge, learn peak OCV from early rest samples."""
+        if not self.pending_peak_from_rest:
+            return
+        self.post_charge_mvs.append(int(mv))
+        if len(self.post_charge_mvs) < POST_CHARGE_PEAK_SAMPLES:
+            return
+        # First sample right after unplug is still elevated; use the rest window
+        window = self.post_charge_mvs[1:] or self.post_charge_mvs
+        peak = int(statistics.median(window))
+        full = self._full_mv()
+        if peak <= full + CHARGE_RAIL_ABOVE_FULL_MV:
+            self.peaks.append([int(t), peak])
+            del self.peaks[:-PEAKS_MAX]
+            self.dirty = True
+        self.pending_peak_from_rest = False
+        self.post_charge_mvs = []
+
     def _open(self, seg_type, t, mv):
+        full = self._full_mv()
+        charging = seg_type == "charge"
+        c_mv = cell_mv(mv, charging, self.last_rest_mv, full_mv=full)
+        # Fall back for segment bookkeeping only if SoC truly unknown
+        pct = batt_percent(c_mv) if c_mv is not None else (
+            batt_percent(self.last_rest_mv) if self.last_rest_mv is not None else 0)
         self.cur = {
             "type": seg_type, "t_start": int(t), "t_end": int(t),
             "mv_start": mv, "mv_end": mv,
-            "pct_start": batt_percent(mv), "pct_end": batt_percent(mv),
-            "samples": 1, "mv_peak": mv if seg_type == "charge" else None,
+            "pct_start": pct, "pct_end": pct,
+            "cell_mv_start": c_mv, "cell_mv_end": c_mv,
+            "samples": 1, "mv_peak": mv if charging else None,
         }
         self.cur_mvs = [mv]
         self.pending_flip = 0
@@ -572,19 +914,38 @@ class HealthTracker:
         self.pending_flip = 0
         seg["reason"] = reason
         if seg["samples"] >= SEG_MIN_SAMPLES:
-            if seg["type"] == "charge" and seg["mv_peak"]:
-                self.peaks.append([seg["t_end"], seg["mv_peak"]])
-                del self.peaks[:-PEAKS_MAX]
+            if seg["type"] == "charge" and seg.get("mv_peak"):
+                self._record_charge_peak(seg)
             self.segments.append(seg)
             del self.segments[:-SEG_MAX]
         self.save()
 
+    def _record_charge_peak(self, seg):
+        """Record a full-charge OCV peak; never store charger-rail spikes."""
+        full = self._full_mv()
+        peak = int(seg.get("mv_peak") or 0)
+        if peak <= 0:
+            return
+        if is_charge_path_mv(peak, full_mv=full, charging=True):
+            # Peak was the rail — capture true OCV after unplug instead
+            self.pending_peak_from_rest = True
+            self.post_charge_mvs = []
+            return
+        # Plausible cell voltage under/near CV
+        self.peaks.append([int(seg["t_end"]), peak])
+        del self.peaks[:-PEAKS_MAX]
+
     def mark_offline(self):
         self.close_segment("headset off")
         self.last_t = 0
+        # Don't clear last_rest_mv — still the best SoC anchor when back on
 
-    def analysis(self, mv=None, rated_runtime_h=None):
-        """Expect-vs-real + remaining runtime package for the UI."""
+    def analysis(self, mv=None, rated_runtime_h=None, charging=None):
+        """Expect-vs-real + remaining runtime package for the UI.
+
+        When `charging` is True, `mv` is treated as path voltage and replaced
+        with the cell estimate for remaining-runtime math.
+        """
         if rated_runtime_h is None:
             key = (
                 "rated_runtime_h_rgb_on"
@@ -592,16 +953,28 @@ class HealthTracker:
                 else "rated_runtime_h_rgb_off"
             )
             rated_runtime_h = float(self.settings[key])
+        cell = None
+        if mv is not None:
+            cell = cell_mv(
+                mv, bool(charging), self.last_rest_mv, full_mv=self._full_mv())
         result = runtime_analysis(
             self.segments, self.recent, rated_runtime_h,
-            mv=mv, settings=self.settings,
+            mv=cell, settings=self.settings,
         )
+        result["raw_mv"] = int(mv) if mv is not None else None
+        result["cell_mv"] = cell
+        result["last_rest_mv"] = self.last_rest_mv
         if self.peaks:
             result["peak_recent_mv"] = max(p[1] for p in self.peaks[-10:])
             result["peaks"] = list(self.peaks)
+            result["peak_summary"] = peak_charge_trend(
+                self.peaks, full_mv=self._full_mv())
         else:
             result["peak_recent_mv"] = None
             result["peaks"] = []
+            result["peak_summary"] = None
+        result["session_rows"] = session_list_rows(
+            self.segments, result.get("rated_runtime_h"))
         return result
 
     def save(self):

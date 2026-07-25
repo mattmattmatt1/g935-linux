@@ -28,7 +28,9 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from g935.daemon_status import acquire_daemon_lock
-from g935.hidpp import G935_PID, find_device_by_pid, open_hidraw, transact
+from g935.hidpp import (
+    G935_PID, PollPresence, find_device_by_pid, open_hidraw, transact,
+)
 from g935.mic import MicHandler
 from g935.mode import load_mode
 
@@ -36,6 +38,7 @@ log = logging.getLogger("g935.dspd")
 
 POLL_S = 5
 MIC_POLL_S = 0.25
+MISSED_POLLS_OFFLINE = 3
 ENABLE = "11ff052b01"
 BATTERY_GET = "11ff080b"
 ALSA_USBID = "046d:0a87"
@@ -67,7 +70,7 @@ def main() -> None:
         sys.exit(1)
 
     mic = MicHandler(usbid=ALSA_USBID, mode_loader=load_mode)
-    connected = False
+    presence = PollPresence(miss_limit=MISSED_POLLS_OFFLINE)
     fd = None
     next_poll = 0.0
 
@@ -75,7 +78,7 @@ def main() -> None:
         if fd is None:
             dev = find_device_by_pid(G935_PID)
             if dev is None:
-                connected = False
+                presence.reset()
                 time.sleep(POLL_S)
                 continue
             try:
@@ -93,22 +96,24 @@ def main() -> None:
                     on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
                 )
                 next_poll = now + POLL_S
-                if status == "ACK":
-                    if not connected:
-                        mode = load_mode()
-                        log.info("headset detected (power-on), mode=%s", mode)
-                        if mode == "ghub":
-                            time.sleep(2)
-                            enable_dsp(fd)
-                            # Power-on with boom up may carry the device flag.
-                            mic.mark_needs_unmute()
-                        else:
-                            log.info("hardware mode — leaving headset stock")
-                        connected = True
-                elif status == "GONE":
+                if status == "GONE":
                     raise OSError("device gone during battery poll")
-                else:
-                    connected = False
+                transition = presence.observe(status == "ACK")
+                if transition is True:
+                    mode = load_mode()
+                    log.info("headset detected (power-on), mode=%s", mode)
+                    if mode == "ghub":
+                        time.sleep(2)
+                        enable_dsp(fd)
+                        # Power-on with boom up may carry the device flag.
+                        mic.mark_needs_unmute()
+                    else:
+                        log.info("hardware mode — leaving headset stock")
+                elif transition is False:
+                    log.info(
+                        "headset unavailable after %d missed polls",
+                        MISSED_POLLS_OFFLINE,
+                    )
                     mic.reset()
 
             wait = max(0.0, min(next_poll, time.time() + MIC_POLL_S) - time.time())
@@ -117,7 +122,7 @@ def main() -> None:
                 buf = os.read(fd, 64)
                 if len(buf) >= 2 and buf[0] != 0x11:
                     mic.handle_report(buf, fd)
-            if connected:
+            if presence.connected:
                 mic.poll(fd)
         except OSError:
             try:
@@ -125,7 +130,7 @@ def main() -> None:
             except OSError:
                 pass
             fd = None
-            connected = False
+            presence.reset()
             mic.reset()
             log.info("receiver gone, rescanning")
             time.sleep(1)

@@ -9,12 +9,13 @@ Full control of the Logitech G935 wireless headset over raw HID
   headset power-on.
 - **10-band hardware EQ** (32 Hz – 16 kHz, ±12 dB) — stored on the headset,
   survives reboots, works with any OS afterwards.
-- **Sidetone** (0–100), **RGB lighting** (logo + strip zones, persistent),
-  **battery level + health graphs**, and **boom-mic mute handling** (the mic
-  logic G HUB normally runs host-side).
+- **Sidetone** (0–100), **RGB lighting** (fixed, breathing, cycling; color,
+  period, waveform, intensity, ramp, and boot animation), **live G1–G3
+  events**, **auto power-off**, **battery level + health graphs**, and
+  **boom-mic mute handling** (the mic logic G HUB normally runs host-side).
 - **GTK3 control panel** (`g935-control`) with tray icon, EQ presets,
   lighting, sidetone, battery expect-vs-actual charts, a raw HID++ console,
-  and audio-device pickers.
+  audio-device pickers, and a live hardware/firmware capability inventory.
 
 ## Screenshots
 
@@ -93,6 +94,7 @@ GUI for G HUB mode.
 | Sound | flat/narrow | DSP soundstage on |
 | Boom mute | handled fully in firmware, just works | host must manage it (`g935-dspd`) |
 | Mic button | works on-device | only emits an event (daemon handles it) |
+| G1–G3 | headset defaults | diverted HID++ events shown live in the panel |
 
 Mode is stored in `~/.config/g935/mode` and re-asserted by the daemon on every
 power-on. **If you use G HUB mode, run the daemon.** Without it, raising the
@@ -119,6 +121,19 @@ Data lives in `~/.config/g935/health.json`. Health % needs longer off-charger
 sessions (merged ≥30 min / ≥8% drop); short sessions still feed live ETA and
 the profile. No coulomb counter exists — this is an honest voltage-based
 extrapolation, not a BMS.
+
+**While charging**, the headset ADC often reports the *charger path* (rail
+spikes above 4.2 V), not resting cell voltage. The UI freezes SoC at the last
+off-charger reading and shows path mV separately; full-charge peaks are taken
+from rest after unplug, never from rail spikes.
+
+### Left-ear-only after sleep
+
+After suspend/resume, PipeWire/EasyEffects sometimes re-links only the left
+channel into the G935 (`playback_FL`) and leaves the right port unconnected
+(often named `playback_2`). The control panel checks every few seconds, shows
+a **🎧 L-only** warning + banner, desktop-notifies, and auto-runs `pw-link` to
+restore FR. Tray menu also gets **Fix stereo** while broken.
 
 ## Layout
 

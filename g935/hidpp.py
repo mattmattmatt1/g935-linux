@@ -102,10 +102,17 @@ def open_hidraw(path: str) -> int:
     return os.open(path, os.O_RDWR | os.O_NONBLOCK)
 
 
-def transact(fd, hx, timeout=1.0, on_non_hidpp=None):
+def is_hidpp_notification(buf: bytes) -> bool:
+    """True for HID++ 2.0 feature notifications (Software ID nibble is zero)."""
+    return len(buf) >= 4 and buf[0] == 0x11 and (buf[3] & 0x0F) == 0
+
+
+def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
+             on_hidpp_notification=None):
     """Send one HID++ report and wait for its ACK/ERR.
 
     on_non_hidpp(buf) is called for non-0x11 input reports (e.g. mic events).
+    on_hidpp_notification(buf) receives unmatched feature notifications.
     Returns (status, detail) where status is ACK|ERR|TIMEOUT|GONE|BADHEX.
     """
     try:
@@ -135,12 +142,55 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None):
                 continue
             matched = parse_reply(buf, feat, fnsw)
             if matched is None:
+                if (on_hidpp_notification is not None
+                        and is_hidpp_notification(buf)):
+                    on_hidpp_notification(buf)
                 continue
             status, detail = matched
             return status, detail
     except OSError:
         return "GONE", None
     return "TIMEOUT", None
+
+
+class PollPresence:
+    """Debounce reachability inferred from periodic HID++ transactions.
+
+    A busy receiver can occasionally drop a reply even though the headset is
+    still on.  Treating one missed reply as a power-off makes the next ACK look
+    like a fresh power-on, which can replay disruptive initialization actions.
+
+    ``observe()`` returns True for a confirmed offline->online transition,
+    False for a confirmed online->offline transition, and None otherwise.
+    """
+
+    def __init__(self, miss_limit: int = 3):
+        if miss_limit < 1:
+            raise ValueError("miss_limit must be at least 1")
+        self.miss_limit = miss_limit
+        self.connected = False
+        self.misses = 0
+
+    def observe(self, reachable: bool):
+        if reachable:
+            self.misses = 0
+            if not self.connected:
+                self.connected = True
+                return True
+            return None
+
+        if not self.connected:
+            return None
+        self.misses += 1
+        if self.misses < self.miss_limit:
+            return None
+        self.connected = False
+        self.misses = 0
+        return False
+
+    def reset(self) -> None:
+        self.connected = False
+        self.misses = 0
 
 
 class HidWorker(threading.Thread):
@@ -156,7 +206,7 @@ class HidWorker(threading.Thread):
 
     def __init__(self, path, log_cb, mic_cb=None, boom_cb=None, poll_boom=True,
                  on_link=None, prefer_pid=None, known_pids=None,
-                 boom_reader=None, idle_add=None):
+                 boom_reader=None, idle_add=None, event_cb=None):
         super().__init__()
         self.path = path
         self.prefer_pid = prefer_pid
@@ -166,6 +216,7 @@ class HidWorker(threading.Thread):
         self.boom_cb = boom_cb
         self.poll_boom = poll_boom
         self.boom_reader = boom_reader  # callable(fd) -> bool|None
+        self.event_cb = event_cb
         self.on_link = on_link
         # GLib.idle_add when provided; else call directly (tests / non-GTK)
         self.idle_add = idle_add or (lambda fn, *a: fn(*a) or False)
@@ -271,6 +322,8 @@ class HidWorker(threading.Thread):
                 return False
             if len(buf) >= 2 and buf[0] == 0x08 and self.mic_cb:
                 self.idle_add(self.mic_cb, buf[1])
+            elif is_hidpp_notification(buf) and self.event_cb:
+                self.idle_add(self.event_cb, buf)
         return True
 
     def _poll_boom(self):
@@ -294,4 +347,11 @@ class HidWorker(threading.Thread):
             if buf[0] == 0x08 and self.mic_cb and len(buf) >= 2:
                 self.idle_add(self.mic_cb, buf[1])
 
-        return transact(self.fd, hx, timeout=timeout, on_non_hidpp=on_non)
+        def on_event(buf):
+            if self.event_cb:
+                self.idle_add(self.event_cb, buf)
+
+        return transact(
+            self.fd, hx, timeout=timeout, on_non_hidpp=on_non,
+            on_hidpp_notification=on_event,
+        )
