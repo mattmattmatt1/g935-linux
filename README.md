@@ -1,31 +1,46 @@
-# g935-linux — Logitech G935 control for Linux, no G HUB required
+# g935-linux — full Logitech G935 control on Linux
 
-Full control of the Logitech G935 wireless headset over raw HID
-(`/dev/hidraw*`). Everything G HUB does on-device, done natively on Linux:
+A native GTK3 control panel and background service for the Logitech G935
+wireless headset. It talks directly to the receiver over HID++—no G HUB,
+Windows VM, or web account required.
 
-- **DSP soundstage ("G HUB sound")** — the wide, out-of-head sound the headset
-  only has while G HUB is connected on Windows. It's an on-device DSP state,
-  enabled with one HID++ command; a small daemon re-enables it on every
-  headset power-on.
-- **10-band hardware EQ** (32 Hz – 16 kHz, ±12 dB) — stored on the headset,
-  survives reboots, works with any OS afterwards.
-- **Sidetone** (0–100), **RGB lighting** (fixed, breathing, cycling; color,
-  period, waveform, intensity, ramp, and boot animation), **live G1–G3
-  events**, **auto power-off**, **battery level + health graphs**, and
-  **boom-mic mute handling** (the mic logic G HUB normally runs host-side).
-- **GTK3 control panel** (`g935-control`) with tray icon, EQ presets,
-  lighting, sidetone, battery expect-vs-actual charts, a raw HID++ console,
-  audio-device pickers, and a live hardware/firmware capability inventory.
+[Latest release: v0.4](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.4)
+
+## What it controls
+
+- **Sound:** on-headset DSP soundstage, 10-band hardware EQ
+  (32 Hz–16 kHz, ±12 dB), 18 categorized presets, and sidetone.
+- **Microphone:** boom-up mute state, host mute recovery, mic-button handling,
+  and daemon-backed auto-unmute in software mode.
+- **Lighting:** independent controls for both RGB zones, including fixed,
+  breathing, cycling, color, period, waveform, intensity, ramp, and boot
+  animation where supported.
+- **Battery:** live charge, voltage and runtime, learned drain history,
+  estimated battery health, full-charge runtime loss, and auto power-off.
+- **Desktop audio:** output/input visibility, default-device selection, tray
+  mixer, and per-device volume. Sliders pause safely at 100%; release and drag
+  again only when you deliberately need boost up to 150%.
+- **Hardware:** live firmware and feature discovery, G1–G3 events, reconnect
+  recovery, automatic left-channel-only detection/repair, and an advanced
+  HID++ console tucked into a collapsed section.
+
+The panel only exposes controls the connected headset reports as supported.
+EQ and lighting changes can be saved in headset memory.
 
 ## Screenshots
 
-| Control panel | Tray menu |
+| Control | Lighting |
 |---|---|
-| ![Control panel](screenshots/control.png) | ![Tray menu](screenshots/rightclickmenu.png) |
+| ![Control page with software mode, sidetone, microphone, ten-band EQ, and preset menu](screenshots/control.png) | ![Lighting page with independent RGB zone effects and colors](screenshots/lighting.png) |
+| **Battery Health** | **Settings** |
+| ![Battery Health page with power management, health, runtime loss, live drain, and history](screenshots/battery.png) | ![Settings page with device visibility and volume sliders with a 100 percent safety stop](screenshots/settings.png) |
 
-![Settings: device visibility and volumes](screenshots/settings.png)
+<details>
+<summary>Tray menu</summary>
 
-![Battery Health: live remaining, expect-vs-actual graphs](screenshots/battery.png)
+![Tray menu with headset and desktop audio controls](screenshots/rightclickmenu.png)
+
+</details>
 
 ## ⚠️ Tested on exactly one setup
 
@@ -45,51 +60,86 @@ territory. **Issues or success reports: hit me up on X
 
 ```bash
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
-                 alsa-utils pulseaudio-utils
+                 alsa-utils pulseaudio-utils pipewire-bin libnotify-bin
 ```
 
 - `python3-gi` + GTK3 — the control panel
 - `gir1.2-ayatanaappindicator3-0.1` — tray icon (optional; without it the app
   runs windowed)
-- `alsa-utils` (`amixer`) — boom-mic mute handling in G HUB mode
+- `alsa-utils` (`amixer`) — boom-mic mute handling in software mode
 - `pulseaudio-utils` (`pactl`) — audio device pickers/volume (works with
-  PipeWire's pulse server too; optional)
+  PipeWire's PulseAudio-compatible server too)
+- `pipewire-bin` (`pw-link`) — detects and repairs the left-ear-only route
+  that can appear after suspend
+- `libnotify-bin` (`notify-send`) — desktop warning when that route breaks
 - `python3-hid` (or `pip install hid`) — only for the standalone
   `tools/g935-enable.py` hidapi path; the GUI and daemon don't need it
 
-## Install
+## Install or upgrade
+
+### Fresh install
 
 ```bash
 git clone https://github.com/mattmattmatt1/g935-linux.git
 cd g935-linux
 
-# 1. Let your user talk to the headset (udev + optional mic-mute hwdb):
+# Install the udev rule and mic-mute hwdb:
 ./install.sh --udev
-# then unplug/replug the receiver
+# Unplug and reconnect the wireless receiver after this step.
 
-# 2. Install the control panel + daemon for your user:
+# Install the panel, shared Python package, command, and user service:
 ./install.sh --user
 # or: make install-user
 
-# 3. Run the control panel:
+# Launch:
 g935-control
-# from a git checkout without install:
-python3 g935-control.py
 ```
 
-Optional daemon (required for **G HUB mode** mic handling + auto DSP on power-on):
+You can also run `python3 g935-control.py` directly from the checkout.
+
+### Upgrade an existing checkout
+
+```bash
+git pull --ff-only
+./install.sh --user
+systemctl --user try-restart g935-dsp
+```
+
+Quit and reopen the panel after upgrading. Re-running `--user` matters because
+the application now installs the shared `g935/` package as well as the launch
+scripts. The udev step does not need to be repeated unless those rules change.
+
+### Background service
+
+Enable the user service for software-mode mic handling and automatic DSP
+restoration whenever the headset powers on:
 
 ```bash
 systemctl --user enable --now g935-dsp
 ```
 
+The panel works without the service in hardware mode.
+
+## The interface
+
+| Page | What is there |
+|---|---|
+| **Control** | software/hardware mode, live G keys, sidetone, microphone state, 10-band EQ, and a compact categorized Presets menu |
+| **Lighting** | independent Logo and Primary/Strip RGB effects and saved settings |
+| **Battery Health** | power management first, prominent wear and time-lost summary, live ETA/drain, history, learned profile, and session quality |
+| **Hardware** | firmware, discovered HID++ features, stereo-route state/repair, and the collapsed advanced console |
+| **Settings** | tray/mixer device visibility, default devices, and 0–150% volume controls with a 100% safety stop |
+
+Scroll-wheel input passes over sliders normally until you click a slider once,
+preventing accidental EQ, sidetone, or volume changes while scrolling a page.
+
 ## The two modes
 
 The headset has a mode switch (`11 ff 05 2b 01/00`) that changes more than sound.
 **Default is hardware mode** (safe without the daemon). Flip the switch in the
-GUI for G HUB mode.
+GUI for software mode—the G HUB-style host-managed behavior.
 
-| | **Hardware mode** (default) | **G HUB mode** |
+| | **Hardware mode** (default) | **Software mode** |
 |---|---|---|
 | Sound | flat/narrow | DSP soundstage on |
 | Boom mute | handled fully in firmware, just works | host must manage it (`g935-dspd`) |
@@ -97,7 +147,7 @@ GUI for G HUB mode.
 | G1–G3 | headset defaults | diverted HID++ events shown live in the panel |
 
 Mode is stored in `~/.config/g935/mode` and re-asserted by the daemon on every
-power-on. **If you use G HUB mode, run the daemon.** Without it, raising the
+power-on. **If you use software mode, run the daemon.** Without it, raising the
 boom mutes the mic and nothing will unmute it (the panel warns you).
 
 ### Who owns what
@@ -113,6 +163,7 @@ boom mutes the mic and nothing will unmute it (the panel warns you).
 
 The Battery Health tab logs voltage samples while the panel is open and builds:
 
+- **Battery wear and runtime lost per full charge** in a high-visibility summary
 - **Live remaining runtime** from recent discharge datapoints
 - **Expected vs actual** comparison against the rated runtime spec
 - **Learned drain profile** (mV/h by voltage bin) and session history graphs
@@ -140,10 +191,10 @@ restore FR. Tray menu also gets **Fix stereo** while broken.
 | Path | Purpose |
 |---|---|
 | `g935-control.py` | GTK3 control panel |
-| `g935-dspd.py` + `g935-dsp.service` | power-on watcher + G HUB-mode mic daemon |
+| `g935-dspd.py` + `g935-dsp.service` | power-on watcher + software-mode mic daemon |
 | `g935/` | shared library (HID++, mic, mode, battery, charts) |
 | `99-g935.rules` | udev rule granting hidraw access |
-| `70-g935-micmute.hwdb` | masks KEY_MICMUTE so the desktop stays out of G HUB mode |
+| `70-g935-micmute.hwdb` | masks KEY_MICMUTE so the desktop stays out of software mode |
 | `tools/` | research scripts (enable replay, sequence bisector) |
 | `tests/` | offline unit tests (`make test`) |
 | `install.sh` / `Makefile` | user + udev install |
@@ -157,7 +208,8 @@ restore FR. Tray menu also gets **Fix stereo** while broken.
 | Tray icon missing (GNOME) | install AppIndicator extension, or run windowed |
 | Mic stuck muted after boom up | enable daemon: `systemctl --user enable --now g935-dsp`, or switch to hardware mode |
 | "press unmute twice" | install `70-g935-micmute.hwdb` via `./install.sh --udev` |
-| Sound flat after power cycle | daemon not running, or mode is hardware — enable daemon / flip G HUB mode |
+| Sound flat after power cycle | daemon not running, or mode is hardware — enable daemon / flip software mode |
+| Only the left ear works after sleep | install `pipewire-bin`; the panel should detect and repair the missing right-channel link |
 | Panel dead after unplug/replug | should auto-recover; if not, restart the panel (file a bug) |
 | `g935-control: command not found` | ensure `~/.local/bin` is on `PATH`, or run `python3 g935-control.py` |
 
