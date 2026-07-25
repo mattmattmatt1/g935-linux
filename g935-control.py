@@ -64,6 +64,14 @@ from g935.mic import (
 from g935.mode import load_mode, save_mode
 from g935.paths import config_dir, ensure_config_dir, runtime_dir
 from g935.stereo_route import fix_stereo, inspect_stereo, notify_user
+from g935.volume_wheel import (
+    DEFAULT_FINE_STEP, DEFAULT_STEP, DIRECTION_GUARD_S, EVIOCGRAB,
+    FAST_ROLL_GAP_S, FINE_INTERVAL_S,
+    HOLD_REPEAT_DELAY_S, HOLD_REPEAT_INTERVAL_S, INPUT_EVENT,
+    KEY_VOLUMEDOWN, KEY_VOLUMEUP, MEDIUM_ROLL_GAP_S,
+    analyze_calibration, find_wheel_device,
+    parse_key_events,
+)
 
 # Ubuntu/Debian/Fedora ship the Ayatana fork; some distros still ship the
 # original namespace. Either works; without both we run windowed only.
@@ -209,6 +217,7 @@ FEATURES = [
 ]
 
 UI_FILE = os.path.join(config_dir(), "ui.json")
+WHEEL_CAPTURE_FILE = os.path.join(config_dir(), "wheel-capture.json")
 ALSA_USBID = "046d:0a87"    # reassigned from the device profile in main()
 MIC_SWITCH_NAME = "Mic Capture Switch"
 
@@ -288,6 +297,16 @@ GENERIC_PROFILE = {
 
 UI_DEFAULTS = {
     "hidden_sinks": [], "hidden_sources": [], "lighting": {},
+    "wheel_enabled": True, "wheel_step": DEFAULT_STEP,
+    "wheel_fine_step": DEFAULT_FINE_STEP,
+    "wheel_fine_interval_ms": round(FINE_INTERVAL_S * 1000),
+    "wheel_calibrated": False,
+    "wheel_fast_gap_ms": round(FAST_ROLL_GAP_S * 1000),
+    "wheel_medium_gap_ms": round(MEDIUM_ROLL_GAP_S * 1000),
+    "wheel_direction_guard_ms": round(DIRECTION_GUARD_S * 1000),
+    "wheel_hold_delay_ms": round(HOLD_REPEAT_DELAY_S * 1000),
+    "wheel_hold_interval_ms": round(HOLD_REPEAT_INTERVAL_S * 1000),
+    "wheel_calibration_version": 3,
 }
 
 class AppSettings:
@@ -300,7 +319,29 @@ class AppSettings:
                 data = json.load(f)
         except (OSError, ValueError):
             data = {}
-        self.data = {**UI_DEFAULTS, **{k: data[k] for k in UI_DEFAULTS if k in data}}
+        self.data = {
+            **UI_DEFAULTS,
+            **{k: data[k] for k in UI_DEFAULTS if k in data},
+        }
+        # Version 1 treated a long press as an 800 ms coarse repeat. Version 2
+        # decodes press duration continuously; version 3 exposes fine feel
+        # independently. Preserve a working profile while filling new fields.
+        try:
+            wheel_profile_version = int(
+                data.get("wheel_calibration_version", 1))
+        except (TypeError, ValueError):
+            wheel_profile_version = 1
+        if wheel_profile_version < 2:
+            self.data["wheel_hold_delay_ms"] = round(
+                HOLD_REPEAT_DELAY_S * 1000)
+            self.data["wheel_hold_interval_ms"] = round(
+                HOLD_REPEAT_INTERVAL_S * 1000)
+            self.data["wheel_calibrated"] = False
+        if wheel_profile_version < 3:
+            self.data["wheel_fine_step"] = DEFAULT_FINE_STEP
+            self.data["wheel_fine_interval_ms"] = round(
+                FINE_INTERVAL_S * 1000)
+        self.data["wheel_calibration_version"] = 3
 
     def save(self):
         ensure_config_dir()
@@ -948,6 +989,124 @@ class App(Gtk.Window):
         devf.pack_start(note, False, False, 0)
 
         volf = self._frame(sp, "Volume")
+        wheel_row = Gtk.Box(spacing=8)
+        wheel_copy = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        wheel_title = Gtk.Label(
+            label="Headset earcup wheel", xalign=0)
+        style(wheel_title, "g935-primary-title")
+        wheel_copy.pack_start(wheel_title, False, False, 0)
+        wheel_note = Gtk.Label(xalign=0)
+        style(wheel_note, "g935-subtitle")
+        wheel_note.set_line_wrap(True)
+        wheel_note.set_text(
+            "Fine movements use short presses; fast sweeps are decoded from "
+            "how long the receiver holds the direction. Every percentage is "
+            "applied as a smooth 1% step. "
+            "Direction chatter and runaway repeats are filtered. "
+            "Wheel-up stops at 100%. "
+            "Use a slider for deliberate boost.")
+        wheel_copy.pack_start(wheel_note, False, False, 0)
+        wheel_row.pack_start(wheel_copy, True, True, 0)
+        self.wheel_sw = Gtk.Switch()
+        self.wheel_sw.set_active(self.settings.data["wheel_enabled"])
+        self.wheel_sw.connect(
+            "notify::active", self.on_wheel_setting_changed)
+        wheel_row.pack_end(self.wheel_sw, False, False, 0)
+        volf.pack_start(wheel_row, False, False, 0)
+
+        feel_heading = Gtk.Box(spacing=8)
+        feel_title = Gtk.Label(label="Wheel feel", xalign=0)
+        style(feel_title, "g935-primary-title")
+        feel_heading.pack_start(feel_title, True, True, 0)
+        reset_feel = Gtk.Button(label="Reset balanced defaults")
+        reset_feel.connect("clicked", self.on_wheel_defaults)
+        feel_heading.pack_end(reset_feel, False, False, 0)
+        volf.pack_start(feel_heading, False, False, 4)
+
+        feel_grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        feel_grid.set_hexpand(True)
+        self._wheel_feel_controls = {}
+
+        def add_feel_control(row, attr, key, title, detail,
+                             lower, upper, step, suffix):
+            copy = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            label = Gtk.Label(label=title, xalign=0)
+            copy.pack_start(label, False, False, 0)
+            sub = Gtk.Label(label=detail, xalign=0)
+            style(sub, "g935-subtitle")
+            sub.set_line_wrap(True)
+            copy.pack_start(sub, False, False, 0)
+            feel_grid.attach(copy, 0, row, 1, 1)
+
+            spin_box = Gtk.Box(spacing=5)
+            spin = Gtk.SpinButton.new_with_range(lower, upper, step)
+            spin.set_value(self.settings.data[key])
+            spin.connect("value-changed", self.on_wheel_setting_changed)
+            spin_box.pack_start(spin, False, False, 0)
+            spin_box.pack_start(
+                Gtk.Label(label=suffix), False, False, 0)
+            feel_grid.attach(spin_box, 1, row, 1, 1)
+            setattr(self, attr, spin)
+            self._wheel_feel_controls[key] = spin
+
+        add_feel_control(
+            0, "wheel_fine_step", "wheel_fine_step",
+            "Fine adjustment", "Immediate change from a tiny movement.",
+            1, 5, 1, "%")
+        add_feel_control(
+            1, "wheel_fine_interval", "wheel_fine_interval_ms",
+            "Fine cadence", "Lower feels more responsive during slow motion.",
+            40, 150, 1, "ms")
+        add_feel_control(
+            2, "wheel_hold_delay", "wheel_hold_delay_ms",
+            "Acceleration point",
+            "How long a movement stays in the gentle fine-control range.",
+            120, 600, 5, "ms")
+        add_feel_control(
+            3, "wheel_hold_interval", "wheel_hold_interval_ms",
+            "Fast cadence", "Delay between each 1% change during a fast sweep.",
+            12, 60, 1, "ms")
+        add_feel_control(
+            4, "wheel_step", "wheel_step",
+            "Maximum fast-sweep change",
+            "Caps the total change produced by one continuous sweep.",
+            10, 50, 1, "%")
+        add_feel_control(
+            5, "wheel_direction_guard", "wheel_direction_guard_ms",
+            "Reversal protection",
+            "Filters brief opposite reports; set to 0 for immediate reversal.",
+            0, 1000, 10, "ms")
+        volf.pack_start(feel_grid, False, False, 2)
+
+        diagnostics = Gtk.Expander(label="Diagnostics & auto-fit")
+        diagnostics_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        diagnostics_box.set_border_width(8)
+        diagnostics_note = Gtk.Label(xalign=0)
+        diagnostics_note.set_line_wrap(True)
+        diagnostics_note.set_text(
+            "Optional. Capture records the receiver's raw press/release "
+            "timeline and can fit the controls above. Manual tuning works "
+            "without running it.")
+        diagnostics_box.pack_start(
+            diagnostics_note, False, False, 0)
+        calibration_row = Gtk.Box(spacing=8)
+        self.wheel_calibration_status = Gtk.Label(xalign=0)
+        style(self.wheel_calibration_status, "g935-subtitle")
+        self.wheel_calibration_status.set_line_wrap(True)
+        calibration_row.pack_start(
+            self.wheel_calibration_status, True, True, 0)
+        calibrate = Gtk.Button(label="Capture & auto-fit…")
+        calibrate.connect("clicked", self.on_wheel_calibrate)
+        calibration_row.pack_end(calibrate, False, False, 0)
+        diagnostics_box.pack_start(calibration_row, False, False, 0)
+        diagnostics.add(diagnostics_box)
+        volf.pack_start(diagnostics, False, False, 2)
+        self._refresh_wheel_calibration_status()
+        volf.pack_start(Gtk.Separator(), False, False, 2)
+
         self.settings_vol_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         volf.pack_start(self.settings_vol_box, False, False, 0)
         self._vol_containers.append(self.settings_vol_box)
@@ -2093,6 +2252,9 @@ class App(Gtk.Window):
         if getattr(self, "_quitting", False):
             return
         self._quitting = True
+        dialog = getattr(self, "_wheel_cal_dialog", None)
+        if dialog is not None:
+            dialog.response(Gtk.ResponseType.CANCEL)
         self.audio.stop()
         try:
             self.worker.stop()
@@ -2103,6 +2265,406 @@ class App(Gtk.Window):
         Gtk.main_quit()
 
     # ---------- audio devices: settings toggles, volume rows, mixer ----------
+    def on_wheel_setting_changed(self, *_args):
+        self.settings.data["wheel_enabled"] = self.wheel_sw.get_active()
+        for key, control in self._wheel_feel_controls.items():
+            self.settings.data[key] = int(control.get_value())
+        source = _args[0] if _args else None
+        if source is not self.wheel_sw:
+            self.settings.data["wheel_calibrated"] = False
+        self.settings.save()
+        self._refresh_wheel_calibration_status()
+
+    def _sync_wheel_feel_controls(self):
+        for key, control in self._wheel_feel_controls.items():
+            control.handler_block_by_func(self.on_wheel_setting_changed)
+            control.set_value(self.settings.data[key])
+            control.handler_unblock_by_func(self.on_wheel_setting_changed)
+
+    def on_wheel_defaults(self, *_args):
+        defaults = {
+            "wheel_fine_step": DEFAULT_FINE_STEP,
+            "wheel_fine_interval_ms": round(FINE_INTERVAL_S * 1000),
+            "wheel_hold_delay_ms": round(HOLD_REPEAT_DELAY_S * 1000),
+            "wheel_hold_interval_ms": round(
+                HOLD_REPEAT_INTERVAL_S * 1000),
+            "wheel_step": DEFAULT_STEP,
+            "wheel_direction_guard_ms": round(
+                DIRECTION_GUARD_S * 1000),
+        }
+        self.settings.data.update(defaults)
+        self.settings.data["wheel_calibrated"] = False
+        self._sync_wheel_feel_controls()
+        self.settings.save()
+        self._refresh_wheel_calibration_status()
+
+    def _refresh_wheel_calibration_status(self):
+        if self.settings.data.get("wheel_calibrated"):
+            self.wheel_calibration_status.set_text(
+                "Last capture was applied · "
+                f"fast rate after "
+                f"{self.settings.data['wheel_hold_delay_ms']} ms · "
+                f"1% every "
+                f"{self.settings.data['wheel_hold_interval_ms']} ms · "
+                f"up to {self.settings.data['wheel_step']}% per sweep")
+        else:
+            self.wheel_calibration_status.set_text(
+                "Manual comfort settings active. Capture is optional.")
+
+    def on_wheel_calibrate(self, *_args):
+        if getattr(self, "_wheel_cal_dialog", None) is not None:
+            self._wheel_cal_dialog.present()
+            return
+
+        original_enabled = self.settings.data["wheel_enabled"]
+        self.settings.data["wheel_enabled"] = False
+        self.settings.save()
+        self.wheel_sw.handler_block_by_func(self.on_wheel_setting_changed)
+        self.wheel_sw.set_active(False)
+        self.wheel_sw.handler_unblock_by_func(self.on_wheel_setting_changed)
+
+        dialog = Gtk.Dialog(
+            title="Calibrate G935 volume wheel",
+            transient_for=self, modal=True)
+        dialog.set_default_size(620, 460)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        next_button = dialog.add_button("Next", Gtk.ResponseType.APPLY)
+        next_button.set_sensitive(False)
+        self._wheel_cal_dialog = dialog
+        self._wheel_cal_fd = None
+        self._wheel_cal_watch = None
+        self._wheel_cal_stage = None
+        self._wheel_cal_samples = {
+            "slow_up": [], "slow_down": [],
+            "fast_up": [], "fast_down": [],
+        }
+        self._wheel_cal_pending = {}
+        self._wheel_cal_raw = []
+        self._wheel_cal_capture_saved = False
+
+        box = dialog.get_content_area()
+        box.set_spacing(12)
+        box.set_border_width(16)
+
+        heading = Gtk.Label(xalign=0)
+        style(heading, "g935-primary-title")
+        heading.set_line_wrap(True)
+        box.pack_start(heading, False, False, 0)
+
+        instruction = Gtk.Label(xalign=0)
+        instruction.set_line_wrap(True)
+        box.pack_start(instruction, False, False, 0)
+
+        progress = Gtk.ProgressBar()
+        progress.set_show_text(True)
+        box.pack_start(progress, False, False, 0)
+
+        live = Gtk.Label(xalign=0)
+        live.set_selectable(True)
+        live.set_line_wrap(True)
+        live.set_size_request(-1, 125)
+        style(live, "g935-zone")
+        box.pack_start(live, False, False, 0)
+
+        target_row = Gtk.Box(spacing=8)
+        target_row.pack_start(Gtk.Label(
+            label="Target fast rolls from 0–100%", xalign=0),
+            True, True, 0)
+        target_rolls = Gtk.SpinButton.new_with_range(3, 5, 1)
+        target_rolls.set_value(3)
+        target_row.pack_end(target_rolls, False, False, 0)
+        box.pack_start(target_row, False, False, 0)
+
+        foot = Gtk.Label(xalign=0)
+        style(foot, "g935-subtitle")
+        foot.set_line_wrap(True)
+        foot.set_text(
+            "The daemon releases the media-key interface only while this "
+            "wizard is open. Volume will not change during capture. Every "
+            "raw press, repeat, release, direction, and timestamp is recorded "
+            "locally for debugging.")
+        box.pack_start(foot, False, False, 0)
+
+        self._wheel_cal_widgets = {
+            "heading": heading, "instruction": instruction,
+            "progress": progress, "live": live,
+            "next": next_button,
+        }
+        stages = (
+            ("slow_up", "Slow upward calibration",
+             "Make exactly 5 small, deliberate upward rolls—the finest "
+             "movements you would use near your target volume. Then click Next.",
+             5, KEY_VOLUMEUP),
+            ("slow_down", "Slow downward calibration",
+             "Make exactly 5 small, deliberate downward rolls. Pause between "
+             "them as you would for fine adjustment, then click Next.",
+             5, KEY_VOLUMEDOWN),
+            ("fast_up", "Fast upward calibration",
+             "Make 3 separate fast upward sweeps toward 100%. The receiver "
+             "reports each sweep as one held UP press, so let it release "
+             "fully between samples. Then click Next.",
+             3, KEY_VOLUMEUP),
+            ("fast_down", "Fast downward calibration",
+             "Make 3 separate fast downward sweeps toward 0%. Let the "
+             "receiver release fully between samples, then click Next.",
+             3, KEY_VOLUMEDOWN),
+        )
+
+        GLib.timeout_add(150, self._wheel_cal_try_open)
+        result = None
+        applied = False
+        try:
+            for key, title, copy, target, expected_code in stages:
+                self._wheel_cal_stage = key
+                self._wheel_cal_target = target
+                self._wheel_cal_expected = expected_code
+                heading.set_text(title)
+                instruction.set_text(copy)
+                next_button.set_label("Next")
+                self._wheel_cal_update_live()
+                dialog.show_all()
+                response = dialog.run()
+                if response != Gtk.ResponseType.APPLY:
+                    break
+            else:
+                self._wheel_cal_stage = None
+                result = analyze_calibration(
+                    self._wheel_cal_samples,
+                    int(target_rolls.get_value()))
+                capture_path = self._wheel_cal_save_capture(result)
+                counts = result["counts"]
+                fast_ms = [round(value * 1000)
+                           for value in result["fast_gaps"]]
+                slow_ms = [round(value * 1000)
+                           for value in result["slow_gaps"]]
+                max_step = result["wheel_step"]
+                slow_holds_ms = [
+                    round(value * 1000)
+                    for value in result["slow_holds"]
+                ]
+                fast_holds_ms = [
+                    round(value * 1000)
+                    for value in result["fast_holds"]
+                ]
+                fine_step = result["wheel_fine_step"]
+                heading.set_text("Calibration result")
+                instruction.set_text(
+                    "Review the measured data below. Apply saves this profile "
+                    "and returns the wheel to the background service.")
+                live.set_text(
+                    "Headset-reported rolls\n"
+                    f"  Slow up {counts['slow_up']}/5 · "
+                    f"Slow down {counts['slow_down']}/5\n"
+                    f"  Fast up {counts['fast_up']}/3 · "
+                    f"Fast down {counts['fast_down']}/3\n"
+                    f"  Opposite-direction reports: "
+                    f"{result['wrong_directions']}\n\n"
+                    f"Raw input events captured: "
+                    f"{len(self._wheel_cal_raw)}\n"
+                    f"Neutral gaps · fast {fast_ms or ['none']} ms · "
+                    f"slow {slow_ms or ['none']} ms\n"
+                    f"Fine holds: {slow_holds_ms or ['none']} ms\n"
+                    f"Fast holds: {fast_holds_ms or ['none']} ms\n"
+                    f"Duration decoder · first {fine_step}% immediately · "
+                    f"gentle steps every "
+                    f"{result['wheel_fine_interval_ms']} ms before "
+                    f"{result['wheel_hold_delay_ms']} ms · "
+                    f"then fast rate at 1% every "
+                    f"{result['wheel_hold_interval_ms']} ms\n"
+                    f"Maximum per sweep: {max_step}%\n\n"
+                    f"Full event trace saved to {capture_path}")
+                progress.set_fraction(1)
+                progress.set_text("Ready to apply")
+                next_button.set_label("Apply calibration")
+                next_button.set_sensitive(True)
+                dialog.show_all()
+                response = dialog.run()
+                if response == Gtk.ResponseType.APPLY:
+                    for key, value in result.items():
+                        if key.startswith("wheel_"):
+                            self.settings.data[key] = value
+                    applied = True
+        finally:
+            if (getattr(self, "_wheel_cal_raw", None)
+                    and not self._wheel_cal_capture_saved):
+                self._wheel_cal_save_capture(result)
+            self._wheel_cal_cleanup()
+            dialog.destroy()
+            self._wheel_cal_dialog = None
+            self.settings.data["wheel_enabled"] = original_enabled
+            self.settings.save()
+            self.wheel_sw.handler_block_by_func(
+                self.on_wheel_setting_changed)
+            self.wheel_sw.set_active(original_enabled)
+            self.wheel_sw.handler_unblock_by_func(
+                self.on_wheel_setting_changed)
+            if applied and result is not None:
+                self._sync_wheel_feel_controls()
+            self._refresh_wheel_calibration_status()
+
+    def _wheel_cal_try_open(self):
+        if getattr(self, "_wheel_cal_dialog", None) is None:
+            return False
+        if self._wheel_cal_fd is not None:
+            return False
+        path = find_wheel_device()
+        if path is None:
+            self._wheel_cal_widgets["live"].set_text(
+                "Waiting for the G935 input device…")
+            return True
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            fcntl.ioctl(fd, EVIOCGRAB, 1)
+        except OSError as exc:
+            if fd is not None:
+                os.close(fd)
+            self._wheel_cal_widgets["live"].set_text(
+                f"Waiting for the daemon to release {path}…\n{exc}")
+            return True
+        self._wheel_cal_fd = fd
+        self._wheel_cal_watch = GLib.io_add_watch(
+            fd, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+            self._wheel_cal_on_io)
+        self._wheel_cal_widgets["next"].set_sensitive(True)
+        self._wheel_cal_update_live()
+        return False
+
+    def _wheel_cal_on_io(self, fd, condition):
+        if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            self._wheel_cal_widgets["live"].set_text(
+                "Wheel device disconnected. Reconnect it and restart calibration.")
+            return False
+        try:
+            data = os.read(fd, INPUT_EVENT.size * 64)
+        except (BlockingIOError, OSError):
+            return True
+        stage = self._wheel_cal_stage
+        if stage is None:
+            return True
+        events = self._wheel_cal_samples[stage]
+        for timestamp, code, value in parse_key_events(data):
+            self._wheel_cal_raw.append({
+                "stage": stage,
+                "timestamp": timestamp,
+                "code": code,
+                "value": value,
+            })
+            if value == 1:
+                event = {
+                    "press": timestamp, "release": None, "code": code,
+                }
+                events.append(event)
+                self._wheel_cal_pending[code] = event
+            elif value == 0:
+                event = self._wheel_cal_pending.pop(code, None)
+                if event is not None:
+                    event["release"] = timestamp
+        self._wheel_cal_update_live()
+        return True
+
+    def _wheel_cal_update_live(self):
+        widgets = getattr(self, "_wheel_cal_widgets", None)
+        stage = getattr(self, "_wheel_cal_stage", None)
+        if not widgets or stage is None:
+            return
+        events = self._wheel_cal_samples[stage]
+        expected = self._wheel_cal_expected
+        correct = sum(event["code"] == expected for event in events)
+        opposite = len(events) - correct
+        holds = [
+            (event["release"] - event["press"]) * 1000
+            for event in events if event["release"] is not None
+        ]
+        direction = "UP" if expected == KEY_VOLUMEUP else "DOWN"
+        last = events[-1] if events else None
+        last_text = (
+            ("UP" if last["code"] == KEY_VOLUMEUP else "DOWN")
+            if last else "waiting")
+        stage_raw = [
+            event for event in self._wheel_cal_raw
+            if event["stage"] == stage
+        ]
+        origin = stage_raw[0]["timestamp"] if stage_raw else 0
+        state_names = {0: "release", 1: "press", 2: "repeat"}
+        trace = "\n".join(
+            f"+{(event['timestamp'] - origin) * 1000:6.0f} ms  "
+            f"{'UP  ' if event['code'] == KEY_VOLUMEUP else 'DOWN'} "
+            f"{state_names.get(event['value'], str(event['value']))}"
+            for event in stage_raw[-8:]
+        )
+        widgets["progress"].set_fraction(
+            min(1, correct / max(1, self._wheel_cal_target)))
+        widgets["progress"].set_text(
+            f"{correct} of {self._wheel_cal_target} "
+            f"{'sweeps' if stage.startswith('fast_') else 'movements'} "
+            f"reported {direction}")
+        widgets["live"].set_text(
+            f"Expected direction: {direction}\n"
+            f"Reported: {correct} expected · {opposite} opposite · "
+            f"{len(events)} total\n"
+            f"Last report: {last_text}\n"
+            f"Completed hold durations: "
+            f"{', '.join(f'{value:.0f} ms' for value in holds[-6:]) or '—'}\n"
+            f"Raw timeline ({len(stage_raw)} events):\n{trace or 'waiting'}")
+
+    def _wheel_cal_save_capture(self, result=None):
+        """Persist a complete, human-readable physical-wheel event trace."""
+        raw = getattr(self, "_wheel_cal_raw", [])
+        origin = raw[0]["timestamp"] if raw else 0
+        state_names = {0: "release", 1: "press", 2: "repeat"}
+        payload = {
+            "version": 1,
+            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "device": find_wheel_device(),
+            "events": [
+                {
+                    "t_ms": round((event["timestamp"] - origin) * 1000, 3),
+                    "stage": event["stage"],
+                    "direction": (
+                        "up" if event["code"] == KEY_VOLUMEUP else "down"),
+                    "state": state_names.get(
+                        event["value"], str(event["value"])),
+                    "code": event["code"],
+                    "value": event["value"],
+                }
+                for event in raw
+            ],
+            "gestures": self._wheel_cal_samples,
+            "analysis": result,
+        }
+        ensure_config_dir()
+        tmp = WHEEL_CAPTURE_FILE + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, WHEEL_CAPTURE_FILE)
+            self._wheel_cal_capture_saved = True
+            return WHEEL_CAPTURE_FILE
+        except OSError as exc:
+            log.warning("could not save wheel capture: %s", exc)
+            return f"capture could not be saved ({exc})"
+
+    def _wheel_cal_cleanup(self):
+        watch = getattr(self, "_wheel_cal_watch", None)
+        if watch is not None:
+            try:
+                GLib.source_remove(watch)
+            except Exception:
+                pass
+        self._wheel_cal_watch = None
+        fd = getattr(self, "_wheel_cal_fd", None)
+        if fd is not None:
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._wheel_cal_fd = None
+
     def _on_audio_change(self):
         self._rebuild_tray_menu()
         self._refresh_device_toggles()

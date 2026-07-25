@@ -6,6 +6,21 @@ Windows VM, or web account required.
 
 [Latest release: v0.4](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.4)
 
+## Major earcup-wheel upgrade
+
+The physical volume wheel now feels like a real analog control instead of an
+unpredictable media key. The receiver's press duration is decoded into smooth
+1% changes: tiny movements stay precise, long sweeps accelerate progressively,
+reversals are filtered, and wheel-up remains safely capped at 100%.
+
+The tested balanced profile works out of the box. Six live comfort controls
+let users tune fine adjustment, fine cadence, acceleration point, fast cadence,
+maximum sweep distance, and reversal protection to taste. Calibration is no
+longer required; raw capture and auto-fit remain available under collapsed
+diagnostics for unusual hardware behavior.
+
+![Earcup wheel comfort controls with balanced defaults](screenshots/volwheel.png)
+
 ## What it controls
 
 - **Sound:** on-headset DSP soundstage, 10-band hardware EQ
@@ -20,6 +35,15 @@ Windows VM, or web account required.
 - **Desktop audio:** output/input visibility, default-device selection, tray
   mixer, and per-device volume. Sliders pause safely at 100%; release and drag
   again only when you deliberately need boost up to 150%.
+- **Earcup wheel:** short receiver presses become fine changes, while the
+  longer held signal produced by a fast sweep is decoded into a continuous
+  series of real 1% changes. Each sweep has a configurable 50% ceiling,
+  wheel-up stops at 100%, and sliders retain deliberate boost up to 150%.
+  Settings expose fine adjustment, fine cadence, acceleration point, fast
+  cadence, sweep limit, and reversal protection, with the tested profile as
+  the balanced default. An optional collapsed capture/auto-fit tool measures
+  press duration, shows the raw timeline, saves every event for debugging, and
+  can fit those controls to an individual wheel.
 - **Hardware:** live firmware and feature discovery, G1–G3 events, reconnect
   recovery, automatic left-channel-only detection/repair, and an advanced
   HID++ console tucked into a collapsed section.
@@ -128,7 +152,7 @@ The panel works without the service in hardware mode.
 | **Lighting** | independent Logo and Primary/Strip RGB effects and saved settings |
 | **Battery Health** | power management first, prominent wear and time-lost summary, live ETA/drain, history, learned profile, and session quality |
 | **Hardware** | firmware, discovered HID++ features, stereo-route state/repair, and the collapsed advanced console |
-| **Settings** | tray/mixer device visibility, default devices, and 0–150% volume controls with a 100% safety stop |
+| **Settings** | tray/mixer device visibility, adaptive earcup-wheel calibration, and 0–150% volume controls with a 100% safety stop |
 
 Scroll-wheel input passes over sliders normally until you click a slider once,
 preventing accidental EQ, sidetone, or volume changes while scrolling a page.

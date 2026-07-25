@@ -33,6 +33,7 @@ from g935.hidpp import (
 )
 from g935.mic import MicHandler
 from g935.mode import load_mode
+from g935.volume_wheel import VolumeWheel
 
 log = logging.getLogger("g935.dspd")
 
@@ -73,6 +74,7 @@ def main() -> None:
         sys.exit(1)
 
     mic = MicHandler(usbid=ALSA_USBID, mode_loader=load_mode)
+    wheel = VolumeWheel(log.getChild("wheel"))
     presence = PollPresence(miss_limit=MISSED_POLLS_OFFLINE)
     fd = None
     next_poll = 0.0
@@ -92,6 +94,7 @@ def main() -> None:
                 time.sleep(POLL_S)
                 continue
         try:
+            wheel.maintain()
             now = time.time()
             if now >= next_poll:
                 status, _ = transact(
@@ -120,8 +123,17 @@ def main() -> None:
                     mic.reset()
 
             wait = max(0.0, min(next_poll, time.time() + MIC_POLL_S) - time.time())
-            r, _, _ = select.select([fd], [], [], wait)
-            if r:
+            wheel_wait = wheel.seconds_until_tick()
+            if wheel_wait is not None:
+                wait = min(wait, wheel_wait)
+            readers = [fd]
+            if wheel.fileno() is not None:
+                readers.append(wheel.fileno())
+            r, _, _ = select.select(readers, [], [], wait)
+            if wheel.fileno() is not None and wheel.fileno() in r:
+                wheel.handle_ready()
+            wheel.tick()
+            if fd in r:
                 buf = os.read(fd, 64)
                 if len(buf) >= 2 and buf[0] != 0x11:
                     mic.handle_report(buf, fd)
