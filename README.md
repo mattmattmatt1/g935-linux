@@ -4,7 +4,7 @@ A native GTK3 control panel and background service for the Logitech G935
 wireless headset. It talks directly to the receiver over HID++—no G HUB,
 Windows VM, or web account required.
 
-[Latest release: v0.4](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.4)
+[Latest release: v0.5](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.5)
 
 ## Major earcup-wheel upgrade
 
@@ -127,13 +127,18 @@ You can also run `python3 g935-control.py` directly from the checkout.
 
 ```bash
 git pull --ff-only
+# Required once when upgrading from v0.4: installs wheel input permissions.
+./install.sh --udev
+# Unplug and reconnect the wireless receiver after the udev step.
+
 ./install.sh --user
 systemctl --user try-restart g935-dsp
 ```
 
 Quit and reopen the panel after upgrading. Re-running `--user` matters because
 the application now installs the shared `g935/` package as well as the launch
-scripts. The udev step does not need to be repeated unless those rules change.
+scripts. After installing the v0.5 wheel rule once, the udev step does not need
+to be repeated unless those rules change again.
 
 ### Background service
 
