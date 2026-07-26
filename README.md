@@ -39,6 +39,8 @@ diagnostics for unusual hardware behavior.
   longer held signal produced by a fast sweep is decoded into a continuous
   series of real 1% changes. Each sweep has a configurable 50% ceiling,
   wheel-up stops at 100%, and sliders retain deliberate boost up to 150%.
+  USB-mixer writes are rate-limited and an oscillation circuit breaker freezes
+  abusive rapid reversals before they can flood the headset hardware.
   Settings expose fine adjustment, fine cadence, acceleration point, fast
   cadence, sweep limit, and reversal protection, with the tested profile as
   the balanced default. An optional collapsed capture/auto-fit tool measures

@@ -306,7 +306,7 @@ UI_DEFAULTS = {
     "wheel_direction_guard_ms": round(DIRECTION_GUARD_S * 1000),
     "wheel_hold_delay_ms": round(HOLD_REPEAT_DELAY_S * 1000),
     "wheel_hold_interval_ms": round(HOLD_REPEAT_INTERVAL_S * 1000),
-    "wheel_calibration_version": 3,
+    "wheel_calibration_version": 4,
 }
 
 class AppSettings:
@@ -324,8 +324,8 @@ class AppSettings:
             **{k: data[k] for k in UI_DEFAULTS if k in data},
         }
         # Version 1 treated a long press as an 800 ms coarse repeat. Version 2
-        # decodes press duration continuously; version 3 exposes fine feel
-        # independently. Preserve a working profile while filling new fields.
+        # decodes press duration continuously; version 3 exposes fine feel;
+        # version 4 adds USB-mixer flood protection and safe reversal.
         try:
             wheel_profile_version = int(
                 data.get("wheel_calibration_version", 1))
@@ -341,7 +341,13 @@ class AppSettings:
             self.data["wheel_fine_step"] = DEFAULT_FINE_STEP
             self.data["wheel_fine_interval_ms"] = round(
                 FINE_INTERVAL_S * 1000)
-        self.data["wheel_calibration_version"] = 3
+        if wheel_profile_version < 4:
+            self.data["wheel_hold_interval_ms"] = round(
+                HOLD_REPEAT_INTERVAL_S * 1000)
+            self.data["wheel_direction_guard_ms"] = round(
+                DIRECTION_GUARD_S * 1000)
+            self.data["wheel_calibrated"] = False
+        self.data["wheel_calibration_version"] = 4
 
     def save(self):
         ensure_config_dir()
@@ -1067,7 +1073,7 @@ class App(Gtk.Window):
         add_feel_control(
             3, "wheel_hold_interval", "wheel_hold_interval_ms",
             "Fast cadence", "Delay between each 1% change during a fast sweep.",
-            12, 60, 1, "ms")
+            25, 60, 1, "ms")
         add_feel_control(
             4, "wheel_step", "wheel_step",
             "Maximum fast-sweep change",

@@ -37,19 +37,24 @@ DEFAULT_CEILING = 100
 # Start continuous growth above the fine-motion range and add one percent at a
 # time.  Calibration refines both values for the individual wheel.
 HOLD_REPEAT_DELAY_S = 0.25
-HOLD_REPEAT_INTERVAL_S = 0.02
+HOLD_REPEAT_INTERVAL_S = 0.025
 FINE_INTERVAL_S = 0.083
 DEFAULT_FINE_STEP = 1
-# The captured encoder occasionally reports the opposite direction for the
-# next one or two activations (up, down, down within 0.44 s while only rolling
-# upward). Require a short pause before accepting a reversal.
-DIRECTION_GUARD_S = 0.52
+# Immediate reversal is the safe default. Optional protection can delay a
+# suspected opposite-direction report, but it must never reinterpret that
+# report as continued motion in the old direction.
+DIRECTION_GUARD_S = 0.0
 FAST_ROLL_GAP_S = 0.75
 MEDIUM_ROLL_GAP_S = 1.50
 # Apply a computed gesture as a short series of real 1% changes.  Jumping
 # directly to the final percentage makes an otherwise-correct fast roll feel
 # like a binary switch and gives mixers no useful intermediate feedback.
-RAMP_INTERVAL_S = 0.010
+# The G935 exposes a real USB hardware mixer. Keep control transfers at or
+# below 40/s even if input events arrive much faster.
+RAMP_INTERVAL_S = 0.025
+REVERSAL_BURST_WINDOW_S = 0.12
+REVERSAL_BURST_LIMIT = 3
+REVERSAL_COOLDOWN_S = 0.35
 RETRY_S = 5.0
 
 _PERCENT_RE = re.compile(r"(\d+)%")
@@ -83,11 +88,11 @@ def load_wheel_calibration():
     except (TypeError, ValueError):
         profile_version = 1
 
-    def seconds(key, default, lo, hi, migrate=False):
+    def seconds(key, default, lo, hi, migrate_before=0):
         try:
             stored = (
                 round(default * 1000)
-                if migrate and profile_version < 2
+                if migrate_before and profile_version < migrate_before
                 else data.get(key, round(default * 1000))
             )
             value = float(stored) / 1000
@@ -109,13 +114,14 @@ def load_wheel_calibration():
         "medium_gap": seconds(
             "wheel_medium_gap_ms", MEDIUM_ROLL_GAP_S, 0.3, 3.0),
         "direction_guard": seconds(
-            "wheel_direction_guard_ms", DIRECTION_GUARD_S, 0.0, 2.0),
+            "wheel_direction_guard_ms", DIRECTION_GUARD_S, 0.0, 2.0,
+            migrate_before=4),
         "hold_delay": seconds(
             "wheel_hold_delay_ms", HOLD_REPEAT_DELAY_S, 0.10, 0.60,
-            migrate=True),
+            migrate_before=2),
         "hold_interval": seconds(
-            "wheel_hold_interval_ms", HOLD_REPEAT_INTERVAL_S, 0.01, 0.10,
-            migrate=True),
+            "wheel_hold_interval_ms", HOLD_REPEAT_INTERVAL_S, 0.025, 0.10,
+            migrate_before=4),
     }
 
 
@@ -221,7 +227,7 @@ def analyze_calibration(stages, target_fast_rolls=3):
         fast_gap + 0.25,
         min(3.0, max(fast_gap + 0.4, slow_typical * 0.80)),
     )
-    direction_guard = max(0.4, min(1.5, fast_gap))
+    direction_guard = DIRECTION_GUARD_S
     target_fast_rolls = max(3, min(5, int(target_fast_rolls)))
     max_step = max(
         10, min(50, math.ceil(100 / (target_fast_rolls - 0.9))))
@@ -238,7 +244,7 @@ def analyze_calibration(stages, target_fast_rolls=3):
     )
     usable_fast_hold = max(0.12, fast_hold_typical - hold_delay)
     hold_interval = max(
-        0.012,
+        RAMP_INTERVAL_S,
         min(
             0.060,
             usable_fast_hold / max(1, max_step - amount_before_fast),
@@ -263,7 +269,7 @@ def analyze_calibration(stages, target_fast_rolls=3):
         "wheel_hold_interval_ms": round(hold_interval * 1000),
         "wheel_fine_step": DEFAULT_FINE_STEP,
         "wheel_fine_interval_ms": round(fine_interval * 1000),
-        "wheel_calibration_version": 3,
+        "wheel_calibration_version": 4,
         "wheel_calibrated": True,
         "counts": counts,
         "wrong_directions": wrong,
@@ -298,9 +304,14 @@ class VolumeWheel:
         self.last_effective_code = None
         self.last_activation = 0.0
         self.last_release = 0.0
+        self.last_raw_code = None
+        self.last_raw_press = 0.0
+        self.reversal_burst = 0
+        self.suppressed_until = 0.0
         self.ramp_current = None
         self.ramp_target = None
         self.next_ramp_step = 0.0
+        self.last_volume_write = None
         self.failures = 0
 
     @staticmethod
@@ -363,9 +374,14 @@ class VolumeWheel:
         self.last_effective_code = None
         self.last_activation = 0.0
         self.last_release = 0.0
+        self.last_raw_code = None
+        self.last_raw_press = 0.0
+        self.reversal_burst = 0
+        self.suppressed_until = 0.0
         self.ramp_current = None
         self.ramp_target = None
         self.next_ramp_step = 0.0
+        self.last_volume_write = None
         self.next_retry = time.monotonic() + RETRY_S
 
     def fileno(self):
@@ -394,18 +410,59 @@ class VolumeWheel:
             # movement; longer holds encode a faster, farther wheel sweep.
             if value == 1:
                 now = time.monotonic()
+                if now < self.suppressed_until:
+                    # A tripped breaker is intentionally quiet: remember the
+                    # latest raw edge and require a full quiet window before
+                    # recovery, without emitting repeated warnings.
+                    self.last_raw_code = code
+                    self.last_raw_press = event_time
+                    self.suppressed_until = now + REVERSAL_COOLDOWN_S
+                    self.held_code = code
+                    self.held_effective_code = None
+                    continue
+                raw_gap = (
+                    None if not self.last_raw_press
+                    else event_time - self.last_raw_press
+                )
+                if (self.last_raw_code is not None
+                        and code != self.last_raw_code
+                        and raw_gap is not None
+                        and 0 <= raw_gap <= REVERSAL_BURST_WINDOW_S):
+                    self.reversal_burst += 1
+                elif raw_gap is None or raw_gap > REVERSAL_BURST_WINDOW_S:
+                    self.reversal_burst = 0
+                self.last_raw_code = code
+                self.last_raw_press = event_time
+                if self.reversal_burst >= REVERSAL_BURST_LIMIT:
+                    self.suppressed_until = now + REVERSAL_COOLDOWN_S
+                    self.reversal_burst = 0
+                    self._stop_motion()
+                    self.log.warning(
+                        "earcup wheel: rapid reversal burst suppressed")
+                if now < self.suppressed_until:
+                    self.held_code = code
+                    self.held_effective_code = None
+                    continue
+
                 direction_gap = (
                     None if not self.last_activation
                     else event_time - self.last_activation
                 )
-                effective_code = code
                 if (self.last_effective_code is not None
                         and code != self.last_effective_code
                         and direction_gap is not None
                         and direction_gap < calibration["direction_guard"]):
-                    effective_code = self.last_effective_code
-                else:
-                    self.last_effective_code = code
+                    # Stop old momentum immediately. Optional protection drops
+                    # this uncertain reversal; it never turns it into another
+                    # step in the old direction.
+                    self._stop_motion()
+                    self.held_code = code
+                    continue
+                if (self.last_effective_code is not None
+                        and code != self.last_effective_code):
+                    self._stop_motion()
+                effective_code = code
+                self.last_effective_code = code
                 self.last_activation = event_time
                 self.held_code = code
                 self.held_effective_code = effective_code
@@ -430,6 +487,18 @@ class VolumeWheel:
                 self.activation_started = 0.0
         if delta:
             self._queue_delta(delta)
+
+    def _stop_motion(self):
+        """Cancel queued/held movement without changing accepted direction."""
+        self.held_code = None
+        self.held_effective_code = None
+        self.next_hold_step = 0.0
+        self.activation_amount = 0
+        self.activation_limit = 0
+        self.activation_started = 0.0
+        self.ramp_current = None
+        self.ramp_target = None
+        self.next_ramp_step = 0.0
 
     def tick(self, now=None):
         """Advance the 1% ramp and recover merged physical activations.
@@ -496,10 +565,19 @@ class VolumeWheel:
         """Queue a gesture; each percent is emitted later by ``tick``."""
         now = time.monotonic() if now is None else now
         try:
-            if self.ramp_current is None or self.ramp_target is None:
+            starting = (
+                self.ramp_current is None or self.ramp_target is None)
+            if starting:
                 self.ramp_current = self._read_volume()
                 self.ramp_target = self.ramp_current
             current = self.ramp_current
+            if delta > 0 and current >= DEFAULT_CEILING:
+                # Wheel-up above the safety stop is a no-op. Never pull a
+                # deliberate slider boost back down toward 100%.
+                self.ramp_current = None
+                self.ramp_target = None
+                self.next_ramp_step = 0.0
+                return
             queued_direction = self.ramp_target - current
             # Reversing the wheel must reverse immediately rather than first
             # draining a long queue from the previous direction.
@@ -518,8 +596,11 @@ class VolumeWheel:
                 self.next_ramp_step = 0.0
                 return
             self.ramp_target = target
-            self.next_ramp_step = min(
-                self.next_ramp_step or now, now)
+            if starting:
+                earliest = (
+                    now if self.last_volume_write is None
+                    else self.last_volume_write + RAMP_INTERVAL_S)
+                self.next_ramp_step = max(now, earliest)
             self.failures = 0
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             self._volume_failure(exc)
@@ -535,6 +616,7 @@ class VolumeWheel:
         try:
             self._set_volume(value)
             self.ramp_current = value
+            self.last_volume_write = now
             self.next_ramp_step = now + RAMP_INTERVAL_S
             self.failures = 0
             self.log.debug(
