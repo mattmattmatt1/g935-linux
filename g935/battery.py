@@ -77,9 +77,108 @@ ETA_PROFILE_HISTORY_HI = 1.5     # with qualifying session history
 CHARGE_RAIL_ABOVE_FULL_MV = 40   # raw mV > full + this while charging → rail
 POST_CHARGE_PEAK_SAMPLES = 5     # rest samples after unplug for true peak OCV
 
+# Desktop low-battery notifications (discharging only)
+BATT_LOW_PCT = 10
+BATT_CRITICAL_PCT = 5
+# Re-arm only after SoC rises this far above the threshold (ADC noise guard)
+BATT_ALERT_HYSTERESIS = 5
+
 
 def health_file() -> str:
     return os.path.join(config_dir(), "health.json")
+
+
+class BatteryAlert:
+    """One desktop notification to fire for a low-battery threshold cross."""
+
+    __slots__ = ("level", "urgency", "summary", "body")
+
+    def __init__(self, level: str, urgency: str, summary: str, body: str):
+        self.level = level
+        self.urgency = urgency
+        self.summary = summary
+        self.body = body
+
+    def __repr__(self):
+        return f"BatteryAlert({self.level!r}, {self.urgency!r})"
+
+
+class BatteryAlerts:
+    """Latch low/critical notifications while discharging.
+
+    Rules:
+      * Never alert while charging (or when charging state is unknown).
+      * Fire once per level when SoC is at or below the threshold.
+      * Critical suppresses a redundant low if both trip together.
+      * On unplug (charge → discharge), re-arm and re-check immediately so
+        unplugging at 8% still warns low, and unplugging at 4% warns critical.
+      * Also re-arm after recovery past threshold + hysteresis (noise guard).
+    """
+
+    def __init__(
+        self,
+        low_pct: int = BATT_LOW_PCT,
+        critical_pct: int = BATT_CRITICAL_PCT,
+        hysteresis: int = BATT_ALERT_HYSTERESIS,
+    ):
+        self.low_pct = int(low_pct)
+        self.critical_pct = int(critical_pct)
+        self.hysteresis = int(hysteresis)
+        self._latched_low = False
+        self._latched_critical = False
+        self._was_charging = False
+
+    def reset(self):
+        self._latched_low = False
+        self._latched_critical = False
+
+    def update(self, pct, charging) -> list:
+        """Feed one battery poll. Returns zero or more BatteryAlert to show."""
+        if charging is True:
+            # Quiet on the rail; remember we were on charge so unplug re-arms.
+            self._was_charging = True
+            return []
+        if pct is None or charging is not False:
+            # Unknown SoC or unknown charge state — stay quiet, keep latches.
+            return []
+
+        # Charge → discharge edge: clear latches so a still-low pack alerts
+        # right after unplug (e.g. unplug at 8% → low, at 4% → critical).
+        if self._was_charging:
+            self.reset()
+            self._was_charging = False
+
+        pct = int(pct)
+        alerts = []
+
+        if pct <= self.critical_pct and not self._latched_critical:
+            self._latched_critical = True
+            self._latched_low = True  # don't also fire low after critical
+            alerts.append(BatteryAlert(
+                level="critical",
+                urgency="critical",
+                summary="G935: battery critically low",
+                body=(
+                    f"{pct}% remaining — charge soon or the headset may "
+                    f"power off."
+                ),
+            ))
+        elif pct <= self.low_pct and not self._latched_low:
+            self._latched_low = True
+            alerts.append(BatteryAlert(
+                level="low",
+                urgency="normal",
+                summary="G935: battery low",
+                body=f"{pct}% remaining — plug in when you can.",
+            ))
+
+        # Re-arm only after clear recovery (noise near the threshold).
+        if pct > self.low_pct + self.hysteresis:
+            self._latched_low = False
+        if pct > self.critical_pct + self.hysteresis:
+            self._latched_critical = False
+
+        return alerts
 
 
 def batt_state(flags):

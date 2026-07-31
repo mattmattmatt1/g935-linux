@@ -40,7 +40,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk, Gio, Pango
 
 from g935.battery import (
-    HEALTH_DEFAULTS, HealthTracker, batt_percent, batt_state,
+    HEALTH_DEFAULTS, BatteryAlerts, HealthTracker, batt_percent, batt_state,
     build_insights, merge_discharge_sessions, session_full_runtime_h,
 )
 from g935.charts import (
@@ -587,6 +587,7 @@ class App(Gtk.Window):
         self._stereo_fixing = False
         self._stereo_last_notify = 0.0
         self._stereo_dismissed_until = 0.0  # user closed banner; quiet until change
+        self._batt_alerts = BatteryAlerts()
 
         # ================= Control page (everything except the console) =================
         sound = self._page("control", "Control", scroll=True)
@@ -3441,6 +3442,7 @@ class App(Gtk.Window):
                 self.batt_label.set_tooltip_text(
                     f"{cell} mV, {state} (flags {flags:#04x})")
             self._update_tray_battery(f"{icon} {pct_s} · {state}")
+            self._check_battery_alerts(pct, charging)
             if self.connected is not True:
                 was_off = self.connected is False
                 self.connected = True
@@ -3461,6 +3463,18 @@ class App(Gtk.Window):
                 f"--- battery poll missed "
                 f"({self._battery_presence.misses}/"
                 f"{self._battery_presence.miss_limit}); keeping state ---")
+
+    def _check_battery_alerts(self, pct, charging):
+        """Desktop notify once per low/critical threshold while discharging."""
+        for alert in self._batt_alerts.update(pct, charging):
+            # Stable replace ids so repeated cycles update the same toast slot
+            rid = 93510 if alert.level == "low" else 93505
+            ok = notify_user(
+                alert.summary, alert.body, urgency=alert.urgency,
+                replace_id=rid)
+            self.log(
+                f"BATT ALERT {alert.level}: {alert.body}"
+                + ("" if ok else " (notify-send failed — check libnotify / DBus)"))
 
     def _mark_disconnected(self):
         self._battery_presence.reset()

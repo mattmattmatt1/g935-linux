@@ -1,6 +1,8 @@
 import unittest
 
-from g935.hidpp import ERROR_CODES, parse_reply, to_report
+from g935.hidpp import (
+    ERROR_CODES, PollPresence, is_hidpp_notification, parse_reply, to_report,
+)
 
 
 class FrameTests(unittest.TestCase):
@@ -40,6 +42,40 @@ class FrameTests(unittest.TestCase):
 
     def test_parse_short(self):
         self.assertIsNone(parse_reply(b"\x11\xff", 0x05, 0x2B))
+
+    def test_hidpp_notification_has_zero_software_id(self):
+        self.assertTrue(is_hidpp_notification(
+            bytes.fromhex("11ff050001000000")))
+        self.assertFalse(is_hidpp_notification(
+            bytes.fromhex("11ff052b01000000")))
+        self.assertFalse(is_hidpp_notification(bytes.fromhex("0801")))
+
+
+class PollPresenceTests(unittest.TestCase):
+    def test_isolated_misses_do_not_create_power_cycles(self):
+        p = PollPresence(miss_limit=3)
+        self.assertIs(p.observe(True), True)
+        self.assertIsNone(p.observe(False))
+        self.assertIsNone(p.observe(False))
+        self.assertTrue(p.connected)
+        self.assertIsNone(p.observe(True))
+        self.assertTrue(p.connected)
+        self.assertEqual(p.misses, 0)
+
+    def test_consecutive_misses_confirm_offline(self):
+        p = PollPresence(miss_limit=3)
+        p.observe(True)
+        self.assertIsNone(p.observe(False))
+        self.assertIsNone(p.observe(False))
+        self.assertIs(p.observe(False), False)
+        self.assertFalse(p.connected)
+        self.assertIsNone(p.observe(False))
+        self.assertIs(p.observe(True), True)
+        self.assertTrue(p.connected)
+
+    def test_rejects_invalid_limit(self):
+        with self.assertRaises(ValueError):
+            PollPresence(miss_limit=0)
 
 
 if __name__ == "__main__":

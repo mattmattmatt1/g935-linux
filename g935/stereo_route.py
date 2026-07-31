@@ -324,21 +324,37 @@ def fix_stereo(status: StereoStatus | None = None) -> tuple[bool, str]:
     return False, after.detail + (" — " + "; ".join(parts) if parts else "")
 
 
-def notify_user(summary: str, body: str = "", urgency: str = "normal") -> None:
-    """Desktop notification via notify-send when available."""
+def notify_user(summary: str, body: str = "", urgency: str = "normal",
+                replace_id: int | None = None) -> bool:
+    """Desktop notification via notify-send when available.
+
+    Returns True if notify-send ran successfully. Failures are logged (the
+    previous silent swallow made missing battery alerts hard to debug).
+    """
     if not shutil.which("notify-send"):
-        return
+        log.warning("notify-send not found — install libnotify-bin for desktop alerts")
+        return False
     cmd = [
         "notify-send",
         f"--urgency={urgency}",
         "--app-name=G935 Control",
         "--icon=audio-headset",
         "--category=device",
+        # Helps KDE/Plasma associate the toast with the desktop entry
+        "--hint=string:desktop-entry:g935-control",
         summary,
     ]
     if body:
         cmd.append(body)
+    if replace_id is not None:
+        cmd[1:1] = [f"--replace-id={int(replace_id)}"]
     try:
-        subprocess.run(cmd, capture_output=True, timeout=3)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+        r = subprocess.run(cmd, capture_output=True, timeout=3, text=True)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("notify-send failed: %s", e)
+        return False
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}"
+        log.warning("notify-send failed: %s", err)
+        return False
+    return True

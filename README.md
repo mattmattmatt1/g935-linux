@@ -4,11 +4,24 @@ A native GTK3 control panel and background service for the Logitech G935
 wireless headset. It talks directly to the receiver over HID++—no G HUB,
 Windows VM, or web account required.
 
-[Latest release: v0.5](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.5)
+[Latest release: v0.6](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.6)
 
-## Major earcup-wheel upgrade
+## What's new in v0.6
 
-The physical volume wheel now feels like a real analog control instead of an
+Desktop **low-battery notifications** via the system tray:
+
+- **Low** at **≤10%** while discharging  
+- **Critical** at **≤5%** while discharging  
+- **Silent while charging** (including while SoC climbs back past those marks)  
+- **Re-check on unplug** — unplug at 8% still warns low; unplug at 4% warns critical  
+- One toast per level per cycle, with hysteresis so ADC noise does not spam  
+
+Requires `libnotify-bin` (`notify-send`) and a running control panel (same path
+as stereo-route alerts).
+
+## Earcup wheel (from v0.5)
+
+The physical volume wheel feels like a real analog control instead of an
 unpredictable media key. The receiver's press duration is decoded into smooth
 1% changes: tiny movements stay precise, long sweeps accelerate progressively,
 reversals are filtered, and wheel-up remains safely capped at 100%.
@@ -31,7 +44,8 @@ diagnostics for unusual hardware behavior.
   breathing, cycling, color, period, waveform, intensity, ramp, and boot
   animation where supported.
 - **Battery:** live charge, voltage and runtime, learned drain history,
-  estimated battery health, full-charge runtime loss, and auto power-off.
+  estimated battery health, full-charge runtime loss, auto power-off, and
+  desktop notifications at 10% (low) / 5% (critical) while discharging.
 - **Desktop audio:** output/input visibility, default-device selection, tray
   mixer, and per-device volume. Sliders pause safely at 100%; release and drag
   again only when you deliberately need boost up to 150%.
@@ -97,7 +111,8 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
   PipeWire's PulseAudio-compatible server too)
 - `pipewire-bin` (`pw-link`) — detects and repairs the left-ear-only route
   that can appear after suspend
-- `libnotify-bin` (`notify-send`) — desktop warning when that route breaks
+- `libnotify-bin` (`notify-send`) — desktop warnings for stereo-route breaks
+  and low / critical battery while discharging
 - `python3-hid` (or `pip install hid`) — only for the standalone
   `tools/g935-enable.py` hidapi path; the GUI and daemon don't need it
 
@@ -208,6 +223,12 @@ extrapolation, not a BMS.
 spikes above 4.2 V), not resting cell voltage. The UI freezes SoC at the last
 off-charger reading and shows path mV separately; full-charge peaks are taken
 from rest after unplug, never from rail spikes.
+
+**Low battery notifications** fire once per discharge cycle via `notify-send`
+(notification tray): **low at ≤10%**, **critical at ≤5%**. Alerts are suppressed
+while charging. Unplugging re-checks immediately (unplug at 8% → low; at 4% →
+critical). Alerts also re-arm after SoC recovers past the threshold (with
+hysteresis so ADC noise near the boundary does not spam).
 
 ### Left-ear-only after sleep
 
