@@ -4,20 +4,27 @@ A native GTK3 control panel and background service for the Logitech G935
 wireless headset. It talks directly to the receiver over HID++—no G HUB,
 Windows VM, or web account required.
 
-[Latest release: v0.6](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.6)
+[Latest release: v0.7](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.7)
 
-## What's new in v0.6
+## What's new in v0.7
 
-Desktop **low-battery notifications** via the system tray:
+**Stable presence / reconnect handling** for the daemon and control panel:
 
-- **Low** at **≤10%** while discharging  
-- **Critical** at **≤5%** while discharging  
-- **Silent while charging** (including while SoC climbs back past those marks)  
-- **Re-check on unplug** — unplug at 8% still warns low; unplug at 4% warns critical  
-- One toast per level per cycle, with hysteresis so ADC noise does not spam  
+- False “headset offline” cycles from HID++ TIMEOUT under concurrent panel +
+  daemon traffic no longer re-trigger power-on DSP enable and lighting/EQ storms
+- Presence debounce uses a longer miss streak and a post-connect grace window
+  while the panel reasserts state
+- Software-mode DSP self-heal is rate-limited (not on every battery poll) to cut
+  bus load on the shared hidraw
 
-Requires `libnotify-bin` (`notify-send`) and a running control panel (same path
-as stereo-route alerts).
+Upgrade: `git pull`, `./install.sh --user`, then
+`systemctl --user try-restart g935-dsp` and reopen the panel. No udev change.
+
+### Earlier: v0.6 low-battery notifications
+
+Desktop toasts at **≤10%** (low) and **≤5%** (critical) while discharging;
+silent while charging; re-check on unplug. Needs `libnotify-bin` and a running
+panel.
 
 ## Earcup wheel (from v0.5)
 
@@ -142,18 +149,21 @@ You can also run `python3 g935-control.py` directly from the checkout.
 
 ```bash
 git pull --ff-only
-# Required once when upgrading from v0.4: installs wheel input permissions.
-./install.sh --udev
-# Unplug and reconnect the wireless receiver after the udev step.
-
 ./install.sh --user
 systemctl --user try-restart g935-dsp
 ```
 
-Quit and reopen the panel after upgrading. Re-running `--user` matters because
-the application now installs the shared `g935/` package as well as the launch
-scripts. After installing the v0.5 wheel rule once, the udev step does not need
-to be repeated unless those rules change again.
+Quit and reopen the panel after upgrading. Re-running `--user` always matters:
+it copies the shared `g935/` package and both launch scripts into
+`~/.local/share/g935-linux/`.
+
+**Udev** is only needed once per machine (or when rules change). If you installed
+before v0.5 and the earcup wheel cannot open `/dev/input/event*`, re-run:
+
+```bash
+./install.sh --udev
+# then unplug and reconnect the wireless receiver
+```
 
 ### Background service
 
@@ -261,9 +271,11 @@ restore FR. Tray menu also gets **Fix stereo** while broken.
 | Mic stuck muted after boom up | enable daemon: `systemctl --user enable --now g935-dsp`, or switch to hardware mode |
 | "press unmute twice" | install `70-g935-micmute.hwdb` via `./install.sh --udev` |
 | Sound flat after power cycle | daemon not running, or mode is hardware — enable daemon / flip software mode |
+| Headset flickers offline / DSP re-enables every ~15–60s | upgrade to v0.7+; `./install.sh --user` and `systemctl --user try-restart g935-dsp`, then reopen the panel |
 | Only the left ear works after sleep | install `pipewire-bin`; the panel should detect and repair the missing right-channel link |
 | Panel dead after unplug/replug | should auto-recover; if not, restart the panel (file a bug) |
 | `g935-control: command not found` | ensure `~/.local/bin` is on `PATH`, or run `python3 g935-control.py` |
+| Desktop file won’t launch from file manager | use the installed `g935-control` command / app menu entry, not the raw `.desktop` in the git checkout |
 
 ## Development
 

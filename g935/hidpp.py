@@ -195,37 +195,66 @@ class PollPresence:
     still on.  Treating one missed reply as a power-off makes the next ACK look
     like a fresh power-on, which can replay disruptive initialization actions.
 
+    After a confirmed connect (and after intentional HID++ bursts such as DSP
+    enable / panel reassert), a short grace window ignores misses so the
+    reconnect traffic storm cannot immediately invent another power cycle.
+
     ``observe()`` returns True for a confirmed offline->online transition,
     False for a confirmed online->offline transition, and None otherwise.
     """
 
-    def __init__(self, miss_limit: int = 3):
+    def __init__(self, miss_limit: int = 5, grace_s: float = 25.0):
         if miss_limit < 1:
             raise ValueError("miss_limit must be at least 1")
+        if grace_s < 0:
+            raise ValueError("grace_s must be non-negative")
         self.miss_limit = miss_limit
+        self.grace_s = float(grace_s)
         self.connected = False
         self.misses = 0
+        self._grace_until = 0.0
 
-    def observe(self, reachable: bool):
+    def note_activity(
+        self, grace_s: float | None = None, now: float | None = None,
+    ) -> None:
+        """Extend the post-burst grace window (e.g. after DSP enable / reassert)."""
+        duration = self.grace_s if grace_s is None else float(grace_s)
+        if duration <= 0:
+            return
+        t = time.time() if now is None else float(now)
+        until = t + duration
+        if until > self._grace_until:
+            self._grace_until = until
+
+    def observe(self, reachable: bool, now: float | None = None):
+        t = time.time() if now is None else float(now)
         if reachable:
             self.misses = 0
             if not self.connected:
                 self.connected = True
+                # Fresh online: ignore short timeout streaks while the panel
+                # and daemon reassert mode/lighting/EQ on the same hidraw.
+                self.note_activity(now=t)
                 return True
             return None
 
         if not self.connected:
+            return None
+        if t < self._grace_until:
+            # Still in reconnect/assert window — do not accumulate toward offline.
             return None
         self.misses += 1
         if self.misses < self.miss_limit:
             return None
         self.connected = False
         self.misses = 0
+        self._grace_until = 0.0
         return False
 
     def reset(self) -> None:
         self.connected = False
         self.misses = 0
+        self._grace_until = 0.0
 
 
 class HidWorker(threading.Thread):

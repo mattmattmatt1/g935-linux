@@ -467,7 +467,9 @@ class App(Gtk.Window):
         self.set_default_size(840, 900)
         self.set_icon_name("audio-headset")
         self.connected = None   # None = unknown, True/False after first battery poll
-        self._battery_presence = PollPresence(miss_limit=3)
+        # match daemon: short TIMEOUT streaks during reassert must not look
+        # like power-off (that re-triggers a full lighting/EQ storm).
+        self._battery_presence = PollPresence(miss_limit=6, grace_s=45.0)
         self.pid = pid
 
         self.settings = AppSettings()
@@ -602,7 +604,7 @@ class App(Gtk.Window):
         self.dsp_sw.set_active(load_mode() == "ghub")
         self.dsp_sw.set_tooltip_text(
             "Saved target mode. The G935 exposes no readback for this state, "
-            "so software mode is reasserted after every battery reading.")
+            "so software mode is reasserted periodically while connected.")
         self.dsp_sw.connect("notify::active", self.on_dsp_toggle)
         row.pack_end(self.dsp_sw, False, False, 0)
         gk.pack_start(row, False, False, 0)
@@ -1844,6 +1846,9 @@ class App(Gtk.Window):
         else:
             self._apply_sidetone()
             self.on_eq_apply(None)
+        # HID++ burst on the shared hidraw — keep presence from declaring
+        # offline mid-reassert (which would re-enter this path).
+        self._battery_presence.note_activity(25.0)
 
     def on_link_change(self, up):
         """HidWorker reopened (or lost) the hidraw node after unplug/replug."""
@@ -3398,12 +3403,16 @@ class App(Gtk.Window):
     def got_battery(self, status, reply):
         if status == "ACK":
             self._battery_presence.observe(True)
-            # 0x8010 has no readable state on this headset. Keep each required
-            # ADC/battery read self-healing by reasserting the saved target
-            # immediately afterward; this avoids a visually-on/actually-flat
-            # soundstage without introducing an audible off/on pulse.
+            # 0x8010 has no readable state on this headset. Periodically
+            # reassert the saved DSP target so a flat soundstage heals, but
+            # not on every 5s poll — that doubled HID++ traffic and made
+            # presence TIMEOUTs look like power-off (reconnect death spiral).
             if self.dsp_sw.get_active():
-                self.send("gkeys", 2, "01")
+                now = time.time()
+                last = getattr(self, "_last_dsp_heal", 0.0)
+                if now - last >= 30.0:
+                    self._last_dsp_heal = now
+                    self.send("gkeys", 2, "01")
             mv = (reply[4] << 8) | reply[5]
             flags = reply[6]
             state, charging = batt_state(flags)

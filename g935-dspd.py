@@ -39,7 +39,12 @@ log = logging.getLogger("g935.dspd")
 
 POLL_S = 5
 MIC_POLL_S = 0.25
-MISSED_POLLS_OFFLINE = 3
+# 3 misses (~15s) was too tight: a reconnect assert storm from the panel makes
+# consecutive presence TIMEOUTs look like power-off, which re-triggers enable
+# and loops. 6 misses ≈ 30s of sustained silence before declaring offline.
+MISSED_POLLS_OFFLINE = 6
+# After power-on enable, ignore presence misses while the panel reasserts.
+POST_ENABLE_GRACE_S = 45.0
 ENABLE = "11ff052b01"
 # A root ping is answered by the USB receiver even while the wireless headset
 # is off.  G-key capability is a harmless, device-level read: it ACKs only when
@@ -75,7 +80,8 @@ def main() -> None:
 
     mic = MicHandler(usbid=ALSA_USBID, mode_loader=load_mode)
     wheel = VolumeWheel(log.getChild("wheel"))
-    presence = PollPresence(miss_limit=MISSED_POLLS_OFFLINE)
+    presence = PollPresence(
+        miss_limit=MISSED_POLLS_OFFLINE, grace_s=POST_ENABLE_GRACE_S)
     fd = None
     next_poll = 0.0
 
@@ -100,6 +106,7 @@ def main() -> None:
                 status, _ = transact(
                     fd, PRESENCE_GET,
                     on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
+                    timeout=1.5,
                 )
                 next_poll = now + POLL_S
                 if status == "GONE":
@@ -111,10 +118,14 @@ def main() -> None:
                     if mode == "ghub":
                         time.sleep(2)
                         enable_dsp(fd)
+                        # Panel will reassert lighting/EQ on the same bus;
+                        # hold grace so TIMEOUT streaks do not re-enter power-on.
+                        presence.note_activity(POST_ENABLE_GRACE_S)
                         # Power-on with boom up may carry the device flag.
                         mic.mark_needs_unmute()
                     else:
                         log.info("hardware mode — leaving headset stock")
+                        presence.note_activity(POST_ENABLE_GRACE_S)
                 elif transition is False:
                     log.info(
                         "headset unavailable after %d missed polls",

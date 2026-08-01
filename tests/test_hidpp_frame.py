@@ -53,7 +53,7 @@ class FrameTests(unittest.TestCase):
 
 class PollPresenceTests(unittest.TestCase):
     def test_isolated_misses_do_not_create_power_cycles(self):
-        p = PollPresence(miss_limit=3)
+        p = PollPresence(miss_limit=3, grace_s=0)
         self.assertIs(p.observe(True), True)
         self.assertIsNone(p.observe(False))
         self.assertIsNone(p.observe(False))
@@ -63,7 +63,7 @@ class PollPresenceTests(unittest.TestCase):
         self.assertEqual(p.misses, 0)
 
     def test_consecutive_misses_confirm_offline(self):
-        p = PollPresence(miss_limit=3)
+        p = PollPresence(miss_limit=3, grace_s=0)
         p.observe(True)
         self.assertIsNone(p.observe(False))
         self.assertIsNone(p.observe(False))
@@ -73,9 +73,42 @@ class PollPresenceTests(unittest.TestCase):
         self.assertIs(p.observe(True), True)
         self.assertTrue(p.connected)
 
+    def test_grace_window_ignores_misses_after_connect(self):
+        """Reconnect assert storms must not invent another power cycle."""
+        p = PollPresence(miss_limit=3, grace_s=10.0)
+        t0 = 1_700_000_000.0
+        self.assertIs(p.observe(True, now=t0), True)
+        # Within grace (t0 .. t0+10 exclusive): many misses still leave us connected
+        for i in range(9):
+            self.assertIsNone(p.observe(False, now=t0 + 1 + i))
+        self.assertTrue(p.connected)
+        self.assertEqual(p.misses, 0)
+        # After grace: normal debounce applies
+        self.assertIsNone(p.observe(False, now=t0 + 10))
+        self.assertIsNone(p.observe(False, now=t0 + 11))
+        self.assertIs(p.observe(False, now=t0 + 12), False)
+        self.assertFalse(p.connected)
+
+    def test_note_activity_extends_grace(self):
+        p = PollPresence(miss_limit=2, grace_s=5.0)
+        t0 = 1_700_000_000.0
+        p.observe(True, now=t0)
+        # Past initial grace…
+        p.observe(False, now=t0 + 6)  # would count without extension
+        self.assertEqual(p.misses, 1)
+        # Burst (DSP enable / panel reassert) re-arms grace
+        p.note_activity(10.0, now=t0 + 7)
+        self.assertIsNone(p.observe(False, now=t0 + 15))
+        self.assertEqual(p.misses, 1)  # unchanged during extended grace
+        self.assertTrue(p.connected)
+        # After extended grace, second miss confirms offline
+        self.assertIs(p.observe(False, now=t0 + 18), False)
+
     def test_rejects_invalid_limit(self):
         with self.assertRaises(ValueError):
             PollPresence(miss_limit=0)
+        with self.assertRaises(ValueError):
+            PollPresence(grace_s=-1)
 
 
 if __name__ == "__main__":
