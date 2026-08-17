@@ -28,6 +28,7 @@ HEALTH_DEFAULTS = {
     "full_mv": 4200,
     "empty_mv": 3500,
     "runtime_profile": "rgb_on",
+    "rated_charge_h": 2.0,             # Logitech spec, 0→100 on USB
 }
 
 # Segment bookkeeping
@@ -62,11 +63,26 @@ PROFILE_MIN_RATES_PER_BIN = 2
 RUNTIME_OUTLIER_LO = 0.25
 RUNTIME_OUTLIER_HI = 1.75
 
-SEG_MAX = 200
+SEG_MAX = 600
 PEAKS_MAX = 50
+# Resting OCV below this is a mid-charge unplug, not a full-charge peak.
+PEAK_MIN_BELOW_FULL_MV = 80
 SAVE_EVERY_S = 300
 N_RECENT_SESSIONS = 8            # median window for learned full runtime
+N_RECENT_CHARGES = 8             # median window for learned empty-to-full charge
 ETA_HISTORY_MIN_SESSIONS = 3     # enough evidence to anchor remaining runtime
+
+# Charge-up time: rest SoC before plug-in vs rest SoC after unplug.
+# On-charger ADC is the rail, so segment % cannot be used.
+CHARGE_RUN_GAP_S = 3 * 60        # hole inside one dock sit
+CHARGE_MERGE_GAP_S = 15 * 60     # brief unplug still the same charge
+CHARGE_MIN_MINUTES = 15
+CHARGE_MAX_HOURS = 2.75          # longer is almost always dock-idle after full
+CHARGE_MIN_DPCT = 25             # need a real fill, not a 5% top-up
+CHARGE_MIN_END_PCT = 55          # unplugged too early to extrapolate 0→100
+CHARGE_MAX_PCT_PER_H = 70        # faster than ~85 min 0→100 is inflated rest
+CHARGE_OUTLIER_LO = 0.35
+CHARGE_OUTLIER_HI = 2.25
 ETA_PROFILE_HISTORY_LO = 0.5     # reject profile ETA if it strongly disagrees
 ETA_PROFILE_HISTORY_HI = 1.5     # with qualifying session history
 
@@ -233,10 +249,15 @@ def cell_mv(mv, charging, last_rest_mv=None, full_mv=None):
 
 
 def sanitize_peaks(peaks, full_mv=None):
-    """Drop peak samples that are clearly charger-rail, not cell OCV."""
+    """Keep only rest OCV that looks like a near-full charge.
+
+    Drop charger-rail spikes and mid-charge unplugs (e.g. 3.9 V after a
+    20-minute top-up) so the peak trend is not a random walk.
+    """
     full = int(full_mv if full_mv is not None else BATT_CURVE[0][0])
-    limit = full + CHARGE_RAIL_ABOVE_FULL_MV
-    return [[int(t), int(mv)] for t, mv in peaks if int(mv) <= limit]
+    hi = full + CHARGE_RAIL_ABOVE_FULL_MV
+    lo = full - PEAK_MIN_BELOW_FULL_MV
+    return [[int(t), int(mv)] for t, mv in peaks if lo <= int(mv) <= hi]
 
 
 def segment_rate(seg):
@@ -622,10 +643,27 @@ def build_insights(analysis, state=None, charging=None):
 
     # Charging-first messaging
     if charging is True or state == "charging":
-        insights.append({
-            "tone": "good",
-            "text": "Charging — remaining runtime updates once you're off the dock.",
-        })
+        remain_chg = a.get("remain_charge_h")
+        learned_chg = a.get("learned_full_charge_h")
+        if remain_chg is not None:
+            insights.append({
+                "tone": "good",
+                "text": f"Charging — about {_fmt_h_short(remain_chg)} to full "
+                        f"(learned {_fmt_h_short(learned_chg)} empty-to-full).",
+            })
+        elif learned_chg is not None:
+            insights.append({
+                "tone": "good",
+                "text": f"Charging — typical empty-to-full is "
+                        f"{_fmt_h_short(learned_chg)}. Remaining runtime updates "
+                        "once you're off the dock.",
+            })
+        else:
+            insights.append({
+                "tone": "good",
+                "text": "Charging — remaining runtime updates once you're off "
+                        "the dock. A couple of 25%+ fills teach charge-up time.",
+            })
     elif state == "headset off" or state == "unknown":
         insights.append({
             "tone": "muted",
@@ -657,6 +695,18 @@ def build_insights(analysis, state=None, charging=None):
             "tone": tone,
             "text": f"Battery is {vibe}: ~{health:.0f}% health · {learned_s} real full "
                     f"runtime vs {rated_s} rated ({conf}).",
+        })
+
+    learned_chg = a.get("learned_full_charge_h")
+    n_chg = a.get("n_charges") or 0
+    rated_chg = a.get("rated_charge_h")
+    if (learned_chg is not None and charging is not True
+            and state not in ("charging",)):
+        rated_cs = f"{rated_chg:g}h" if rated_chg else "—"
+        insights.append({
+            "tone": "info",
+            "text": f"Empty-to-full charge-up is about {_fmt_h_short(learned_chg)} "
+                    f"(median of {n_chg} fills · {rated_cs} rated).",
         })
 
     # Live remaining vs rated at this level
@@ -759,10 +809,25 @@ def _fmt_h_short(hours):
 
 
 def session_list_rows(segments, rated_runtime_h, limit=10):
-    """Rows for the recent-sessions list: label, duration, drain, full runtime, quality."""
-    rows = []
+    """Rows for the session list: solid evidence first, plus newer shorts.
+
+    The last N raw merges are almost all short hops, which hid the sessions
+    that actually feed the health median. Show the qualifying wears and any
+    shorter sits that happened after the newest solid one.
+    """
     sessions = merge_discharge_sessions(segments)
-    for sess in reversed(sessions[-limit:]):
+    solid = [s for s in sessions if session_full_runtime_h(s) is not None]
+    newest_solid_t = solid[-1]["t_start"] if solid else 0
+    newer_short = [
+        s for s in sessions
+        if session_full_runtime_h(s) is None and s["t_start"] > newest_solid_t
+    ]
+    picked = solid[-(limit - min(2, len(newer_short))):] + newer_short[-2:]
+    picked.sort(key=lambda s: s["t_start"], reverse=True)
+    picked = picked[:limit]
+
+    rows = []
+    for sess in picked:
         full = session_full_runtime_h(sess)
         dpct = sess["pct_start"] - sess["pct_end"]
         quality = "solid" if full is not None else "short"
@@ -782,6 +847,161 @@ def session_list_rows(segments, rated_runtime_h, limit=10):
             "pct_of_rated": pct_of_rated,
             "quality": quality,
         })
+    return rows
+
+
+def extract_charge_sits(recent, run_gap_s=CHARGE_RUN_GAP_S):
+    """Turn dense recent samples into charge sits with rest SoC before/after.
+
+    Each sit: t_start, t_end, on_time_s, parts, mv_start, mv_end,
+    pct_start, pct_end, path_start, path_end, path_peak, open.
+    pct_* come from the last off-charger reading, never from the rail.
+    """
+    sits = []
+    last_rest = None
+    i = 0
+    n = len(recent or [])
+    while i < n:
+        t, mv, chg = recent[i]
+        if not chg:
+            last_rest = (int(t), int(mv))
+            i += 1
+            continue
+        samples = [recent[i]]
+        i += 1
+        while i < n and recent[i][2]:
+            if recent[i][0] - samples[-1][0] > run_gap_s:
+                break
+            samples.append(recent[i])
+            i += 1
+        rest_after = None
+        if i < n and not recent[i][2]:
+            rest_after = (int(recent[i][0]), int(recent[i][1]))
+        t0 = int(samples[0][0])
+        t1 = int(samples[-1][0])
+        start_mv = last_rest[1] if last_rest is not None else None
+        end_mv = rest_after[1] if rest_after is not None else None
+        sits.append({
+            "t_start": t0,
+            "t_end": t1,
+            "on_time_s": max(0, t1 - t0),
+            "parts": 1,
+            "mv_start": start_mv,
+            "mv_end": end_mv,
+            "pct_start": batt_percent(start_mv) if start_mv is not None else None,
+            "pct_end": batt_percent(end_mv) if end_mv is not None else None,
+            "path_start": int(samples[0][1]),
+            "path_end": int(samples[-1][1]),
+            "path_peak": max(int(s[1]) for s in samples),
+            "open": i >= n and bool(samples[-1][2]),
+        })
+    return sits
+
+
+def merge_charge_sits(sits, gap_s=CHARGE_MERGE_GAP_S):
+    """Stitch charge sits across brief unplugs into one fill."""
+    if not sits:
+        return []
+    out = []
+    cur = dict(sits[0])
+    for sit in sits[1:]:
+        gap = sit["t_start"] - cur["t_end"]
+        if 0 <= gap <= gap_s:
+            cur["t_end"] = sit["t_end"]
+            cur["on_time_s"] += sit["on_time_s"]
+            cur["parts"] += sit["parts"]
+            if sit["mv_end"] is not None:
+                cur["mv_end"] = sit["mv_end"]
+                cur["pct_end"] = sit["pct_end"]
+            cur["path_end"] = sit["path_end"]
+            cur["path_peak"] = max(cur["path_peak"], sit["path_peak"])
+            cur["open"] = sit["open"]
+        else:
+            out.append(cur)
+            cur = dict(sit)
+    out.append(cur)
+    return out
+
+
+def session_full_charge_h(sit, min_minutes=CHARGE_MIN_MINUTES,
+                          max_hours=CHARGE_MAX_HOURS,
+                          min_dpct=CHARGE_MIN_DPCT,
+                          min_end_pct=CHARGE_MIN_END_PCT):
+    """Extrapolate a charge sit to empty-to-full hours, or None."""
+    if sit.get("pct_start") is None or sit.get("pct_end") is None:
+        return None
+    if sit.get("open"):
+        return None
+    dpct = sit["pct_end"] - sit["pct_start"]
+    dt_h = sit["on_time_s"] / 3600.0
+    if dpct < min_dpct or sit["pct_end"] < min_end_pct:
+        return None
+    if dt_h * 60 < min_minutes or dt_h > max_hours:
+        return None
+    # Already-full dock sit: path never rose, SoC barely moved.
+    if sit["pct_start"] >= 80 and dpct < 20:
+        return None
+    # Left on the dock after full — the tail is not charge-up time.
+    if sit["pct_end"] >= 85 and dt_h > 2.0:
+        return None
+    # Rest-after is often still elevated for a few minutes; that fakes a
+    # 15-minute 0→80% fill. Reject physically impossible rates.
+    if dpct / dt_h > CHARGE_MAX_PCT_PER_H:
+        return None
+    return 100.0 * dt_h / dpct
+
+
+def learned_full_charge_h(recent, n_recent=N_RECENT_CHARGES,
+                          rated_charge_h=None):
+    """(median empty-to-full hours, n) from rest-before/after charge sits."""
+    runtimes = []
+    for sit in merge_charge_sits(extract_charge_sits(recent)):
+        h = session_full_charge_h(sit)
+        if h is not None:
+            runtimes.append(h)
+    runtimes = _filter_runtime_outliers(runtimes, rated_charge_h)
+    if not runtimes:
+        return None, 0
+    used = runtimes[-n_recent:]
+    return statistics.median(used), len(used)
+
+
+def remaining_charge_h(start_pct, elapsed_s, full_charge_h):
+    """Time left to full from a known start SoC and elapsed on-charger time."""
+    if full_charge_h is None or full_charge_h <= 0 or start_pct is None:
+        return None
+    need = full_charge_h * max(0.0, (100.0 - int(start_pct)) / 100.0)
+    return max(0.0, need - max(0.0, elapsed_s) / 3600.0)
+
+
+def charge_list_rows(recent, rated_charge_h, limit=8):
+    """Newest-first charge sits for the Battery Health list."""
+    rows = []
+    sits = merge_charge_sits(extract_charge_sits(recent))
+    for sit in reversed(sits[-limit * 2:]):
+        full = session_full_charge_h(sit)
+        dpct = None
+        if sit["pct_start"] is not None and sit["pct_end"] is not None:
+            dpct = sit["pct_end"] - sit["pct_start"]
+        quality = "solid" if full is not None else (
+            "charging" if sit.get("open") else "short")
+        pct_of_rated = None
+        if full is not None and rated_charge_h and rated_charge_h > 0:
+            pct_of_rated = min(200.0, 100.0 * full / rated_charge_h)
+        rows.append({
+            "t_start": sit["t_start"],
+            "on_time_s": sit["on_time_s"],
+            "parts": sit["parts"],
+            "pct_start": sit["pct_start"],
+            "pct_end": sit["pct_end"],
+            "dpct": dpct,
+            "full_h": full,
+            "pct_of_rated": pct_of_rated,
+            "quality": quality,
+            "open": sit.get("open", False),
+        })
+        if len(rows) >= limit:
+            break
     return rows
 
 
@@ -870,6 +1090,22 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
     if remain_best is not None and remain_expected is not None and remain_expected > 0:
         remain_vs_rated_pct = 100.0 * (remain_best / remain_expected - 1.0)
 
+    rated_charge_h = float(
+        settings.get("rated_charge_h", HEALTH_DEFAULTS["rated_charge_h"]))
+    learned_charge_h, n_charges = learned_full_charge_h(
+        recent, rated_charge_h=rated_charge_h)
+    charge_rows = charge_list_rows(recent, rated_charge_h)
+    open_charge = None
+    merged_charges = merge_charge_sits(extract_charge_sits(recent))
+    if merged_charges and merged_charges[-1].get("open"):
+        open_charge = merged_charges[-1]
+    remain_charge = None
+    if (open_charge and open_charge.get("pct_start") is not None
+            and learned_charge_h is not None):
+        remain_charge = remaining_charge_h(
+            open_charge["pct_start"], open_charge["on_time_s"],
+            learned_charge_h)
+
     return {
         "learned_full_runtime_h": learned_h,
         "n_sessions": n_sess,
@@ -896,6 +1132,12 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
         "remain_vs_rated_pct": remain_vs_rated_pct,
         "profile": profile,
         "profile_summary": psum,
+        "learned_full_charge_h": learned_charge_h,
+        "n_charges": n_charges,
+        "rated_charge_h": rated_charge_h,
+        "charge_rows": charge_rows,
+        "open_charge": open_charge,
+        "remain_charge_h": remain_charge,
     }
 
 
@@ -1025,7 +1267,7 @@ class HealthTracker:
         window = self.post_charge_mvs[1:] or self.post_charge_mvs
         peak = int(statistics.median(window))
         full = self._full_mv()
-        if peak <= full + CHARGE_RAIL_ABOVE_FULL_MV:
+        if full - PEAK_MIN_BELOW_FULL_MV <= peak <= full + CHARGE_RAIL_ABOVE_FULL_MV:
             self.peaks.append([int(t), peak])
             del self.peaks[:-PEAKS_MAX]
             self.dirty = True
@@ -1072,6 +1314,9 @@ class HealthTracker:
             # Peak was the rail — capture true OCV after unplug instead
             self.pending_peak_from_rest = True
             self.post_charge_mvs = []
+            return
+        if peak < full - PEAK_MIN_BELOW_FULL_MV:
+            # Mid-charge unplug, not a full-charge rest peak
             return
         # Plausible cell voltage under/near CV
         self.peaks.append([int(seg["t_end"]), peak])

@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import time
 
+import cairo
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk
@@ -52,7 +53,7 @@ def _pango_fit(cr, text, x, y, size=10, color=None, align="left"):
     """Simple cairo text (no pango dep beyond cairo)."""
     if color is not None:
         _set_source(cr, color)
-    cr.select_font_face("Sans", 0, 0)
+    cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
     cr.set_font_size(size)
     ext = cr.text_extents(text)
     if align == "center":
@@ -63,14 +64,158 @@ def _pango_fit(cr, text, x, y, size=10, color=None, align="left"):
     cr.show_text(text)
 
 
+# Sampling holes shorter than this stay on the same stroke; we just do not
+# invent a smooth curve through them (a straight connector fills the gap).
+_HOLE_S = 20 * 60
+
+
+def _smooth_cluster(run, step_s=90):
+    """Resample + two-pass EMA so a sitting reads as a curve, not stairs."""
+    if len(run) < 2:
+        return [(float(t), float(p), c) for t, p, c in run]
+    t0, t1 = float(run[0][0]), float(run[-1][0])
+    if len(run) < 8:
+        grid = [(float(t), float(p), c) for t, p, c in run]
+    else:
+        grid = []
+        t = t0
+        j = 0
+        while t <= t1:
+            while j + 1 < len(run) and run[j + 1][0] < t:
+                j += 1
+            if j + 1 < len(run) and run[j + 1][0] != run[j][0]:
+                u = (t - run[j][0]) / (run[j + 1][0] - run[j][0])
+                pct = run[j][1] + u * (run[j + 1][1] - run[j][1])
+                chg = run[j][2] or run[j + 1][2]
+            else:
+                pct, chg = float(run[j][1]), run[j][2]
+            grid.append((t, pct, chg))
+            t += step_s
+        if grid[-1][0] < t1:
+            grid.append((float(run[-1][0]), float(run[-1][1]), run[-1][2]))
+
+    alpha = 0.22
+
+    def ema(pts):
+        s = pts[0][1]
+        out = []
+        for t, p, c in pts:
+            s = alpha * p + (1.0 - alpha) * s
+            out.append((t, s, c))
+        return out
+
+    fwd = ema(grid)
+    rev = ema(list(reversed(fwd)))
+    rev.reverse()
+    # Pin endpoints so a charge rise / last sample is not EMA-lagged.
+    rev[0] = (rev[0][0], float(run[0][1]), run[0][2])
+    rev[-1] = (rev[-1][0], float(run[-1][1]), run[-1][2])
+    return rev
+
+
+def _cluster_run(run, hole_s=_HOLE_S):
+    """Split a sitting on headset-off holes. Never invent samples across them."""
+    if not run:
+        return []
+    clusters = [[run[0]]]
+    for pt in run[1:]:
+        if pt[0] - clusters[-1][-1][0] > hole_s:
+            clusters.append([pt])
+        else:
+            clusters[-1].append(pt)
+    return clusters
+
+
+def _display_curve(run, step_s=90, hole_s=_HOLE_S):
+    """Flattened _display_clusters (tests / callers that want one list)."""
+    return [pt for cl in _display_clusters(run, step_s=step_s, hole_s=hole_s)
+            for pt in cl]
+
+
+def _display_clusters(run, step_s=90, hole_s=_HOLE_S):
+    """Like _display_curve but keeps each sit as its own list (lift the pen)."""
+    out = []
+    for cl in _cluster_run(run, hole_s=hole_s):
+        if len(cl) == 1:
+            t, p, c = cl[0]
+            out.append([(float(t), float(p), c)])
+        else:
+            out.append(_smooth_cluster(cl, step_s))
+    return out
+
+
+def _trace_poly(cr, pts):
+    """Polyline through every vertex. Round caps hide the joints."""
+    if not pts:
+        return
+    cr.move_to(*pts[0])
+    for pt in pts[1:]:
+        cr.line_to(*pt)
+
+
+def _trace_smooth(cr, pts, max_dx=28):
+    """Mid-point spline on close points; long jumps stay a straight segment.
+
+    A spline across a multi-hour hole bows into empty space and looks like
+    invented drain. Only curve when neighbours share a few pixels of x.
+    """
+    if not pts:
+        return
+    if len(pts) < 3:
+        _trace_poly(cr, pts)
+        return
+    cr.move_to(*pts[0])
+    for i in range(len(pts) - 1):
+        x0, y0 = pts[i]
+        x1, y1 = pts[i + 1]
+        if abs(x1 - x0) > max_dx:
+            cr.line_to(x1, y1)
+            continue
+        cx = (x0 + x1) / 2.0
+        cr.curve_to(cx, y0, cx, y1, x1, y1)
+
+
+def _decimate_xy(curve, flags, min_dx=1.25):
+    """Drop points that collapse into the same pixel, keep color flips."""
+    if len(curve) <= 3:
+        return curve, flags
+    out_c = [curve[0]]
+    out_f = [flags[0]]
+    for i in range(1, len(curve) - 1):
+        if (abs(curve[i][0] - out_c[-1][0]) >= min_dx
+                or bool(flags[i]) != bool(out_f[-1])):
+            out_c.append(curve[i])
+            out_f.append(flags[i])
+    out_c.append(curve[-1])
+    out_f.append(flags[-1])
+    return out_c, out_f
+
+
+def _color_runs(curve, flags):
+    """Inclusive [i, j] slices of the same charge/use color. Shared vertices."""
+    if len(curve) < 2:
+        return []
+    runs = []
+    i = 0
+    while i < len(curve) - 1:
+        charging = bool(flags[i] and flags[i + 1])
+        j = i + 1
+        while j < len(curve) - 1 and bool(flags[j] and flags[j + 1]) == charging:
+            j += 1
+        runs.append((i, j, charging))
+        i = j
+    return runs
+
+
 class _ChartBase(Gtk.DrawingArea):
     """Shared chrome: background, title, padding, theme-aware colors."""
 
     __gtype_name__ = "G935ChartBase"
 
-    def __init__(self, title="", height=160):
+    def __init__(self, title="", height=160, framed=True):
         super().__init__()
         self._title = title
+        self._framed = framed
         self._data = None
         self.set_size_request(200, height)
         self.set_hexpand(True)
@@ -113,29 +258,43 @@ class _ChartBase(Gtk.DrawingArea):
         w = widget.get_allocated_width()
         h = widget.get_allocated_height()
         pal = self._colors(widget)
-        # outer bg
-        _set_source(cr, pal["bg"])
-        cr.rectangle(0, 0, w, h)
-        cr.fill()
-        # plot card
-        pad = 8
-        _set_source(cr, pal["plot"])
-        self._round_rect(cr, pad, pad, w - 2 * pad, h - 2 * pad, 8)
-        cr.fill()
-
-        # title
-        if self._title:
-            _pango_fit(cr, self._title, pad + 10, pad + 16, size=11, color=pal["text"])
-
-        # Leave room under the plot for x-axis labels / bar categories.
-        bottom = getattr(self, "_bottom_label_h", 18)
-        top = 28 if self._title else 12
-        inner = {
-            "x": pad + 40,
-            "y": pad + top,
-            "w": w - 2 * pad - 52,
-            "h": h - 2 * pad - top - bottom,
-        }
+        cr.set_antialias(cairo.ANTIALIAS_GOOD)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        if self._framed:
+            _set_source(cr, pal["bg"])
+            cr.rectangle(0, 0, w, h)
+            cr.fill()
+            pad = 8
+            _set_source(cr, pal["plot"])
+            self._round_rect(cr, pad, pad, w - 2 * pad, h - 2 * pad, 8)
+            cr.fill()
+            if self._title:
+                _pango_fit(cr, self._title, pad + 10, pad + 16,
+                           size=11, color=pal["text"])
+            bottom = getattr(self, "_bottom_label_h", 18)
+            top = 28 if self._title else 12
+            inner = {
+                "x": pad + 40,
+                "y": pad + top,
+                "w": w - 2 * pad - 52,
+                "h": h - 2 * pad - top - bottom,
+            }
+        else:
+            # Sit inside a section card — no second box, no second title.
+            bottom = getattr(self, "_bottom_label_h", 20)
+            top = 8 if self._title else 4
+            inner = {
+                "x": 36,
+                "y": top,
+                "w": w - 44,
+                "h": h - top - bottom,
+            }
+            if self._title:
+                _pango_fit(cr, self._title, inner["x"], 12,
+                           size=10, color=pal["muted"])
+                inner["y"] = 20
+                inner["h"] = h - 20 - bottom
         if inner["w"] < 40 or inner["h"] < 30:
             return False
         self._draw_chart(cr, inner, pal)
@@ -159,128 +318,144 @@ class _ChartBase(Gtk.DrawingArea):
             frac = i / ticks
             val = y_min + (y_max - y_min) * (1 - frac)
             y = box["y"] + box["h"] * frac
-            _set_source(cr, pal["grid"], 0.6)
-            cr.set_line_width(1)
+            _set_source(cr, pal["grid"], 0.28 if i < ticks else 0.42)
+            cr.set_line_width(1.0)
             cr.move_to(box["x"], y)
             cr.line_to(box["x"] + box["w"], y)
             cr.stroke()
-            _pango_fit(cr, fmt(val), box["x"] - 6, y + 3, size=9,
+            _pango_fit(cr, fmt(val), box["x"] - 8, y + 3, size=8.5,
                        color=pal["muted"], align="right")
 
     def _axis_frame(self, cr, box, pal):
-        _set_source(cr, pal["axis"], 0.5)
-        cr.set_line_width(1)
-        cr.rectangle(box["x"], box["y"], box["w"], box["h"])
+        # Hairline baseline only — a full box fights the section card.
+        _set_source(cr, pal["axis"], 0.28)
+        cr.set_line_width(1.0)
+        cr.move_to(box["x"], box["y"] + box["h"])
+        cr.line_to(box["x"] + box["w"], box["y"] + box["h"])
         cr.stroke()
 
 
 class ChargeHistoryChart(_ChartBase):
-    """Charge % over time with charging/discharging coloring — battery manager classic."""
+    """Battery % over the last week as one connected line."""
 
     __gtype_name__ = "G935ChargeHistoryChart"
 
     def __init__(self):
-        super().__init__(title="Charge level over time", height=200)
-        self._bottom_label_h = 22
+        super().__init__(title="", height=232, framed=False)
+        self._bottom_label_h = 26
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
-        points = data.get("points") or []  # [(t, pct, charging), ...]
-        if len(points) < 2:
+        lobes = data.get("series") or []
+        lobes = [lobe for lobe in lobes if lobe]
+        if not lobes:
             _pango_fit(cr, "Collecting samples… wear the headset with tracking on",
                        box["x"] + box["w"] / 2,
                        box["y"] + box["h"] / 2, size=12, color=pal["muted"],
                        align="center")
             return
 
-        t0, t1 = points[0][0], points[-1][0]
-        span = max(1, t1 - t0)
-        y_min, y_max = 0, 100
-        self._grid_y(cr, box, pal, y_min, y_max, ticks=4, fmt=lambda v: f"{v:.0f}%")
+        t0 = min(lobe[0][0] for lobe in lobes)
+        t1 = max(lobe[-1][0] for lobe in lobes)
+        # Pad the window so a single sit is not stretched edge-to-edge.
+        span = max(3600, t1 - t0)
+        pad = min(3 * 3600, span * 0.04)
+        t0 -= pad
+        t1 += pad
+        span = t1 - t0
+
+        self._grid_y(cr, box, pal, 0, 100, ticks=4, fmt=lambda v: f"{v:.0f}%")
+        self._axis_frame(cr, box, pal)
 
         def xy(t, pct):
             x = box["x"] + (t - t0) / span * box["w"]
-            y = box["y"] + (1 - (pct - y_min) / (y_max - y_min)) * box["h"]
+            y = box["y"] + (1 - max(0.0, min(100.0, pct)) / 100.0) * box["h"]
             return x, y
 
-        # Area fill under the curve
-        cr.new_path()
-        x0, y0 = xy(points[0][0], points[0][1])
-        cr.move_to(x0, box["y"] + box["h"])
-        cr.line_to(x0, y0)
-        for t, pct, _chg in points[1:]:
-            x, y = xy(t, pct)
-            cr.line_to(x, y)
-        x_last, _ = xy(points[-1][0], points[-1][1])
-        cr.line_to(x_last, box["y"] + box["h"])
-        cr.close_path()
-        _set_source(cr, pal["actual_fill"])
-        cr.fill()
-
-        # Line segments colored by charge/discharge
-        cr.set_line_width(2.2)
-        cr.set_line_join(1)  # ROUND
-        for i in range(1, len(points)):
-            t0p, pct0, chg0 = points[i - 1]
-            t1p, pct1, chg1 = points[i]
-            charging = chg0 or chg1
-            color = pal["charge"] if charging else pal["actual"]
-            _set_source(cr, color)
-            x0, y0 = xy(t0p, pct0)
-            x1, y1 = xy(t1p, pct1)
-            cr.move_to(x0, y0)
-            cr.line_to(x1, y1)
+        # Flatten every sitting onto one polyline so nights / off-hours stay
+        # on the same stroke. Color still flips at charge/use vertices.
+        flat = [pt for lobe in lobes for pt in lobe]
+        smooth = _display_curve(flat)
+        curve = [xy(t, p) for t, p, _c in smooth]
+        flags = [c for _t, _p, c in smooth]
+        curve, flags = _decimate_xy(curve, flags)
+        if len(curve) == 1:
+            x, y = curve[0]
+            _set_source(cr, pal["charge"] if flags[0] else pal["actual"])
+            cr.arc(x, y, 2.8, 0, 2 * math.pi)
+            cr.fill()
+        else:
+            cr.new_path()
+            _trace_smooth(cr, curve)
+            cr.line_to(curve[-1][0], box["y"] + box["h"])
+            cr.line_to(curve[0][0], box["y"] + box["h"])
+            cr.close_path()
+            _set_source(cr, pal["actual_fill"])
+            cr.fill()
+            # One glow under the whole polyline so color joints never break.
+            cr.new_path()
+            _trace_smooth(cr, curve)
+            _set_source(cr, pal["actual"], 0.16)
+            cr.set_line_width(6.5)
             cr.stroke()
+            for i, j, charging in _color_runs(curve, flags):
+                piece = curve[i:j + 1]
+                if len(piece) < 2:
+                    continue
+                cr.new_path()
+                _trace_smooth(cr, piece)
+                _set_source(cr, pal["charge"] if charging else pal["actual"])
+                cr.set_line_width(2.3)
+                cr.stroke()
 
-        # Expected dashed reference: linear discharge from first point at rated rate
-        expected = data.get("expected_points")
-        if expected and len(expected) >= 2:
-            cr.set_line_width(1.5)
-            cr.set_dash([5, 4])
-            _set_source(cr, pal["expected"], 0.9)
-            x, y = xy(expected[0][0], expected[0][1])
-            cr.move_to(x, y)
-            for t, pct in expected[1:]:
-                x, y = xy(t, pct)
-                cr.line_to(x, y)
-            cr.stroke()
-            cr.set_dash([])
-
-        # Current level marker
-        last_t, last_pct, _ = points[-1]
+        last_t, last_pct, last_chg = lobes[-1][-1]
         lx, ly = xy(last_t, last_pct)
-        _set_source(cr, pal["text"])
-        cr.arc(lx, ly, 3.5, 0, 2 * math.pi)
+        _set_source(cr, pal["bg"], 0.9)
+        cr.arc(lx, ly, 4.6, 0, 2 * math.pi)
         cr.fill()
-        _pango_fit(cr, f"{last_pct}%", lx - 8, ly - 8, size=10, color=pal["text"],
-                   align="right")
+        _set_source(cr, pal["charge"] if last_chg else pal["actual"])
+        cr.arc(lx, ly, 3.2, 0, 2 * math.pi)
+        cr.fill()
+        # Keep the label inside the plot so an isolated "now" dot isn't orphaned
+        # in the right-hand margin.
+        label = f"{last_pct:.0f}% now"
+        label_x = min(lx - 8, box["x"] + box["w"] - 4)
+        label_y = ly - 10 if ly > box["y"] + 18 else ly + 16
+        if label_x < box["x"] + 56:
+            label_x = min(lx + 10, box["x"] + box["w"] - 4)
+            _pango_fit(cr, label, label_x, label_y, size=10, color=pal["text"])
+        else:
+            _pango_fit(cr, label, label_x, label_y,
+                       size=10, color=pal["text"], align="right")
 
-        self._axis_frame(cr, box, pal)
+        # Midnight ticks for each day in the window.
+        midnight = time.mktime(time.localtime(t0)[:3] + (0, 0, 0, 0, 0, -1))
+        if midnight < t0:
+            midnight += 86400
+        while midnight <= t1:
+            x = box["x"] + (midnight - t0) / span * box["w"]
+            _set_source(cr, pal["grid"], 0.2)
+            cr.set_line_width(1.0)
+            cr.move_to(x, box["y"])
+            cr.line_to(x, box["y"] + box["h"])
+            cr.stroke()
+            label = time.strftime("%a %d", time.localtime(midnight)).replace(" 0", " ")
+            _pango_fit(cr, label, x + 4, box["y"] + box["h"] + 16,
+                       size=8.5, color=pal["muted"])
+            midnight += 86400
 
-        # X labels: start, mid, end — date-aware for multi-day spans
-        mid_t = t0 + span / 2
-        _pango_fit(cr, _fmt_axis_time(t0, span), box["x"], box["y"] + box["h"] + 14,
-                   size=9, color=pal["muted"])
-        _pango_fit(cr, _fmt_axis_time(mid_t, span), box["x"] + box["w"] / 2,
-                   box["y"] + box["h"] + 14, size=9, color=pal["muted"], align="center")
-        _pango_fit(cr, _fmt_axis_time(t1, span), box["x"] + box["w"],
-                   box["y"] + box["h"] + 14, size=9, color=pal["muted"], align="right")
-
-        # Legend
-        ly = box["y"] - 14
-        self._legend_swatch(cr, box["x"] + box["w"] - 200, ly, pal["actual"],
-                            "actual", pal["muted"])
-        self._legend_swatch(cr, box["x"] + box["w"] - 130, ly, pal["charge"],
-                            "charging", pal["muted"])
-        if expected:
-            self._legend_swatch(cr, box["x"] + box["w"] - 55, ly, pal["expected"],
-                                "rated", pal["muted"])
+        self._legend_swatch(
+            cr, box["x"] + box["w"] - 150, box["y"] + 10,
+            pal["actual"], "using", pal["muted"])
+        self._legend_swatch(
+            cr, box["x"] + box["w"] - 78, box["y"] + 10,
+            pal["charge"], "charging", pal["muted"])
 
     def _legend_swatch(self, cr, x, y, color, label, text_color=None):
         _set_source(cr, color)
-        cr.rectangle(x, y - 6, 10, 3)
+        cr.rectangle(x, y - 3, 11, 2.2)
         cr.fill()
-        _pango_fit(cr, label, x + 14, y, size=9,
+        _pango_fit(cr, label, x + 15, y + 1, size=8.5,
                    color=text_color or _PAL["muted"])
 
 
@@ -290,8 +465,8 @@ class ExpectActualChart(_ChartBase):
     __gtype_name__ = "G935ExpectActualChart"
 
     def __init__(self):
-        super().__init__(title="Time left now · expected vs measured", height=175)
-        self._bottom_label_h = 36
+        super().__init__(title="", height=168, framed=False)
+        self._bottom_label_h = 34
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
@@ -326,8 +501,8 @@ class ExpectActualChart(_ChartBase):
             bh = (val / max_h) * box["h"] if max_h else 0
             y = box["y"] + box["h"] - bh
             # track
-            _set_source(cr, pal["bar_bg"])
-            self._round_rect(cr, x, box["y"], bar_w, box["h"], 6)
+            _set_source(cr, pal["bar_bg"], 0.55)
+            self._round_rect(cr, x, box["y"], bar_w, box["h"], 8)
             cr.fill()
             # value bar
             _set_source(cr, color)
@@ -365,7 +540,7 @@ class SessionRuntimeChart(_ChartBase):
     __gtype_name__ = "G935SessionRuntimeChart"
 
     def __init__(self):
-        super().__init__(title="Full-runtime from each solid session", height=165)
+        super().__init__(title="", height=168, framed=False)
         self._bottom_label_h = 22
 
     def _draw_chart(self, cr, box, pal):
@@ -451,7 +626,7 @@ class DrainProfileChart(_ChartBase):
     __gtype_name__ = "G935DrainProfileChart"
 
     def __init__(self):
-        super().__init__(title="How hard it drains by voltage (mV/h)", height=155)
+        super().__init__(title="", height=150, framed=False)
         self._bottom_label_h = 22
 
     def _draw_chart(self, cr, box, pal):
@@ -518,7 +693,7 @@ class HealthGaugeChart(_ChartBase):
     __gtype_name__ = "G935HealthGaugeChart"
 
     def __init__(self):
-        super().__init__(title="Battery health", height=150)
+        super().__init__(title="", height=156, framed=False)
 
     def _draw_chart(self, cr, box, pal):
         data = self._data or {}
@@ -595,70 +770,3 @@ def _fmt_hours(h):
     return f"{total_m}m"
 
 
-def build_history_points(recent, batt_percent_fn, max_points=400, full_mv=4200):
-    """Downsample recent samples to chart points [(t, pct, charging), ...].
-
-    While charging, the ADC often reports charger-path voltage (spikes to
-    ~4.3 V+). Hold the last resting cell voltage for SoC so the curve does
-    not jump to a fake 100% on plug-in.
-    """
-    if not recent:
-        return []
-    # First pass: resolve cell mV for every sample (charging holds last rest)
-    resolved = []
-    last_rest = None
-    for t, mv, chg in recent:
-        mv = int(mv)
-        chg = bool(chg)
-        if not chg:
-            last_rest = mv
-            cell = mv
-        else:
-            cell = last_rest if last_rest is not None else min(mv, int(full_mv))
-        resolved.append((int(t), cell, chg))
-
-    step = max(1, len(resolved) // max_points)
-    pts = []
-    for i in range(0, len(resolved), step):
-        t, cell, chg = resolved[i]
-        pts.append((t, int(batt_percent_fn(cell)), chg))
-    # always include last
-    t, cell, chg = resolved[-1]
-    if not pts or pts[-1][0] != t:
-        pts.append((t, int(batt_percent_fn(cell)), chg))
-    return pts
-
-
-def build_expected_overlay(points, rated_runtime_h):
-    """Dashed rated-discharge reference from the first non-charge stretch.
-
-    Starts at the first discharge sample's % and declines at 100/rated %/h.
-    """
-    if not points or not rated_runtime_h or rated_runtime_h <= 0:
-        return None
-    # find first discharge point
-    start = None
-    for t, pct, chg in points:
-        if not chg:
-            start = (t, pct)
-            break
-    if start is None:
-        return None
-    t0, pct0 = start
-    rate = 100.0 / rated_runtime_h  # %/h
-    out = []
-    t_end = points[-1][0]
-    # sample every ~5 min across the window
-    step = max(60, (t_end - t0) // 40) if t_end > t0 else 300
-    t = t0
-    while t <= t_end:
-        hours = (t - t0) / 3600.0
-        pct = max(0.0, pct0 - rate * hours)
-        out.append((t, pct))
-        if pct <= 0:
-            break
-        t += step
-    if not out or out[-1][0] != t_end:
-        hours = (t_end - t0) / 3600.0
-        out.append((t_end, max(0.0, pct0 - rate * hours)))
-    return out

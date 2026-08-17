@@ -1,7 +1,12 @@
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from g935.hidpp import (
-    ERROR_CODES, PollPresence, is_hidpp_notification, parse_reply, to_report,
+    ERROR_CODES, PollPresence, drain_idle, is_hidpp_notification,
+    parse_reply, to_report, try_acquire_transaction_lock,
+    _release_transaction_lock,
 )
 
 
@@ -109,6 +114,51 @@ class PollPresenceTests(unittest.TestCase):
             PollPresence(miss_limit=0)
         with self.assertRaises(ValueError):
             PollPresence(grace_s=-1)
+
+
+class TransactionLockTests(unittest.TestCase):
+    def test_nonblocking_fails_while_held(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                first = try_acquire_transaction_lock()
+                self.assertIsNotNone(first)
+                second = try_acquire_transaction_lock()
+                self.assertIsNone(second)
+                _release_transaction_lock(first)
+                third = try_acquire_transaction_lock()
+                self.assertIsNotNone(third)
+                _release_transaction_lock(third)
+
+    def test_drain_idle_skips_when_lock_held(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                held = try_acquire_transaction_lock()
+                self.assertIsNotNone(held)
+                seen = []
+                r, w = os.pipe()
+                try:
+                    os.write(w, bytes.fromhex("0801"))
+                    self.assertTrue(drain_idle(
+                        r, on_non_hidpp=lambda buf: seen.append(buf)))
+                    self.assertEqual(seen, [])
+                finally:
+                    os.close(r)
+                    os.close(w)
+                    _release_transaction_lock(held)
+
+    def test_drain_idle_reads_when_unlocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                seen = []
+                r, w = os.pipe()
+                try:
+                    os.write(w, bytes.fromhex("0820"))
+                    self.assertTrue(drain_idle(
+                        r, on_non_hidpp=lambda buf: seen.append(bytes(buf))))
+                    self.assertEqual(seen, [bytes.fromhex("0820")])
+                finally:
+                    os.close(r)
+                    os.close(w)
 
 
 if __name__ == "__main__":

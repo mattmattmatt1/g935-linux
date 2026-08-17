@@ -111,7 +111,20 @@ def is_hidpp_notification(buf: bytes) -> bool:
     return len(buf) >= 4 and buf[0] == 0x11 and (buf[3] & 0x0F) == 0
 
 
-def _acquire_transaction_lock():
+def _release_transaction_lock(lock_fd):
+    if lock_fd is None:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+
+
+def _acquire_transaction_lock(nonblocking=False):
     """Serialize commands across the panel, daemon, and helper tools.
 
     The receiver can accept multiple hidraw opens, but overlapping HID++
@@ -122,8 +135,10 @@ def _acquire_transaction_lock():
     fd = None
     try:
         path = os.path.join(runtime_dir(), TRANSACTION_LOCK_NAME)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        fcntl.flock(fd, flags)
         return fd
     except OSError:
         if fd is not None:
@@ -132,6 +147,44 @@ def _acquire_transaction_lock():
             except OSError:
                 pass
         return None
+
+
+def try_acquire_transaction_lock():
+    """Non-blocking exclusive lock, or None if a transaction is in flight."""
+    return _acquire_transaction_lock(nonblocking=True)
+
+
+def drain_idle(fd, on_non_hidpp=None, on_hidpp_notification=None):
+    """Read pending reports only when no HID++ transaction owns the bus.
+
+    Returns True if the device is still there (or we skipped because the
+    lock is held). Returns False if the hidraw is gone.
+    """
+    lock_fd = try_acquire_transaction_lock()
+    if lock_fd is None:
+        return True
+    try:
+        while True:
+            try:
+                r, _, _ = select.select([fd], [], [], 0)
+            except (OSError, ValueError):
+                return False
+            if not r:
+                return True
+            try:
+                buf = os.read(fd, 64)
+            except OSError:
+                return False
+            if len(buf) < 2:
+                continue
+            if buf[0] != 0x11:
+                if on_non_hidpp is not None:
+                    on_non_hidpp(buf)
+            elif (on_hidpp_notification is not None
+                    and is_hidpp_notification(buf)):
+                on_hidpp_notification(buf)
+    finally:
+        _release_transaction_lock(lock_fd)
 
 
 def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
@@ -179,12 +232,7 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
     except OSError:
         return "GONE", None
     finally:
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(lock_fd)
+        _release_transaction_lock(lock_fd)
     return "TIMEOUT", None
 
 
@@ -371,23 +419,19 @@ class HidWorker(threading.Thread):
         """Read pending input reports. Returns False if the device is gone."""
         if self.fd is None:
             return False
-        while True:
-            try:
-                r, _, _ = select.select([self.fd], [], [], 0)
-            except (OSError, ValueError):
-                self._handle_gone()
-                return False
-            if not r:
-                return True
-            try:
-                buf = os.read(self.fd, 64)
-            except OSError:
-                self._handle_gone()
-                return False
-            if len(buf) >= 2 and buf[0] == 0x08 and self.mic_cb:
+
+        def on_non(buf):
+            if buf[0] == 0x08 and self.mic_cb and len(buf) >= 2:
                 self.idle_add(self.mic_cb, buf[1])
-            elif is_hidpp_notification(buf) and self.event_cb:
+
+        def on_event(buf):
+            if self.event_cb:
                 self.idle_add(self.event_cb, buf)
+
+        if not drain_idle(
+                self.fd, on_non_hidpp=on_non, on_hidpp_notification=on_event):
+            self._handle_gone()
+            return False
         return True
 
     def _poll_boom(self):

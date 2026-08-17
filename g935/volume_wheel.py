@@ -31,7 +31,13 @@ INPUT_EVENT = struct.Struct("llHHi")
 
 DEFAULT_ENABLED = True
 DEFAULT_STEP = 48
-DEFAULT_CEILING = 100
+# Linux 100% is the USB mixer 0 dB stop (quieter than Windows). PipeWire
+# software gain on the G935 sink is what matches Windows loudness — the
+# bar and wheel show that extra range instead of hiding it.
+VOLUME_BOOST_DEFAULT = 150
+VOLUME_BOOST_MIN = 100
+VOLUME_BOOST_MAX = 200
+DEFAULT_CEILING = VOLUME_BOOST_MAX
 # The receiver encodes wheel distance as key-hold duration: fine movements in
 # live captures last roughly 50–200 ms, while fast sweeps last 700–1700 ms.
 # Start continuous growth above the fine-motion range and add one percent at a
@@ -67,6 +73,19 @@ def _load_ui_data():
             return json.load(f)
     except (OSError, ValueError):
         return {}
+
+
+def clamp_volume_boost(pct):
+    try:
+        return max(VOLUME_BOOST_MIN, min(VOLUME_BOOST_MAX, int(round(float(pct)))))
+    except (TypeError, ValueError):
+        return VOLUME_BOOST_DEFAULT
+
+
+def load_volume_boost():
+    """Saved slider/wheel ceiling from ui.json (100–200)."""
+    return clamp_volume_boost(
+        _load_ui_data().get("volume_boost_pct", VOLUME_BOOST_DEFAULT))
 
 
 def load_wheel_settings():
@@ -125,8 +144,26 @@ def load_wheel_calibration():
     }
 
 
+def parse_evdev_key_caps(text):
+    """Integer bitfield from sysfs ``capabilities/key`` (high word first)."""
+    words = text.split()
+    if not words:
+        return 0
+    width = 64 if any(len(word) > 8 for word in words) else 32
+    value = 0
+    for word in words:
+        value = (value << width) | int(word, 16)
+    return value
+
+
+def key_caps_has(text, *codes):
+    """True when every key code is set in a sysfs key-capability string."""
+    bits = parse_evdev_key_caps(text)
+    return all(((bits >> int(code)) & 1) for code in codes)
+
+
 def find_wheel_device(vid=0x046D, pid=0x0A87):
-    """Return the matching evdev node, or None when the receiver is absent."""
+    """Return the volume-key evdev node, or None when the receiver is absent."""
     for base in glob.glob("/sys/class/input/event*"):
         try:
             with open(os.path.join(base, "device", "id", "vendor")) as f:
@@ -135,7 +172,14 @@ def find_wheel_device(vid=0x046D, pid=0x0A87):
                 found_pid = int(f.read().strip(), 16)
         except (OSError, ValueError):
             continue
-        if found_vid == vid and found_pid == pid:
+        if found_vid != vid or found_pid != pid:
+            continue
+        try:
+            with open(os.path.join(base, "device", "capabilities", "key")) as f:
+                caps = f.read()
+        except OSError:
+            continue
+        if key_caps_has(caps, KEY_VOLUMEDOWN, KEY_VOLUMEUP):
             return os.path.join("/dev/input", os.path.basename(base))
     return None
 
@@ -557,7 +601,7 @@ class VolumeWheel:
 
     def _set_volume(self, target):
         set_reply = self.command_runner(
-            "set-sink-volume", "@DEFAULT_SINK@", f"{target}%")
+            "set-sink-volume", "@DEFAULT_SINK@", f"{int(target)}%")
         if set_reply.returncode:
             raise RuntimeError(set_reply.stderr.strip() or "set failed")
 
@@ -572,8 +616,6 @@ class VolumeWheel:
                 self.ramp_target = self.ramp_current
             current = self.ramp_current
             if delta > 0 and current >= DEFAULT_CEILING:
-                # Wheel-up above the safety stop is a no-op. Never pull a
-                # deliberate slider boost back down toward 100%.
                 self.ramp_current = None
                 self.ramp_target = None
                 self.next_ramp_step = 0.0
@@ -586,8 +628,6 @@ class VolumeWheel:
             else:
                 base = self.ramp_target
             target = max(0, base + delta)
-            # A deliberate slider boost can remain above 100 and be stepped
-            # down, but wheel-up never crosses the hearing-safety ceiling.
             if delta > 0:
                 target = min(DEFAULT_CEILING, target)
             if target == current:

@@ -1,5 +1,7 @@
 [Unit]
 Description=G935 DSP soundstage + mic daemon (HID++ power-on watcher)
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 # Prefer `make install-user` / `./install.sh --user`, which writes a unit with
@@ -11,4 +13,4 @@ RestartSec=5
 SyslogIdentifier=g935-dspd
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

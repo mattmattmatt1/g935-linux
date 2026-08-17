@@ -152,6 +152,17 @@ def parse_gkey_mask(report: bytes) -> int:
     return int.from_bytes(p[:4], "little")
 
 
+def parse_gkey_control(reply: bytes) -> int:
+    """0x8010 function 1 payload byte.
+
+    On G935 firmware U1 29.00 this GET ACKs 0x01 and does not follow
+    function 2 (software-mode SET). Treat it as a capability/state byte,
+    not as mode readback.
+    """
+    p = _payload(reply, 1)
+    return p[0]
+
+
 def build_light_params(zone: int, mode: int, rgb=(0, 180, 255),
                        period_ms: int = 5000, intensity: int = 100,
                        waveform: int = 0, ramp: int = 2,

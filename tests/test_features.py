@@ -2,8 +2,9 @@ import unittest
 
 from g935.features import (
     build_light_params, format_frequency, parse_device_info, parse_eq_info,
-    parse_firmware_info, parse_frequency_page, parse_gkey_mask,
-    parse_led_effect_info, parse_led_state, parse_led_zone_info,
+    parse_firmware_info, parse_frequency_page, parse_gkey_control,
+    parse_gkey_mask, parse_led_effect_info, parse_led_state,
+    parse_led_zone_info,
 )
 
 
@@ -47,6 +48,15 @@ class FeatureDecoderTests(unittest.TestCase):
         self.assertEqual(parse_gkey_mask(report), 1)
         report = bytes.fromhex("11ff050004000000")
         self.assertEqual(parse_gkey_mask(report), 4)
+
+    def test_gkey_control_from_live_reply(self):
+        # Live G935: fn 1 stays 0x01 after both 052b00 and 052b01.
+        self.assertEqual(
+            parse_gkey_control(bytes.fromhex("11ff051b0100000000000000")), 1)
+        self.assertEqual(
+            parse_gkey_control(bytes.fromhex("11ff051b00")), 0)
+        with self.assertRaises(ValueError):
+            parse_gkey_control(bytes.fromhex("11ff051b"))
 
     def test_live_led_info_layouts(self):
         self.assertEqual(

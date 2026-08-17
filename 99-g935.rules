@@ -4,6 +4,6 @@
 #           sudo udevadm control --reload && sudo udevadm trigger
 # then unplug/replug the receiver (or reboot).
 ACTION!="add|change", GOTO="g935_end"
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0a87", TAG+="uaccess"
-KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0a87", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0a87", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0a87", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 LABEL="g935_end"

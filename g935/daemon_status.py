@@ -11,6 +11,28 @@ def lock_path() -> str:
     return os.path.join(runtime_dir(), "g935-dspd.lock")
 
 
+def panel_lock_path() -> str:
+    return os.path.join(runtime_dir(), "g935-control.lock")
+
+
+def _lock_held(path: str) -> bool:
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+    return False
+
+
 def acquire_daemon_lock():
     """Hold an exclusive flock for the lifetime of the daemon process.
 
@@ -36,21 +58,9 @@ def acquire_daemon_lock():
 
 def daemon_running() -> bool:
     """True if g935-dspd currently holds the daemon lock."""
-    path = lock_path()
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        # someone else holds it → daemon is up
-        os.close(fd)
-        return True
-    # we got the lock → no daemon; release immediately
-    try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-        pass
-    os.close(fd)
-    return False
+    return _lock_held(lock_path())
+
+
+def panel_running() -> bool:
+    """True if g935-control currently holds the panel lock."""
+    return _lock_held(panel_lock_path())

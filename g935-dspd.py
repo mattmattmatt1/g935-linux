@@ -16,6 +16,7 @@ Usage: python3 g935-dspd.py   (see g935-dsp.service for systemd --user setup)
 """
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import select
@@ -27,12 +28,16 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from g935.daemon_status import acquire_daemon_lock
+from g935.battery import RECENT_DECIM_S, HealthTracker, batt_state
+from g935.daemon_status import acquire_daemon_lock, panel_running
 from g935.hidpp import (
-    G935_PID, PollPresence, find_device_by_pid, open_hidraw, transact,
+    G935_PID, PollPresence, drain_idle, find_device_by_pid, open_hidraw,
+    transact,
 )
+from g935.bindings import BINDINGS_VERSION, normalize_bindings
 from g935.mic import MicHandler
 from g935.mode import load_mode
+from g935.paths import config_dir
 from g935.volume_wheel import VolumeWheel
 
 log = logging.getLogger("g935.dspd")
@@ -50,6 +55,8 @@ ENABLE = "11ff052b01"
 # is off.  G-key capability is a harmless, device-level read: it ACKs only when
 # the headset itself is reachable and avoids touching ADC/battery state.
 PRESENCE_GET = "11ff050b"
+# Feature index 08 = 0x1f20 ADC/battery on the G935 (same hardcode style as ENABLE).
+BATTERY_GET = "11ff080b"
 ALSA_USBID = "046d:0a87"
 
 
@@ -66,6 +73,22 @@ def enable_dsp(fd) -> bool:
     return False
 
 
+def _g0_tap_binding():
+    """G0 tap from ui.json so the mute key follows the panel when it is closed."""
+    import json
+    path = os.path.join(config_dir(), "ui.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    try:
+        version = int(data.get("bindings_version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    return normalize_bindings(data.get("bindings"), version)["g0"].tap
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -78,12 +101,17 @@ def main() -> None:
         log.error("another g935-dspd is already running")
         sys.exit(1)
 
-    mic = MicHandler(usbid=ALSA_USBID, mode_loader=load_mode)
+    mic = MicHandler(
+        usbid=ALSA_USBID, mode_loader=load_mode,
+        button_gate=panel_running, button_binding=_g0_tap_binding)
     wheel = VolumeWheel(log.getChild("wheel"))
+    health = HealthTracker()
     presence = PollPresence(
         miss_limit=MISSED_POLLS_OFFLINE, grace_s=POST_ENABLE_GRACE_S)
     fd = None
     next_poll = 0.0
+    next_health = 0.0
+    denied_logged = False
 
     while True:
         if fd is None:
@@ -94,9 +122,22 @@ def main() -> None:
                 continue
             try:
                 fd = open_hidraw(dev)
-                log.info("opened %s", dev)
+                if denied_logged:
+                    log.info("opened %s (ACL ready)", dev)
+                    denied_logged = False
+                else:
+                    log.info("opened %s", dev)
             except OSError as e:
-                log.warning("open %s: %s", dev, e)
+                if e.errno in (errno.EACCES, errno.EPERM):
+                    if not denied_logged:
+                        log.warning(
+                            "open %s: permission denied "
+                            "(waiting for udev/seat ACL)", dev)
+                        denied_logged = True
+                    else:
+                        log.debug("open %s: permission denied", dev)
+                else:
+                    log.warning("open %s: %s", dev, e)
                 time.sleep(POLL_S)
                 continue
         try:
@@ -132,11 +173,31 @@ def main() -> None:
                         MISSED_POLLS_OFFLINE,
                     )
                     mic.reset()
+                    health.mark_offline()
+                elif (presence.connected
+                        and not panel_running()
+                        and now >= next_health):
+                    next_health = now + RECENT_DECIM_S
+                    batt_st, reply = transact(
+                        fd, BATTERY_GET,
+                        on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
+                        timeout=1.5,
+                    )
+                    if batt_st == "ACK" and reply is not None and len(reply) > 6:
+                        mv = (reply[4] << 8) | reply[5]
+                        _state, charging = batt_state(reply[6])
+                        if charging is not None:
+                            health.add_sample(now, mv, charging)
+                    elif batt_st == "GONE":
+                        raise OSError("device gone during battery sample")
 
             wait = max(0.0, min(next_poll, time.time() + MIC_POLL_S) - time.time())
             wheel_wait = wheel.seconds_until_tick()
             if wheel_wait is not None:
                 wait = min(wait, wheel_wait)
+            mic_wait = mic.seconds_until_tick()
+            if mic_wait is not None:
+                wait = min(wait, mic_wait)
             readers = [fd]
             if wheel.fileno() is not None:
                 readers.append(wheel.fileno())
@@ -145,11 +206,13 @@ def main() -> None:
                 wheel.handle_ready()
             wheel.tick()
             if fd in r:
-                buf = os.read(fd, 64)
-                if len(buf) >= 2 and buf[0] != 0x11:
-                    mic.handle_report(buf, fd)
+                if not drain_idle(
+                        fd,
+                        on_non_hidpp=lambda buf: mic.handle_report(buf, fd)):
+                    raise OSError("device gone during idle drain")
             if presence.connected:
                 mic.poll(fd)
+                mic.tick(fd)
         except OSError:
             try:
                 os.close(fd)
@@ -158,6 +221,7 @@ def main() -> None:
             fd = None
             presence.reset()
             mic.reset()
+            health.mark_offline()
             log.info("receiver gone, rescanning")
             time.sleep(1)
 

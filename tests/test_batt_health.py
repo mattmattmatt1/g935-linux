@@ -14,8 +14,11 @@ from g935.battery import (
     cell_mv,
     health_estimate,
     is_charge_path_mv,
+    learned_full_charge_h,
     learned_full_runtime_h,
     live_drain_rate,
+    remaining_charge_h,
+    session_full_charge_h,
     merge_discharge_sessions,
     peak_charge_trend,
     projected_runtime_h,
@@ -27,7 +30,10 @@ from g935.battery import (
     session_full_runtime_h,
     session_list_rows,
 )
-from g935.charts import build_history_points
+from g935.chart_data import (
+    build_day_ridges, build_day_summaries, build_history_points,
+    build_history_runs, build_level_series, split_history_runs,
+)
 
 
 class BattCurveTests(unittest.TestCase):
@@ -241,6 +247,11 @@ class ChargePathVoltageTests(unittest.TestCase):
         clean = sanitize_peaks(peaks, full_mv=4200)
         self.assertEqual(clean, [[1, 4165], [3, 4160]])
 
+    def test_sanitize_peaks_drops_mid_charge_unplug(self):
+        peaks = [[1, 4165], [2, 3959], [3, 4016], [4, 4152]]
+        clean = sanitize_peaks(peaks, full_mv=4200)
+        self.assertEqual(clean, [[1, 4165], [4, 4152]])
+
     def test_history_holds_soc_while_charging(self):
         # discharge at 72%, then charge path spikes to 100%
         recent = [
@@ -348,6 +359,194 @@ class InsightsAndPeaksTests(unittest.TestCase):
         self.assertEqual(rows[0]["quality"], "solid")  # newest first
         self.assertIsNotNone(rows[0]["full_h"])
 
+    def test_session_list_keeps_solid_not_recent_shorts(self):
+        segs = []
+        t = 0
+        # two solid days
+        for _ in range(2):
+            segs.append({
+                "type": "discharge", "t_start": t, "t_end": t + 3600,
+                "mv_start": 4000, "mv_end": 3900,
+                "pct_start": 80, "pct_end": 60, "samples": 20,
+            })
+            t += 86400
+        # then many 5-minute shorts (what used to hide the solid rows)
+        for _ in range(8):
+            segs.append({
+                "type": "discharge", "t_start": t, "t_end": t + 300,
+                "mv_start": 3700, "mv_end": 3698,
+                "pct_start": 12, "pct_end": 11, "samples": 5,
+            })
+            t += 3600
+        rows = session_list_rows(segs, rated_runtime_h=8.0)
+        self.assertTrue(any(r["quality"] == "solid" for r in rows))
+        self.assertGreaterEqual(sum(1 for r in rows if r["quality"] == "solid"), 2)
+
+
+class HistoryGapTests(unittest.TestCase):
+    def test_split_breaks_overnight_hole(self):
+        t0 = 1_700_000_000
+        pts = [
+            (t0, 80, False),
+            (t0 + 60, 79, False),
+            (t0 + 10 * 3600, 78, False),
+            (t0 + 10 * 3600 + 60, 77, False),
+        ]
+        runs = split_history_runs(pts, gap_s=20 * 60)
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(len(runs[0]), 2)
+        self.assertEqual(len(runs[1]), 2)
+
+    def test_build_history_runs_does_not_bridge_gap(self):
+        t0 = 1_700_000_000
+        recent = [
+            [t0, 4000, 0],
+            [t0 + 60, 3990, 0],
+            [t0 + 8 * 3600, 3800, 0],
+            [t0 + 8 * 3600 + 60, 3790, 0],
+        ]
+        runs = build_history_runs(recent, batt_percent, max_points=40)
+        self.assertEqual(len(runs), 2)
+        flat = build_history_points(recent, batt_percent, max_points=40)
+        self.assertEqual(len(flat), sum(len(r) for r in runs))
+
+    def test_day_ridges_split_gaps_not_days(self):
+        t0 = 1_700_000_000  # a known unix time
+        recent = [
+            [t0, 4000, 0],
+            [t0 + 60, 3990, 0],
+            [t0 + 8 * 3600, 3800, 0],
+            [t0 + 8 * 3600 + 60, 3790, 0],
+        ]
+        days = build_day_ridges(recent, batt_percent, gap_s=20 * 60)
+        self.assertGreaterEqual(len(days), 1)
+        lobes = sum(len(d["lobes"]) for d in days)
+        self.assertEqual(lobes, 2)
+
+    def test_day_summaries_range(self):
+        t0 = 1_700_000_000
+        recent = [
+            [t0, 4000, 0],
+            [t0 + 60, 3900, 0],
+            [t0 + 86400, 4100, 1],
+        ]
+        days = build_day_summaries(recent, batt_percent)
+        self.assertGreaterEqual(len(days), 2)
+        used = [d for d in days if d["samples"]]
+        self.assertTrue(all(d["min_pct"] <= d["max_pct"] for d in used))
+        self.assertTrue(any(d["charged"] for d in used))
+
+    def test_level_series_rises_while_charging(self):
+        t0 = 1_700_000_000
+        # rest 20% (3715), charge for an hour, rest 80% (3980)
+        recent = [[t0, 3715, 0]]
+        for i in range(1, 12):
+            recent.append([t0 + i * 300, 4200, 1])
+        recent.append([t0 + 12 * 300, 3980, 0])
+        lobes = build_level_series(
+            recent, batt_percent, window_s=86400, gap_s=20 * 60)
+        flat = [p for lobe in lobes for p in lobe]
+        charge = [p for p in flat if p[2]]
+        self.assertTrue(charge)
+        self.assertGreater(charge[-1][1], charge[0][1] + 20)
+        # Nearby unplug: rise spans the real charge window, not a spike.
+        self.assertGreater(charge[-1][0] - charge[0][0], 30 * 60)
+
+    def test_level_series_is_one_connected_stroke(self):
+        import time as _time
+        t_day = _time.mktime(_time.strptime("2026-08-10 10:00:00",
+                                            "%Y-%m-%d %H:%M:%S"))
+        recent = [
+            [t_day, 4000, 0],
+            [t_day + 60, 3990, 0],
+            [t_day + 4 * 3600, 3900, 0],
+            [t_day + 4 * 3600 + 60, 3890, 0],
+            [t_day + 24 * 3600, 3800, 0],
+            [t_day + 24 * 3600 + 60, 3790, 0],
+        ]
+        lobes = build_level_series(recent, batt_percent, window_s=3 * 86400)
+        # Mid-day holes and the next calendar day stay on one line.
+        self.assertEqual(len(lobes), 1)
+        self.assertGreaterEqual(len(lobes[0]), 6)
+        self.assertEqual(lobes[0][0][0], recent[0][0])
+        self.assertEqual(lobes[0][-1][0], recent[-1][0])
+
+    def test_level_series_no_spike_on_distant_rest(self):
+        t0 = 1_700_000_000
+        # 20% rest, two minutes of charge, then 12 h later rest at 80%.
+        recent = [
+            [t0, 3715, 0],
+            [t0 + 60, 4200, 1],
+            [t0 + 120, 4210, 1],
+            [t0 + 12 * 3600, 3980, 0],
+        ]
+        lobes = build_level_series(recent, batt_percent, window_s=86400)
+        self.assertEqual(len(lobes), 1)
+        charge = [p for p in lobes[0] if p[2]]
+        self.assertTrue(charge)
+        rise_s = charge[-1][0] - charge[0][0]
+        # Must not compress 20→80 into the 2-minute charge burst.
+        self.assertGreater(rise_s, 30 * 60)
+        self.assertLessEqual(rise_s, 3 * 3600)
+        self.assertGreater(charge[-1][1], charge[0][1] + 20)
+        # Morning rest is on the same line, at the charged %.
+        self.assertAlmostEqual(lobes[0][-1][1], 80, delta=1)
+
+    def test_level_series_ignores_rest_days_later(self):
+        t0 = 1_700_000_000
+        # Brief charge, then a rest two days later after unseen wear.
+        recent = [
+            [t0, 3580, 0],            # ~5%
+            [t0 + 60, 4100, 1],
+            [t0 + 120, 4140, 1],
+            [t0 + 48 * 3600, 3729, 0],  # ~20%
+        ]
+        lobes = build_level_series(recent, batt_percent, window_s=4 * 86400)
+        charge = [p for lobe in lobes for p in lobe if p[2]]
+        self.assertTrue(charge)
+        # Must not invent a 5→20% climb toward a sitting two days later.
+        self.assertLess(max(p[1] for p in charge) - min(p[1] for p in charge), 8)
+        # The two-day hole is a hold at ~5%, then a short ease to 20%.
+        bridged = [p for lobe in lobes for p in lobe
+                   if charge[-1][0] < p[0] < recent[-1][0]]
+        self.assertTrue(bridged)
+        self.assertTrue(all(not p[2] for p in bridged))
+        mid = bridged[len(bridged) // 2][1]
+        self.assertLess(mid, 12)
+        self.assertGreater(bridged[-1][1], 12)
+
+    def test_level_series_projects_holes_not_steps(self):
+        t0 = 1_700_000_000
+        recent = [
+            [t0, 3980, 0],             # 80%
+            [t0 + 60, 3975, 0],
+            [t0 + 4 * 3600, 3870, 0],  # 60%
+            [t0 + 4 * 3600 + 60, 3865, 0],
+        ]
+        lobes = build_level_series(recent, batt_percent, window_s=86400)
+        flat = lobes[0]
+        # A point in the hole must be between 80 and 60, not stuck at 80.
+        hole = [p for p in flat if t0 + 60 < p[0] < t0 + 4 * 3600]
+        self.assertTrue(hole)
+        self.assertTrue(any(65 <= p[1] <= 75 for p in hole))
+        self.assertTrue(all(not p[2] for p in hole))
+
+    def test_level_series_long_dock_rises_then_holds(self):
+        t0 = 1_700_000_000
+        # 20% rest, 6 h on the dock, then rest at 80%.
+        recent = [[t0, 3715, 0]]
+        for i in range(1, 73):
+            recent.append([t0 + i * 300, 4300, 1])
+        recent.append([t0 + 73 * 300, 3980, 0])
+        lobes = build_level_series(recent, batt_percent, window_s=86400)
+        charge = [p for lobe in lobes for p in lobe if p[2]]
+        self.assertTrue(charge)
+        # First half of the sit should be climbing; the tail should be flat.
+        mid = charge[len(charge) // 2]
+        self.assertGreater(mid[1], charge[0][1] + 15)
+        self.assertAlmostEqual(charge[-1][1], charge[-2][1], delta=1.0)
+        self.assertLess(abs(charge[-1][1] - 80), 2)
+
 
 class BatteryAlertTests(unittest.TestCase):
     def test_no_alert_above_low(self):
@@ -452,6 +651,66 @@ class BatteryAlertTests(unittest.TestCase):
     def test_thresholds_match_defaults(self):
         self.assertEqual(BATT_LOW_PCT, 10)
         self.assertEqual(BATT_CRITICAL_PCT, 5)
+
+
+class ChargeUpTests(unittest.TestCase):
+    def _recent_fill(self, t0, start_mv, end_mv, minutes, path_start=4000,
+                     path_end=4300):
+        """Rest → charge samples → rest after unplug."""
+        recent = [[t0, start_mv, 0]]
+        n = max(16, minutes)
+        for i in range(n):
+            mv = path_start + (path_end - path_start) * i / max(1, n - 1)
+            recent.append([t0 + 60 + i * 60, int(mv), 1])
+        recent.append([t0 + 60 + n * 60 + 60, end_mv, 0])
+        return recent
+
+    def test_full_charge_from_rest_pair(self):
+        # 20% (3715) → 90% (4060) in 84 min → 100/70 * 1.4h ≈ 2.0h
+        recent = self._recent_fill(1_700_000_000, 3715, 4060, 84)
+        h, n = learned_full_charge_h(recent, rated_charge_h=2.0)
+        self.assertEqual(n, 1)
+        self.assertAlmostEqual(h, 2.0, delta=0.15)
+
+    def test_rejects_top_up_and_dock_idle(self):
+        # 88% → 92% in 30 min
+        top = self._recent_fill(1_700_000_000, 4040, 4070, 30)
+        h, n = learned_full_charge_h(top, rated_charge_h=2.0)
+        self.assertIsNone(h)
+        self.assertEqual(n, 0)
+        # already-full sit: start rest 97%, tiny gain, long dock
+        idle = self._recent_fill(1_700_100_000, 4165, 4168, 180,
+                                 path_start=4160, path_end=4162)
+        h, n = learned_full_charge_h(idle, rated_charge_h=2.0)
+        self.assertIsNone(h)
+
+    def test_rejects_inflated_rest_after(self):
+        # 19 min 17→87% is not a real 0.45h charge-up
+        self.assertIsNone(session_full_charge_h({
+            "pct_start": 17, "pct_end": 87, "on_time_s": 19 * 60, "open": False,
+        }))
+
+    def test_rejects_early_unplug(self):
+        # 5% → 20% in 40 min — not enough of the curve
+        recent = self._recent_fill(1_700_000_000, 3580, 3730, 40)
+        self.assertIsNone(session_full_charge_h({
+            "pct_start": 5, "pct_end": 20, "on_time_s": 40 * 60, "open": False,
+        }))
+        h, n = learned_full_charge_h(recent, rated_charge_h=2.0)
+        self.assertIsNone(h)
+
+    def test_remaining_charge(self):
+        # 2h empty-to-full, started at 50%, 30 min elapsed → 30 min left
+        left = remaining_charge_h(50, 30 * 60, 2.0)
+        self.assertAlmostEqual(left, 0.5, places=2)
+        self.assertEqual(remaining_charge_h(10, 3 * 3600, 2.0), 0.0)
+
+    def test_insights_include_charge_eta(self):
+        ins = build_insights(
+            {"remain_charge_h": 0.4, "learned_full_charge_h": 1.8},
+            state="charging", charging=True)
+        texts = " ".join(i["text"] for i in ins)
+        self.assertIn("to full", texts)
 
 
 if __name__ == "__main__":

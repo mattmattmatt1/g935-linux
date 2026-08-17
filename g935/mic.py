@@ -94,37 +94,41 @@ def read_boom(fd) -> bool | None:
 def unmute_pulse(fd, usbid: str = DEFAULT_USBID,
                  switch_name: str = DEFAULT_SWITCH,
                  hold_s: float = UNMUTE_HOLD_S) -> None:
-    """Host-side UAC mute pulse that merges the device boom flag away.
-
-    Off → hold ≥1.5s → on. Aborts the final "on" if boom goes up mid-hold.
-    """
-    log.info("unmute pulse: switch off, hold %.1fs, on", hold_s)
-    set_host_mic_switch(False, usbid=usbid, switch_name=switch_name)
+    """Blocking UAC mute pulse for helper scripts. The daemon uses MicHandler."""
+    handler = MicHandler(usbid=usbid, switch_name=switch_name)
+    handler.start_unmute_pulse()
     time.sleep(hold_s)
-    if read_boom(fd) is False:
-        log.info("boom went up mid-pulse: staying muted")
-        return
-    set_host_mic_switch(True, usbid=usbid, switch_name=switch_name)
+    handler.tick(fd)
 
 
 class MicHandler:
     """G HUB-mode boom/button mic state machine (the host side of G HUB's job).
 
     Only active when mode_loader() returns "ghub". Hardware mode: log events only.
+    The unmute pulse is a deadline on ``tick()`` so the daemon select loop
+    keeps running the earcup wheel during the 1.5s hold.
     """
 
     def __init__(self, usbid: str = DEFAULT_USBID,
                  switch_name: str = DEFAULT_SWITCH,
-                 mode_loader=None):
+                 mode_loader=None, button_gate=None, button_binding=None):
         self.usbid = usbid
         self.switch_name = switch_name
         self.mode_loader = mode_loader or (lambda: "ghub")
+        # button_gate() True → panel owns G0. button_binding() → G0 tap Binding.
+        self.button_gate = button_gate
+        self.button_binding = button_binding
         self._boom_down = None       # last observed position
         self._needs_unmute = False   # boom-up happened; next boom-down owes a pulse
+        self._pulse_deadline = None
+        self._read_boom = read_boom
+        self._read_switch = read_host_mic_switch
+        self._set_switch = set_host_mic_switch
 
     def reset(self):
         self._boom_down = None
         self._needs_unmute = False
+        self._pulse_deadline = None
 
     def mark_needs_unmute(self):
         """Headset powered on may already carry a raised-boom flag."""
@@ -133,6 +137,33 @@ class MicHandler:
     def _mode_is_ghub(self) -> bool:
         return self.mode_loader() == "ghub"
 
+    def seconds_until_tick(self, now=None):
+        if self._pulse_deadline is None:
+            return None
+        now = time.time() if now is None else now
+        return max(0.0, self._pulse_deadline - now)
+
+    def start_unmute_pulse(self, now=None, hold_s: float = UNMUTE_HOLD_S) -> None:
+        """Host switch off; ``tick`` turns it back on after hold_s."""
+        now = time.time() if now is None else now
+        log.info("unmute pulse: switch off, hold %.1fs, on", hold_s)
+        self._set_switch(False, usbid=self.usbid, switch_name=self.switch_name)
+        self._pulse_deadline = now + hold_s
+
+    def tick(self, fd, now=None) -> None:
+        """Complete a pending unmute pulse once the hold has elapsed."""
+        if self._pulse_deadline is None:
+            return
+        now = time.time() if now is None else now
+        if now < self._pulse_deadline:
+            return
+        self._pulse_deadline = None
+        if self._read_boom(fd) is False:
+            log.info("boom went up mid-pulse: staying muted")
+            return
+        self._set_switch(True, usbid=self.usbid, switch_name=self.switch_name)
+        self.poll(fd)
+
     def handle_report(self, buf, fd) -> None:
         if len(buf) < 2 or buf[0] != MIC_REPORT:
             return
@@ -140,28 +171,38 @@ class MicHandler:
         log.info("mic event: %s", buf[:2].hex())
         if not self._mode_is_ghub():
             return
-        if bits & BOOM_UP and read_boom(fd) is False:
+        if bits & BOOM_UP and self._read_boom(fd) is False:
             self._needs_unmute = True
         elif bits & BUTTON and not bits & (BOOM_UP | BOOM_DOWN):
-            cur = read_host_mic_switch(self.usbid, self.switch_name)
+            if self.button_gate and self.button_gate():
+                return
+            if self.button_binding is not None:
+                from g935.bindings import fire_headless
+                slot = self.button_binding()
+                if slot is not None and slot.action != "mic_mute":
+                    if slot.action != "none":
+                        ok, detail = fire_headless(slot)
+                        log.info("G0 tap %s: %s", slot.action, detail)
+                    return
+            cur = self._read_switch(self.usbid, self.switch_name)
             if cur is None:
                 return
             if cur:
                 log.info("button: muting (host switch off)")
-                set_host_mic_switch(False, self.usbid, self.switch_name)
+                self._set_switch(False, self.usbid, self.switch_name)
             elif not self._boom_down:
                 log.info("button: ignored, boom is up")
             elif self._needs_unmute:
                 log.info("button: unmuting (stale boom flag, full pulse)")
                 self._needs_unmute = False
-                unmute_pulse(fd, self.usbid, self.switch_name)
+                self.start_unmute_pulse()
             else:
                 log.info("button: unmuting (host switch on)")
-                set_host_mic_switch(True, self.usbid, self.switch_name)
+                self._set_switch(True, self.usbid, self.switch_name)
 
     def poll(self, fd) -> None:
         """Track boom position by level and settle the mic to match it."""
-        down = read_boom(fd)
+        down = self._read_boom(fd)
         if down is None:
             return
         changed = down != self._boom_down
@@ -173,12 +214,11 @@ class MicHandler:
         if not down:
             if changed:
                 self._needs_unmute = True
-                if read_host_mic_switch(self.usbid, self.switch_name):
+                if self._read_switch(self.usbid, self.switch_name):
                     log.info("boom up: host switch off")
-                    set_host_mic_switch(False, self.usbid, self.switch_name)
+                    self._set_switch(False, self.usbid, self.switch_name)
             return
-        if not self._needs_unmute:
+        if not self._needs_unmute or self._pulse_deadline is not None:
             return
         self._needs_unmute = False
-        unmute_pulse(fd, self.usbid, self.switch_name)
-        self.poll(fd)  # resync after the blind hold window
+        self.start_unmute_pulse()
