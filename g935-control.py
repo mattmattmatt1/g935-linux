@@ -109,6 +109,10 @@ for _ns in ("AyatanaAppIndicator3", "AppIndicator3"):
         continue
 
 
+TRAY_SNI_RETRY_S = 1
+TRAY_SNI_RETRY_MAX = 20
+
+
 def sni_watcher_present():
     """True if a StatusNotifier tray host is on the session bus."""
     try:
@@ -374,9 +378,12 @@ GENERIC_PROFILE = {
 
 
 class App(Gtk.Window):
-    def __init__(self, dev_path, pid, hid_name):
+    def __init__(self, dev_path, pid, hid_name, start_in_tray=False):
         self.profile = {**GENERIC_PROFILE,
                         **DEVICE_PROFILES.get(pid, {"name": hid_name})}
+        self._start_in_tray = start_in_tray
+        self._tray_sni_tries = 0
+        self._tray_waiting = False
         super().__init__(title=f"{self.profile['name']} Control")
         style(self, "g935-window")
         self.set_default_size(840, 900)
@@ -2356,15 +2363,33 @@ class App(Gtk.Window):
             self.worker.submit(hx)
 
     # ---------- tray ----------
+    def _retry_tray(self):
+        self._setup_tray()
+        return False
+
     def _setup_tray(self):
+        if self.indicator:
+            return
         if AppIndicator is None:
+            self._tray_waiting = False
             self.log("--- tray skipped: Ayatana AppIndicator not installed ---")
             return
         if not sni_watcher_present():
+            self._tray_sni_tries += 1
+            if self._tray_sni_tries <= TRAY_SNI_RETRY_MAX:
+                self._tray_waiting = True
+                if self._tray_sni_tries == 1:
+                    self.log("--- tray host not ready, waiting ---")
+                GLib.timeout_add_seconds(TRAY_SNI_RETRY_S, self._retry_tray)
+                return
+            self._tray_waiting = False
             # no tray host (stock GNOME without the AppIndicator extension):
             # stay windowed and let the close button quit normally
             self.log("--- tray skipped: no StatusNotifier host on this session ---")
+            if self._start_in_tray:
+                self.present()
             return
+        self._tray_waiting = False
         icon = sni_icon_name()
         category = AppIndicator.IndicatorCategory.APPLICATION_STATUS
         self.indicator = AppIndicator.Indicator.new(APP_ID, icon, category)
@@ -3864,27 +3889,31 @@ def main():
     if prof["alsa_usbid"]:
         ALSA_USBID, MIC_SWITCH_NAME = prof["alsa_usbid"], prof["mic_switch_name"]
     # Probe permissions before building the full UI (worker opens later).
+    # --tray (login autostart) must not block on a dialog: seat ACLs often
+    # land after autostart, and HidWorker retries EACCES every second.
     if path is not None:
         try:
             probe = open_hidraw(path)
             os.close(probe)
         except PermissionError:
-            error_dialog(f"No permission to open {path}.\n\n"
-                         "Install the udev rule from this repo:\n"
-                         "  sudo cp 99-g935.rules /etc/udev/rules.d/\n"
-                         "  sudo udevadm control --reload && sudo udevadm trigger\n"
-                         "then unplug/replug the receiver.\n\n"
-                         f"(Looking for hidraw access on {path}, PID {pid:04x}.)")
-            return
+            if not opts.tray:
+                error_dialog(f"No permission to open {path}.\n\n"
+                             "Install the udev rule from this repo:\n"
+                             "  sudo cp 99-g935.rules /etc/udev/rules.d/\n"
+                             "  sudo udevadm control --reload && sudo udevadm trigger\n"
+                             "then unplug/replug the receiver.\n\n"
+                             f"(Looking for hidraw access on {path}, PID {pid:04x}.)")
+                return
         except OSError as e:
-            error_dialog(f"Could not open {path}:\n{e}\n\n"
-                         "Was the receiver unplugged?")
-            return
-    win = App(path, pid, name)
+            if not opts.tray:
+                error_dialog(f"Could not open {path}:\n{e}\n\n"
+                             "Was the receiver unplugged?")
+                return
+    win = App(path, pid, name, start_in_tray=opts.tray)
     win.connect("destroy", win.on_quit)
     win.listen_for_activation()
     win.show_all()
-    if opts.tray and win.indicator:
+    if opts.tray and (win.indicator or win._tray_waiting):
         win.hide()
     else:
         win.present()

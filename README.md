@@ -4,9 +4,33 @@ A native GTK3 control panel and background service for the Logitech G935
 wireless headset. It talks directly to the receiver over HID++—no G HUB,
 Windows VM, or web account required.
 
-[Latest release: v0.8](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.8)
+[Latest release: v0.8.1](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.8.1)
 
-## What's new in v0.8
+## What's new in v0.8.1
+
+**Login tray autostart actually starts.** systemd’s XDG autostart generator
+runs before `~/.local/bin` is on `PATH`, so `Exec=g935-control --tray` was
+skipped (`Exec binary 'g935-control' does not exist`) and the tray icon never
+appeared after reboot. `./install.sh --user` now writes an absolute `Exec=` /
+`TryExec=` path.
+
+Also:
+
+- Wait for Plasma’s StatusNotifier host at login instead of skipping the tray
+- `--tray` no longer dies on a hidraw permission dialog while seat ACLs catch up
+
+Upgrade from v0.8:
+
+```bash
+git pull --ff-only
+./install.sh --user
+systemctl --user daemon-reload
+```
+
+Then log out/in, or start the tray now with `g935-control --tray`. Udev does
+not need to be reinstalled for this fix.
+
+### Earlier: v0.8
 
 **G0–G3 bindings.** The bottom earcup mute button is G0; G1–G3 sit above it.
 In software mode, tap defaults are next / play-pause / back / mic mute. Hold
@@ -18,32 +42,28 @@ path and the daemon’s leftover-report read take the same transaction lock as
 `transact()`, so a busy hidraw cannot invent a power cycle. Presence debounce
 from v0.7 stays as a backstop.
 
-Also in this release:
+Also in v0.8:
 
-- Tray icon on Plasma 6 Wayland (real app icon, `--tray`, login autostart)
+- Tray icon on Plasma 6 Wayland (real app icon, `--tray`; login autostart
+  landed in v0.8.1)
 - HID++ feature/function probe (`tools/g935-probe.py`)
-
 - Reconnect reapplies EQ in RAM only (explicit **Apply EQ** still writes EEPROM)
 - The unmute pulse no longer blocks the daemon for 1.5s (wheel ramps keep moving)
 - The panel starts without the receiver plugged in (settings and battery history)
-- After login, hidraw `EACCES` is retried quietly until seat ACLs land
+- After login, the **daemon** retries hidraw `EACCES` until seat ACLs land
 - The user unit starts after `graphical-session.target`
 - udev grants `0660`/`plugdev` as a fallback next to `uaccess`
 - The daemon logs battery samples when the panel is closed
 - Console log is capped; earcup grab requires volume-key bits on the evdev node
 
-Upgrade:
+First-time udev / `plugdev` (needed once, or when rules change):
 
 ```bash
-git pull --ff-only
-./install.sh --user
-./install.sh --udev          # udev rule changed — then unplug/replug the receiver
+./install.sh --udev          # then unplug/replug the receiver
 sudo usermod -aG plugdev "$USER"   # once, if you are not already in plugdev
-systemctl --user daemon-reload
-systemctl --user reenable --now g935-dsp
 ```
 
-Quit and reopen the panel. Log out/in (or reboot) after adding `plugdev`.
+Log out/in (or reboot) after adding `plugdev`.
 
 ### Earlier: v0.7 presence / reconnect
 
@@ -178,7 +198,10 @@ cd g935-linux
 g935-control
 ```
 
-You can also run `python3 g935-control.py` directly from the checkout.
+`./install.sh --user` also installs `~/.config/autostart/g935-control.desktop`
+(absolute `Exec=` so systemd actually starts it). The next login puts the
+panel in the tray (`g935-control --tray`). You can also run
+`python3 g935-control.py` directly from the checkout.
 
 ### Upgrade an existing checkout
 
@@ -231,16 +254,11 @@ preventing accidental EQ, sidetone, or volume changes while scrolling a page.
 Linux 100% on this headset is the USB mixer’s **0 dB** stop (`HW_VOLUME_CTRL`).
 Windows G HUB adds extra digital gain on top, so the same “max” is louder there.
 
-Playback here is:
-
-```
-apps → EasyEffects (locked at 100%) → limiter → G935 sink
-```
-
-`g935-ee-unity` keeps EasyEffects at 100% because that sink’s own volume is
-ignored on the monitor/filter path. **Loudness is the G935 Pulse/PipeWire
-volume.** Raising EasyEffects does nothing; raising HDMI/IEC958 does nothing
-while you are listening on the headset.
+**Loudness is the G935 Pulse/PipeWire volume.** Raising HDMI/IEC958 does
+nothing while you are listening on the headset. If you run EasyEffects in
+front of the G935, lock that sink at 100% and keep using the G935 node as the
+volume control — EasyEffects’ own volume is ignored on the monitor/filter
+path, and this panel hides `easyeffects_*` devices so they are not mixed here.
 
 To match Windows, set the **G935 sink** past 100%. PipeWire applies software
 gain on that node (`channelVolumes` / `softVolumes`). 150% is about **+10.6 dB**.
@@ -258,10 +276,10 @@ Do not remap 0–100% UI onto 0–150% Pulse. That hid the extra range and made
 the 100% mark a dead stop. Show the real Pulse percent past 100% instead.
 
 Plasma’s own volume popup/OSD is separate. Enable **Raise maximum volume**
-in System Settings → Sound (this repo writes `RaiseMaximumVolume=true` in
-`~/.config/plasmaparc`). That popup can go to **150%** — Plasma hard-codes
-that as `PulseAudio.MaximalVolume` and cannot show 200%. Headset volume in
-this panel, the earcup wheel, and tray scroll still go to 200%.
+in System Settings → Sound if you want that popup to go past 100%. Plasma
+hard-codes a **150%** cap (`PulseAudio.MaximalVolume`) and cannot show 200%.
+Headset volume in this panel, the earcup wheel, and tray scroll still go to
+200%. This repo does not write `~/.config/plasmaparc`.
 
 ## The two modes
 
@@ -274,7 +292,7 @@ GUI for software mode—the G HUB-style host-managed behavior.
 | Sound | flat/narrow | DSP soundstage on |
 | Boom mute | handled fully in firmware, just works | host must manage it (`g935-dspd`) |
 | Mic button | works on-device | only emits an event (daemon handles it) |
-| G1–G3 | headset defaults | diverted HID++ events shown live in the panel |
+| G0–G3 | G0 is on-device mute; G1–G3 stay on-headset | diverted HID++ events; software bindings |
 
 Mode is stored in `~/.config/g935/mode` and re-asserted by the daemon on every
 power-on. **If you use software mode, run the daemon.** Without it, raising the
@@ -335,7 +353,7 @@ restore FR. Tray menu also gets **Fix stereo** while broken.
 | `70-g935-micmute.hwdb` | masks KEY_MICMUTE so the desktop stays out of software mode |
 | `tools/` | research scripts (enable replay, sequence bisector) |
 | `tests/` | offline unit tests (`make test`) |
-| `install.sh` / `Makefile` | user + udev install |
+| `install.sh` / `Makefile` | user + udev install (writes `~/.config/autostart/g935-control.desktop`) |
 | `easyeffects-g935.json` | optional EasyEffects preset (software EQ route) |
 
 ## Troubleshooting
@@ -343,16 +361,16 @@ restore FR. Tray menu also gets **Fix stereo** while broken.
 | Symptom | Fix |
 |---|---|
 | Permission denied on hidraw | `./install.sh --udev`, add yourself to `plugdev`, then replug the receiver |
-| Daemon logs `permission denied` for ~1 min after login | upgrade to v0.8; `systemctl --user reenable --now g935-dsp`. It now waits for seat ACLs instead of failing the session |
+| Daemon logs `permission denied` for ~1 min after login | upgrade to v0.8 or later; `systemctl --user reenable --now g935-dsp`. It waits for seat ACLs instead of failing the session |
 | Tray icon missing (GNOME) | install AppIndicator extension, or run windowed |
-| Tray icon missing (Plasma) | the icon is the **panel**, not the daemon. `./install.sh --user` then `g935-control --tray`. Login autostart is installed. Look in the tray overflow (▲) if Application Status is hidden |
+| Tray icon missing (Plasma) | the icon is the **panel**, not the daemon. `./install.sh --user` then `g935-control --tray`. Login autostart uses an **absolute** `Exec=` path (`~/.local/bin/g935-control --tray`) because systemd’s autostart generator does not search `PATH`. Look in the tray overflow (▲) if Application Status is hidden |
 | Mic stuck muted after boom up | enable daemon: `systemctl --user enable --now g935-dsp`, or switch to hardware mode |
 | "press unmute twice" | install `70-g935-micmute.hwdb` via `./install.sh --udev` |
 | Sound flat after power cycle | daemon not running, or mode is hardware — enable daemon / flip software mode |
-| Headset flickers offline / DSP re-enables every ~15–60s | upgrade to v0.8; `./install.sh --user` and `systemctl --user reenable --now g935-dsp`, then reopen the panel |
+| Headset flickers offline / DSP re-enables every ~15–60s | upgrade to v0.8 or later; `./install.sh --user` and `systemctl --user reenable --now g935-dsp`, then reopen the panel |
 | Only the left ear works after sleep | install `pipewire-bin`; the panel should detect and repair the missing right-channel link |
 | Panel dead after unplug/replug | should auto-recover; if not, restart the panel (file a bug) |
-| Panel will not start with the dongle unplugged | upgrade to v0.8 — settings and battery history open offline |
+| Panel will not start with the dongle unplugged | upgrade to v0.8 or later — settings and battery history open offline |
 | `g935-control: command not found` | ensure `~/.local/bin` is on `PATH`, or run `python3 g935-control.py` |
 | Desktop file won’t launch from file manager | use the installed `g935-control` command / app menu entry, not the raw `.desktop` in the git checkout |
 

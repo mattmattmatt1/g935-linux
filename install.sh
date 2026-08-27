@@ -64,13 +64,13 @@ SyslogIdentifier=g935-dspd
 WantedBy=graphical-session.target
 EOF
 
-  # desktop entry
+  # desktop entry (absolute Exec so it still launches if PATH is thin)
   cat > "$APP_DIR/g935-control.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=G935 Control
 Comment=Sidetone, EQ and lighting control for the Logitech G935
-Exec=g935-control
+Exec=$BIN/g935-control
 Icon=g935-control
 Terminal=false
 Categories=AudioVideo;Audio;Settings;
@@ -79,18 +79,23 @@ StartupWMClass=g935-control
 EOF
 
   # Persistent tray icon (the daemon is headless). Hidden start; click Show.
+  # systemd-xdg-autostart-generator runs before ~/.local/bin is on PATH, so
+  # Exec= must be absolute or it logs "does not exist" and skips the unit.
   cat > "$AUTOSTART_DIR/g935-control.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=G935 Control
 Comment=G935 tray icon
-Exec=g935-control --tray
+Exec=$BIN/g935-control --tray
+TryExec=$BIN/g935-control
 Icon=g935-control
 Terminal=false
 Categories=AudioVideo;Audio;Settings;
 StartupNotify=false
 StartupWMClass=g935-control
+Hidden=false
 X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
 X-KDE-autostart-phase=2
 EOF
 
