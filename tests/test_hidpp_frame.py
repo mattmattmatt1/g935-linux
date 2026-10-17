@@ -1,13 +1,24 @@
+import errno
 import os
 import tempfile
 import unittest
 from unittest import mock
 
 from g935.hidpp import (
-    ERROR_CODES, PollPresence, drain_idle, is_hidpp_notification,
+    ERROR_CODES, PollPresence, drain_idle, hidraw_error, is_hidpp_notification,
     parse_reply, to_report, try_acquire_transaction_lock,
     _release_transaction_lock,
 )
+
+
+class HidrawErrorTests(unittest.TestCase):
+    def test_unplug_is_gone(self):
+        self.assertEqual(hidraw_error(OSError(errno.ENODEV, "gone")), "GONE")
+        self.assertEqual(hidraw_error(OSError(errno.EIO, "io")), "GONE")
+
+    def test_bad_report_is_not_an_unplug(self):
+        self.assertEqual(hidraw_error(OSError(errno.EINVAL, "bad")), "TIMEOUT")
+        self.assertEqual(hidraw_error(OSError(errno.EAGAIN, "again")), "TIMEOUT")
 
 
 class FrameTests(unittest.TestCase):
@@ -156,6 +167,34 @@ class TransactionLockTests(unittest.TestCase):
                     self.assertTrue(drain_idle(
                         r, on_non_hidpp=lambda buf: seen.append(bytes(buf))))
                     self.assertEqual(seen, [bytes.fromhex("0820")])
+                finally:
+                    os.close(r)
+                    os.close(w)
+
+    def test_drain_idle_bad_report_is_not_an_unplug(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                r, w = os.pipe()
+                try:
+                    os.write(w, b"\x11")
+                    with mock.patch(
+                            "g935.hidpp.os.read",
+                            side_effect=OSError(errno.EINVAL, "bad")):
+                        self.assertTrue(drain_idle(r))
+                finally:
+                    os.close(r)
+                    os.close(w)
+
+    def test_drain_idle_unplug_is_gone(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                r, w = os.pipe()
+                try:
+                    os.write(w, b"\x11")
+                    with mock.patch(
+                            "g935.hidpp.os.read",
+                            side_effect=OSError(errno.ENODEV, "gone")):
+                        self.assertFalse(drain_idle(r))
                 finally:
                     os.close(r)
                     os.close(w)

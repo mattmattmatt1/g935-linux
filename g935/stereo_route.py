@@ -69,6 +69,12 @@ def _is_g935_port(name: str) -> bool:
     return any(m in name for m in G935_SINK_MARKERS)
 
 
+def is_g935_sink(name: str, description: str = "") -> bool:
+    """True for the G935 USB playback node, not EasyEffects or a monitor."""
+    text = f"{name} {description}"
+    return any(marker in text for marker in G935_SINK_MARKERS)
+
+
 def parse_pw_link_list(text: str) -> dict[str, list[str]]:
     """Parse ``pw-link -l`` into {port: [linked_peer, ...]} (both directions).
 

@@ -4,9 +4,36 @@ A native GTK3 control panel and background service for the Logitech G935
 wireless headset. It talks directly to the receiver over HID++—no G HUB,
 Windows VM, or web account required.
 
-[Latest release: v0.8.1](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.8.1)
+[Latest release: v0.8.2](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.8.2)
 
-## What's new in v0.8.1
+## What's new in v0.8.2
+
+**Volume stays on the headset.** Tray scroll, the earcup wheel, and G-key
+volume and mute write the G935 sink (0–200%), including while that sink is
+suspended. They use the default sink only when the headset node is gone. A
+failed sink listing during a wheel spin no longer jumps to another device.
+
+Also:
+
+- Wheel-up on the tray icon is louder, one notch per 5%
+- Volume and stream changes move the sliders and leave an open tray menu alone
+- The tray still registers if Plasma’s status host is not up yet at login
+- A second `--tray` start exits quietly when the panel is already running
+- A rejected HID report is a timeout, not an unplug, so it does not look like a power cycle
+- The daemon does not overwrite battery history while the panel is open
+
+Upgrade from v0.8.1:
+
+```bash
+git pull --ff-only
+./install.sh --user
+systemctl --user restart g935-dsp.service
+systemctl --user restart 'app-g935\x2dcontrol@autostart.service'
+```
+
+Udev does not need to be reinstalled.
+
+### Earlier: v0.8.1
 
 **Login tray autostart actually starts.** systemd’s XDG autostart generator
 runs before `~/.local/bin` is on `PATH`, so `Exec=g935-control --tray` was
@@ -114,7 +141,7 @@ diagnostics for unusual hardware behavior.
 - **Earcup wheel:** short receiver presses become fine changes, while the
   longer held signal produced by a fast sweep is decoded into a continuous
   series of real 1% changes. Each sweep has a configurable 50% ceiling.
-  Wheel, tray scroll, and sliders share the same 0–200% scale.
+  Wheel, tray scroll, G-key volume, and sliders share the same 0–200% scale.
   USB-mixer writes are rate-limited and an oscillation circuit breaker freezes
   abusive rapid reversals before they can flood the headset hardware.
   Settings expose fine adjustment, fine cadence, acceleration point, fast
@@ -262,9 +289,9 @@ path, and this panel hides `easyeffects_*` devices so they are not mixed here.
 
 To match Windows, set the **G935 sink** past 100%. PipeWire applies software
 gain on that node (`channelVolumes` / `softVolumes`). 150% is about **+10.6 dB**.
-The panel **Headset volume** bar, tray scroll, and earcup wheel all show and
-write that real percent, 0–200%. 100% is marked as hardware max; the bar does
-not stop there.
+The panel **Headset volume** bar, tray scroll, earcup wheel, and G-key volume
+and mute all write that real percent, 0–200%. 100% is marked as hardware max;
+the bar does not stop there.
 
 ```bash
 # sanity check — this is the control that actually changes loudness
@@ -278,8 +305,8 @@ the 100% mark a dead stop. Show the real Pulse percent past 100% instead.
 Plasma’s own volume popup/OSD is separate. Enable **Raise maximum volume**
 in System Settings → Sound if you want that popup to go past 100%. Plasma
 hard-codes a **150%** cap (`PulseAudio.MaximalVolume`) and cannot show 200%.
-Headset volume in this panel, the earcup wheel, and tray scroll still go to
-200%. This repo does not write `~/.config/plasmaparc`.
+Headset volume in this panel, the earcup wheel, G-key volume, and tray scroll
+still go to 200%. This repo does not write `~/.config/plasmaparc`.
 
 ## The two modes
 

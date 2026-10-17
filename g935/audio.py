@@ -13,10 +13,40 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib
 
 
+def classify_pactl_event(line: str) -> str | None:
+    """Classify one ``pactl subscribe`` line.
+
+    ``devices`` means a sink, source, card, or the default device appeared,
+    disappeared, or changed identity. ``levels`` means only a volume or mute
+    on an existing sink/source. Stream events (``sink-input``,
+    ``source-output``) are ignored: they fire for the whole session and are
+    not the headset control.
+    """
+    match = re.match(
+        r"event '(\w+)' on ([a-z0-9-]+)", line.strip().lower())
+    if not match:
+        return None
+    action, obj = match.group(1), match.group(2)
+    if obj == "server":
+        return "devices" if action == "change" else None
+    if obj == "card" and action in ("new", "remove", "change"):
+        return "devices"
+    if obj in ("sink", "source"):
+        if action in ("new", "remove"):
+            return "devices"
+        if action == "change":
+            return "levels"
+    return None
+
+
 class AudioControl:
     """pactl wrapper + subscribe thread. Never lists easyeffects_* devices
     (g935-ee-unity owns them and would fight any change) and never lists
-    .monitor sources. Change notifications land debounced on the main loop."""
+    .monitor sources. Change notifications land debounced on the main loop.
+
+    The callback receives "devices" or "levels". A device event inside the
+    debounce window wins over a volume event.
+    """
 
     # pactl output is localized - force C so "Name:"/"Description:" and the
     # subscribe event wording are parseable on any system language
@@ -26,6 +56,7 @@ class AudioControl:
         self.on_change = on_change
         self.available = shutil.which("pactl") is not None
         self._pending = None
+        self._pending_kind = None
         self._stop = False
         self._proc = None
         if self.available:
@@ -73,6 +104,9 @@ class AudioControl:
     def toggle_default_mute(self):
         self._run("set-sink-mute", "@DEFAULT_SINK@", "toggle")
 
+    def toggle_mute(self, kind, name):
+        self._run(f"set-{kind}-mute", name, "toggle")
+
     def _subscribe_loop(self):
         delay = 0.5
         while not self._stop:
@@ -87,25 +121,29 @@ class AudioControl:
             for line in self._proc.stdout:
                 if self._stop:
                     return
-                l = line.lower()
-                if ("sink" in l or "source" in l or "server" in l) and \
-                        ("new" in l or "remove" in l or "change" in l):
-                    GLib.idle_add(self._poke)
+                kind = classify_pactl_event(line)
+                if kind:
+                    GLib.idle_add(self._poke, kind)
             if not self._stop:
                 # a subscription that dies instantly means no sound server:
                 # back off instead of respawning pactl twice a second forever
                 delay = 0.5 if time.time() - started > 5 else min(delay * 2, 30)
                 time.sleep(delay)
 
-    def _poke(self):
+    def _poke(self, kind="devices"):
+        # Device add/remove must not be lost behind a volume-only refresh.
+        if self._pending_kind != "devices":
+            self._pending_kind = kind
         if self._pending:
             GLib.source_remove(self._pending)
         self._pending = GLib.timeout_add(300, self._fire)
         return False
 
     def _fire(self):
+        kind = self._pending_kind or "devices"
         self._pending = None
-        self.on_change()
+        self._pending_kind = None
+        self.on_change(kind)
         return False
 
     def stop(self):

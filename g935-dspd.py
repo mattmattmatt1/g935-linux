@@ -173,7 +173,10 @@ def main() -> None:
                         MISSED_POLLS_OFFLINE,
                     )
                     mic.reset()
-                    health.mark_offline()
+                    # The panel owns health.json while it is open. Saving
+                    # the daemon's older snapshot here deletes its samples.
+                    if not panel_running():
+                        health.mark_offline()
                 elif (presence.connected
                         and not panel_running()
                         and now >= next_health):
@@ -221,7 +224,8 @@ def main() -> None:
             fd = None
             presence.reset()
             mic.reset()
-            health.mark_offline()
+            if not panel_running():
+                health.mark_offline()
             log.info("receiver gone, rescanning")
             time.sleep(1)
 

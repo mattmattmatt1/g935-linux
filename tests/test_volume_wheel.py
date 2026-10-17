@@ -68,17 +68,24 @@ class FakePactl:
     def __init__(self, vol=40):
         self.vol = vol
         self.sets = []
+        self.targets = []
+        self.sinks = ""
         self.failures = 0
 
     def __call__(self, *args):
+        if args[0] == "list":
+            return SimpleNamespace(
+                returncode=0, stdout=self.sinks, stderr="")
         if self.failures:
             self.failures -= 1
             return SimpleNamespace(returncode=1, stdout="", stderr="fail")
         if args[0] == "get-sink-volume":
+            self.targets.append(args[1])
             return SimpleNamespace(
                 returncode=0, stdout=f"Volume: {self.vol}% / {self.vol}%",
                 stderr="")
         if args[0] == "set-sink-volume":
+            self.targets.append(args[1])
             self.vol = int(str(args[2]).rstrip("%"))
             self.sets.append(self.vol)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -136,6 +143,58 @@ class VolumeWheelTests(unittest.TestCase):
     def tearDown(self):
         # handle_ready / close may already have closed the pipe
         pass
+
+    def test_wheel_targets_g935_sink_when_present(self):
+        w = self._wheel(40)
+        w._pactl.sinks = (
+            "179576\talsa_output.pci-0000_0a_00.1.hdmi-stereo\tPipeWire\t"
+            "s32le 2ch 48000Hz\tRUNNING\n"
+            "108\talsa_output.usb-Logitech_G935_Gaming_Headset-00.analog-stereo"
+            "\tPipeWire\ts16le 2ch 48000Hz\tSUSPENDED\n"
+        )
+        try:
+            self._feed(
+                w,
+                _key_event(1.0, KEY_VOLUMEUP, 1),
+                _key_event(1.05, KEY_VOLUMEUP, 0),
+            )
+            self._flush(w)
+            self.assertEqual(w._pactl.sets, [41])
+            self.assertTrue(w._pactl.targets)
+            self.assertTrue(all(
+                "Logitech_G935" in name for name in w._pactl.targets))
+        finally:
+            os.close(w._write)
+            w.close()
+
+    def test_failed_sink_list_keeps_known_g935_name(self):
+        w = self._wheel(40)
+        w._pactl.sinks = (
+            "108\talsa_output.usb-Logitech_G935_Gaming_Headset-00.analog-stereo"
+            "\tPipeWire\ts16le 2ch 48000Hz\tSUSPENDED\n"
+        )
+        try:
+            self.assertIn("Logitech_G935", w._volume_target())
+            w._sink_until = 0
+
+            def list_fails(*args):
+                if args[0] == "list":
+                    return SimpleNamespace(
+                        returncode=1, stdout="", stderr="fail")
+                return w._pactl(*args)
+
+            w.command_runner = list_fails
+            self.assertIn("Logitech_G935", w._volume_target())
+            w._sink_until = 0
+            w.command_runner = w._pactl
+            w._pactl.sinks = (
+                "179576\talsa_output.pci-0000_0a_00.1.hdmi-stereo\tPipeWire\t"
+                "s32le 2ch 48000Hz\tRUNNING\n"
+            )
+            self.assertEqual(w._volume_target(), "@DEFAULT_SINK@")
+        finally:
+            os.close(w._write)
+            w.close()
 
     def test_fine_press_changes_one_percent(self):
         w = self._wheel(40)

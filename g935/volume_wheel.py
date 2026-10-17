@@ -22,6 +22,7 @@ import subprocess
 import time
 
 from g935.paths import config_dir
+from g935.stereo_route import is_g935_sink
 
 EV_KEY = 0x01
 KEY_VOLUMEDOWN = 114
@@ -357,6 +358,8 @@ class VolumeWheel:
         self.next_ramp_step = 0.0
         self.last_volume_write = None
         self.failures = 0
+        self._sink_name = None
+        self._sink_until = 0.0
 
     @staticmethod
     def _run(*args):
@@ -588,9 +591,48 @@ class VolumeWheel:
             return None
         return max(0.0, min(deadlines) - now)
 
+    def _volume_target(self):
+        """G935 sink when it exists, otherwise whatever is the default.
+
+        The earcup wheel is on the headset. ``@DEFAULT_SINK@`` follows HDMI
+        or speakers when those are selected, so a spin would change the
+        wrong device. The name is cached for a couple of seconds so a fast
+        sweep does not run ``pactl list`` on every percent.
+        """
+        now = time.monotonic()
+        if self._sink_name and now < self._sink_until:
+            return self._sink_name
+        reply = None
+        try:
+            reply = self.command_runner("list", "short", "sinks")
+        except (OSError, subprocess.SubprocessError):
+            reply = None
+        listed = reply is not None and not reply.returncode
+        found = None
+        if listed:
+            for line in (reply.stdout or "").splitlines():
+                parts = line.split("\t") if "\t" in line else line.split()
+                if len(parts) >= 2 and is_g935_sink(parts[1]):
+                    found = parts[1]
+                    break
+        if found:
+            self._sink_name = found
+            self._sink_until = now + 2.0
+            return found
+        # A failed list is not proof the headset node left. Keep the last
+        # real name so one pactl error during a spin does not hit HDMI.
+        # A successful list with no G935 node does fall through.
+        if (not listed and self._sink_name
+                and is_g935_sink(self._sink_name)):
+            self._sink_until = now + 2.0
+            return self._sink_name
+        self._sink_name = "@DEFAULT_SINK@"
+        self._sink_until = now + 2.0
+        return self._sink_name
+
     def _read_volume(self):
         current_reply = self.command_runner(
-            "get-sink-volume", "@DEFAULT_SINK@")
+            "get-sink-volume", self._volume_target())
         values = [
             int(value)
             for value in _PERCENT_RE.findall(current_reply.stdout or "")
@@ -601,7 +643,7 @@ class VolumeWheel:
 
     def _set_volume(self, target):
         set_reply = self.command_runner(
-            "set-sink-volume", "@DEFAULT_SINK@", f"{int(target)}%")
+            "set-sink-volume", self._volume_target(), f"{int(target)}%")
         if set_reply.returncode:
             raise RuntimeError(set_reply.stderr.strip() or "set failed")
 

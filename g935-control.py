@@ -87,7 +87,10 @@ from g935.mic import (
 from g935.mode import load_mode, save_mode
 from g935.panel_ipc import bind_listener, notify_running_instance
 from g935.paths import config_dir, ensure_config_dir, runtime_dir
-from g935.stereo_route import fix_stereo, inspect_stereo, notify_user
+from g935.stereo_route import (
+    fix_stereo, inspect_stereo, is_g935_sink, notify_user,
+)
+from g935.tray_scroll import tray_scroll_notches
 from g935.volume_wheel import (
     DEFAULT_FINE_STEP, DEFAULT_STEP, DIRECTION_GUARD_S, EVIOCGRAB,
     FAST_ROLL_GAP_S, FINE_INTERVAL_S,
@@ -403,6 +406,10 @@ class App(Gtk.Window):
         self.mixer_win = None
         self.indicator = None
         self.tray_batt_item = None
+        self._tray_status = None
+        self._tray_scroll_acc = 0
+        self._tray_menu_sig = None
+        self._headset_sink_cache = None
         self._vol_pending = {}    # (kind, name) -> debounce source id
         self._vol_containers = []
         self._vol_interacting = False
@@ -1518,6 +1525,11 @@ class App(Gtk.Window):
                            lambda st, rep, a=attr: self._got_feature(a, st, rep))
 
     def _got_feature(self, attr, status, reply):
+        if status == "GONE" or not self._discovering:
+            # A late reply after the receiver dropped must not finish
+            # discovery with an empty map (heartbeat would then stop retrying).
+            self._discovering = False
+            return
         if status == "TIMEOUT":
             # one retry: g935-dspd shares the hidraw and a collided reply
             # looks identical to a powered-off headset
@@ -1545,6 +1557,9 @@ class App(Gtk.Window):
         self.worker.submit("11ff010b", self._got_feat_count)
 
     def _got_feat_count(self, status, reply):
+        if status == "GONE" or not self._discovering:
+            self._discovering = False
+            return
         if status != "ACK":
             self._discovering = False
             if status == "TIMEOUT":
@@ -1566,6 +1581,9 @@ class App(Gtk.Window):
                            lambda st, rep, i=i: self._got_feat_id(i, st, rep))
 
     def _got_feat_id(self, i, status, reply):
+        if status == "GONE" or not self._discovering:
+            self._discovering = False
+            return
         if status == "TIMEOUT":
             self._discovering = False
             self._mark_disconnected()
@@ -2036,14 +2054,15 @@ class App(Gtk.Window):
         if action == "prev_track":
             return media_call("Previous")
         if action == "vol_up":
-            self.audio.step_default_volume(5)
-            return True, "+5%"
+            return self._nudge_headset_volume(5)
         if action == "vol_down":
-            self.audio.step_default_volume(-5)
-            return True, "-5%"
+            return self._nudge_headset_volume(-5)
         if action == "mute_output":
-            self.audio.toggle_default_mute()
-            return True, "toggled sink mute"
+            name = self._headset_sink()
+            if not name:
+                return False, "no sink"
+            self.audio.toggle_mute("sink", name)
+            return True, "toggled headset mute"
         if action == "mic_mute":
             cur = _read_host_mic()
             if cur is None:
@@ -2383,12 +2402,9 @@ class App(Gtk.Window):
                 GLib.timeout_add_seconds(TRAY_SNI_RETRY_S, self._retry_tray)
                 return
             self._tray_waiting = False
-            # no tray host (stock GNOME without the AppIndicator extension):
-            # stay windowed and let the close button quit normally
-            self.log("--- tray skipped: no StatusNotifier host on this session ---")
-            if self._start_in_tray:
-                self.present()
-            return
+            # Ayatana registers itself when the watcher appears later.
+            # Giving up here left --tray with no icon for the rest of the session.
+            self.log("--- tray host still missing; registering anyway ---")
         self._tray_waiting = False
         icon = sni_icon_name()
         category = AppIndicator.IndicatorCategory.APPLICATION_STATUS
@@ -2409,52 +2425,94 @@ class App(Gtk.Window):
         self._rebuild_tray_menu()
         self.log(f"--- tray active ({icon}) ---")
 
-    def on_tray_scroll(self, _ind, _delta, direction):
-        try:
-            up = direction == Gdk.ScrollDirection.UP
-        except Exception:
-            up = True
-        name = self.audio.default_sink()
+    def on_tray_scroll(self, _ind, delta, direction):
+        # DOWN is wheel-up: Ayatana flips Plasma's positive angleDelta.y.
+        if direction == Gdk.ScrollDirection.DOWN:
+            way = "down"
+        elif direction == Gdk.ScrollDirection.UP:
+            way = "up"
+        else:
+            way = "other"
+        notches, self._tray_scroll_acc = tray_scroll_notches(
+            way, delta, self._tray_scroll_acc)
+        if notches == 0:
+            return
+        name = self._headset_sink()
         if not name:
             return
-        cur = self.audio.get_volume("sink", name) or 0
-        if up:
-            if cur >= VOLUME_BOOST_MAX:
-                return
-            self.audio.set_volume("sink", name, min(VOLUME_BOOST_MAX, cur + 5))
-        else:
-            self.audio.set_volume("sink", name, max(0, cur - 5))
+        cur = self.audio.get_volume("sink", name)
+        if cur is None:
+            return
+        new = max(0, min(VOLUME_BOOST_MAX, cur + notches * 5))
+        if new != cur:
+            self.audio.set_volume("sink", name, new)
+
+    def _tray_header_label(self):
+        name = self.profile["name"]
+        text = self._tray_status
+        if text:
+            return f"{name} — {text}"
+        return name
 
     def _update_tray_battery(self, text):
+        self._tray_status = text
         if self.indicator:
             self.indicator.set_title(f"{self.profile['name']} · {text}")
         if self.tray_batt_item:
-            self.tray_batt_item.set_label(f"{self.profile['name']} — {text}")
+            self.tray_batt_item.set_label(self._tray_header_label())
+
+    def _tray_menu_signature(self):
+        """Identity of the menu. Volume changes are not part of it."""
+        hidden_sinks = set(self.settings.data["hidden_sinks"])
+        hidden_sources = set(self.settings.data["hidden_sources"])
+        sinks = tuple(
+            (name, desc) for name, desc in self.audio.list_sinks()
+            if name not in hidden_sinks)
+        sources = tuple(
+            (name, desc) for name, desc in self.audio.list_sources()
+            if name not in hidden_sources)
+        return (
+            sinks, self.audio.default_sink(),
+            sources, self.audio.default_source(),
+            bool(getattr(self, "_stereo_broken", False)),
+        )
 
     def _rebuild_tray_menu(self):
         if not self.indicator:
             return
+        signature = self._tray_menu_signature()
+        if signature == self._tray_menu_sig and self.tray_batt_item:
+            self.tray_batt_item.set_label(self._tray_header_label())
+            return
+        self._tray_menu_sig = signature
         menu = Gtk.Menu()
 
-        self.tray_batt_item = Gtk.MenuItem(label=f"{self.profile['name']}")
+        self.tray_batt_item = Gtk.MenuItem(label=self._tray_header_label())
         self.tray_batt_item.set_sensitive(False)
         menu.append(self.tray_batt_item)
         menu.append(Gtk.SeparatorMenuItem())
 
+        hidden_sinks = set(self.settings.data["hidden_sinks"])
+        hidden_sources = set(self.settings.data["hidden_sources"])
         for kind, devs, hidden, default, setter in (
                 ("Output", self.audio.list_sinks(),
-                 set(self.settings.data["hidden_sinks"]),
+                 hidden_sinks,
                  self.audio.default_sink(), self.audio.set_default_sink),
                 ("Input", self.audio.list_sources(),
-                 set(self.settings.data["hidden_sources"]),
+                 hidden_sources,
                  self.audio.default_source(), self.audio.set_default_source)):
             hdr = Gtk.MenuItem(label=kind)
             hdr.set_sensitive(False)
             menu.append(hdr)
+            visible = [(name, desc) for name, desc in devs if name not in hidden]
+            # The first radio in a new group is born active, and GTK ignores
+            # set_active(False) on that only item. A hidden placeholder keeps
+            # the check off when the real default is filtered out.
             group = None
-            for name, desc in devs:
-                if name in hidden:
-                    continue
+            if not any(name == default for name, _desc in visible):
+                group = Gtk.RadioMenuItem.new_with_label_from_widget(None, "")
+                group.set_active(True)
+            for name, desc in visible:
                 item = Gtk.RadioMenuItem.new_with_label_from_widget(group, desc)
                 group = group or item
                 item.set_active(name == default)   # before connect: no echo
@@ -2489,12 +2547,15 @@ class App(Gtk.Window):
             return True
         return False                # no tray: normal close -> destroy -> quit
 
-    def listen_for_activation(self):
-        try:
-            self._ipc_sock = bind_listener()
-        except OSError as exc:
-            self.log(f"--- panel activation socket failed: {exc} ---")
-            return
+    def listen_for_activation(self, sock=None):
+        if sock is not None:
+            self._ipc_sock = sock
+        if getattr(self, "_ipc_sock", None) is None:
+            try:
+                self._ipc_sock = bind_listener()
+            except OSError as exc:
+                self.log(f"--- panel activation socket failed: {exc} ---")
+                return
         GLib.io_add_watch(
             self._ipc_sock.fileno(), GLib.IO_IN, self._on_activation)
 
@@ -2523,11 +2584,33 @@ class App(Gtk.Window):
         Gtk.main_quit()
 
     # ---------- audio devices: settings toggles, volume rows, mixer ----------
+    def _nudge_headset_volume(self, delta):
+        """G-key volume. Absolute percent on the G935 node, capped at 200."""
+        name = self._headset_sink()
+        if not name:
+            return False, "no sink"
+        cur = self.audio.get_volume("sink", name)
+        if cur is None:
+            return False, "volume unreadable"
+        new = max(0, min(VOLUME_BOOST_MAX, cur + delta))
+        if new != cur:
+            self.audio.set_volume("sink", name, new)
+        return True, f"{new}%"
+
     def _headset_sink(self):
-        for name, desc in self.audio.list_sinks():
-            if "Logitech_G935" in name or "G935" in desc:
-                return name
-        return self.audio.default_sink()
+        now = time.monotonic()
+        cached = self._headset_sink_cache
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        name = None
+        for sink_name, desc in self.audio.list_sinks():
+            if is_g935_sink(sink_name, desc):
+                name = sink_name
+                break
+        if name is None:
+            name = self.audio.default_sink()
+        self._headset_sink_cache = (now + 2.0, name)
+        return name
 
     def _sync_headset_vol_slider(self):
         if getattr(self, "headset_vol", None) is None:
@@ -2967,13 +3050,32 @@ class App(Gtk.Window):
                 pass
         self._wheel_cal_fd = None
 
-    def _on_audio_change(self):
+    def _on_audio_change(self, kind="devices"):
+        if kind == "levels":
+            # Volume/mute only. Rebuilding the tray menu here used to run on
+            # every sink-input event (all playback), which closed an open
+            # menu and spawned a pactl storm.
+            self._sync_headset_vol_slider()
+            self._sync_volume_row_levels()
+            return
+        self._headset_sink_cache = None
         self._rebuild_tray_menu()
         self._refresh_device_toggles()
         self._sync_headset_vol_slider()
         self._refresh_volume_rows()
-        # Device re-enumerate after resume often breaks FR link — check soon
-        GLib.timeout_add(1500, self._poll_stereo_route_once)
+        # Device re-enumerate after resume often breaks the FR link.
+        # The 8s poll still covers the quiet case; don't stack one-shots.
+        self._schedule_stereo_check()
+
+    def _schedule_stereo_check(self):
+        if getattr(self, "_stereo_check_id", None):
+            return
+        self._stereo_check_id = GLib.timeout_add(1500, self._stereo_check_done)
+
+    def _stereo_check_done(self):
+        self._stereo_check_id = None
+        self._poll_stereo_route_once()
+        return False
 
     def _refresh_device_toggles(self):
         box = self.dev_toggle_box
@@ -3048,9 +3150,33 @@ class App(Gtk.Window):
                 sc.connect("button-press-event", self._on_vol_press)
                 sc.connect_after("button-release-event", self._on_vol_release)
                 sc.connect("value-changed", self._on_vol_slider, kind, name)
+                sc._g935_kind = kind
+                sc._g935_name = name
+                row._g935_scale = sc
                 row.pack_start(sc, True, True, 0)
                 container.pack_start(row, False, False, 0)
         container.show_all()
+
+    def _sync_volume_row_levels(self):
+        """Move existing mixer sliders to the current volumes.
+
+        Does not rebuild rows, so an open tray menu and in-progress drag
+        stay put. ``handler_block`` keeps the update from writing the
+        volume back.
+        """
+        if self._vol_interacting or self._vol_pending:
+            return
+        for box in self._vol_containers:
+            for row in box.get_children():
+                scale = getattr(row, "_g935_scale", None)
+                if scale is None:
+                    continue
+                raw = self.audio.get_volume(scale._g935_kind, scale._g935_name)
+                if raw is None or int(scale.get_value()) == int(raw):
+                    continue
+                scale.handler_block_by_func(self._on_vol_slider)
+                scale.set_value(raw)
+                scale.handler_unblock_by_func(self._on_vol_slider)
 
     def _on_vol_slider(self, scale, kind, name):
         key = (kind, name)
@@ -3865,8 +3991,17 @@ def main():
         return
     lock = acquire_single_instance()
     if lock is None:
+        if opts.tray:
+            notify_running_instance()
+            return
         error_dialog("Another instance is already running (check the tray).")
         return
+    # Own the present-socket before the window build. A second --tray start
+    # in that gap used to miss the socket, lose the lock, and pop a dialog.
+    try:
+        ipc_sock = bind_listener()
+    except OSError:
+        ipc_sock = None
     found = find_headset(known_pids=set(DEVICE_PROFILES))
     if not found:
         # HidWorker rescans; battery history and settings should still open.
@@ -3911,7 +4046,7 @@ def main():
                 return
     win = App(path, pid, name, start_in_tray=opts.tray)
     win.connect("destroy", win.on_quit)
-    win.listen_for_activation()
+    win.listen_for_activation(ipc_sock)
     win.show_all()
     if opts.tray and (win.indicator or win._tray_waiting):
         win.hide()

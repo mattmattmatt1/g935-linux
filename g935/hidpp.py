@@ -1,6 +1,7 @@
 """HID++ over hidraw: device discovery, report framing, transactions, worker thread."""
 from __future__ import annotations
 
+import errno
 import glob
 import fcntl
 import os
@@ -154,6 +155,24 @@ def try_acquire_transaction_lock():
     return _acquire_transaction_lock(nonblocking=True)
 
 
+# These mean the hidraw node itself is gone. EINVAL is a rejected report
+# (wrong id or length) on a node that is still open.
+_GONE_ERRNOS = frozenset({
+    errno.ENODEV, errno.EIO, errno.EBADF, errno.EPIPE,
+})
+
+
+def hidraw_error(exc: OSError) -> str:
+    """``GONE`` only when the device node is gone. Otherwise ``TIMEOUT``.
+
+    A bad report must not look like an unplug: the daemon treats ``GONE``
+    as the receiver leaving, and the next real ACK becomes a fake power-on.
+    """
+    if exc.errno in _GONE_ERRNOS:
+        return "GONE"
+    return "TIMEOUT"
+
+
 def drain_idle(fd, on_non_hidpp=None, on_hidpp_notification=None):
     """Read pending reports only when no HID++ transaction owns the bus.
 
@@ -173,8 +192,12 @@ def drain_idle(fd, on_non_hidpp=None, on_hidpp_notification=None):
                 return True
             try:
                 buf = os.read(fd, 64)
-            except OSError:
-                return False
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    continue
+                # False only when the node is gone. A rejected report
+                # (EINVAL) must not make the daemon close the fd.
+                return hidraw_error(exc) != "GONE"
             if len(buf) < 2:
                 continue
             if buf[0] != 0x11:
@@ -205,16 +228,30 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
     feat, fnsw = rpt[2], rpt[3]
     lock_fd = _acquire_transaction_lock()
     try:
-        os.write(fd, rpt)
+        try:
+            os.write(fd, rpt)
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                return hidraw_error(exc), None
         deadline = time.time() + timeout
         while time.time() < deadline:
             wait = deadline - time.time()
             if wait <= 0:
                 break
-            r, _, _ = select.select([fd], [], [], wait)
+            try:
+                r, _, _ = select.select([fd], [], [], wait)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EINTR):
+                    continue
+                return hidraw_error(exc), None
             if not r:
                 break
-            buf = os.read(fd, 64)
+            try:
+                buf = os.read(fd, 64)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    continue
+                return hidraw_error(exc), None
             if len(buf) < 2:
                 continue
             if buf[0] != 0x11:
@@ -229,8 +266,6 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
                 continue
             status, detail = matched
             return status, detail
-    except OSError:
-        return "GONE", None
     finally:
         _release_transaction_lock(lock_fd)
     return "TIMEOUT", None
