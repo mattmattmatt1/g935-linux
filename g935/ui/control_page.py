@@ -89,6 +89,7 @@ def build_control_page(app, container, read_host_mic_fn, set_host_mic_fn):
         subtitle="On-headset DSP soundstage + host controls",
         header_widget=app.dsp_sw,
     )
+    mid_pair.set_child_packing(gk_card, True, True, 0, Gtk.PackType.START)
     app.mode_note = Gtk.Label(xalign=0)
     style(app.mode_note, "g935-caption")
     app.mode_note.set_line_wrap(True)
@@ -117,6 +118,7 @@ def build_control_page(app, container, read_host_mic_fn, set_host_mic_fn):
             subtitle="Boom position & ALSA capture",
             header_widget=app.mic_badge,
         )
+        mid_pair.set_child_packing(_mic_card, True, True, 0, Gtk.PackType.START)
         app.mic_big = Gtk.Label(xalign=0)
         style(app.mic_big, "g935-caption")
         app.mic_big.set_line_wrap(True)

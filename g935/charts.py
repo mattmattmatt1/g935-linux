@@ -525,7 +525,7 @@ class ExpectActualChart(_ChartBase):
 
         # delta badge (more useful than re-stating health)
         if delta_pct is not None:
-            sign = "+" if delta_pct >= 0 else "−"
+            sign = "+" if delta_pct >= 0 else "-"
             if delta_pct >= 10:
                 hc = pal["health_good"]
             elif delta_pct <= -15:
@@ -533,8 +533,8 @@ class ExpectActualChart(_ChartBase):
             else:
                 hc = pal["muted"]
             badge = f"{sign}{abs(delta_pct):.0f}% vs rated"
-            _pango_fit(cr, badge, box["x"] + box["w"], box["y"] - 2,
-                       size=11, color=hc, align="right")
+            _pango_fit(cr, badge, box["x"] + box["w"] - 4, box["y"] + 12,
+                       size=10.5, color=hc, align="right")
 
         self._axis_frame(cr, box, pal)
 

@@ -1,168 +1,18 @@
 # g935-linux — full Logitech G935 control on Linux
 
-A native GTK3 control panel and background service for the Logitech G935
-wireless headset. It talks directly to the receiver over HID++—no G HUB,
-Windows VM, or web account required.
+A native GTK3 control panel and single-owner background daemon for the
+**Logitech G935** wireless headset on Linux. It talks directly to the USB
+receiver over HID++—no G HUB, Windows VM, or cloud account required.
 
-[Latest release: v0.8.2](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.8.2)
-
-## What's new in v0.8.2
-
-**Volume stays on the headset.** Tray scroll, the earcup wheel, and G-key
-volume and mute write the G935 sink (0–200%), including while that sink is
-suspended. They use the default sink only when the headset node is gone. A
-failed sink listing during a wheel spin no longer jumps to another device.
-
-Also:
-
-- Wheel-up on the tray icon is louder, one notch per 5%
-- Volume and stream changes move the sliders and leave an open tray menu alone
-- The tray still registers if Plasma’s status host is not up yet at login
-- A second `--tray` start exits quietly when the panel is already running
-- A rejected HID report is a timeout, not an unplug, so it does not look like a power cycle
-- The daemon does not overwrite battery history while the panel is open
-
-Upgrade from v0.8.1:
-
-```bash
-git pull --ff-only
-./install.sh --user
-systemctl --user restart g935-dsp.service
-systemctl --user restart 'app-g935\x2dcontrol@autostart.service'
-```
-
-Udev does not need to be reinstalled.
-
-### Earlier: v0.8.1
-
-**Login tray autostart actually starts.** systemd’s XDG autostart generator
-runs before `~/.local/bin` is on `PATH`, so `Exec=g935-control --tray` was
-skipped (`Exec binary 'g935-control' does not exist`) and the tray icon never
-appeared after reboot. `./install.sh --user` now writes an absolute `Exec=` /
-`TryExec=` path.
-
-Also:
-
-- Wait for Plasma’s StatusNotifier host at login instead of skipping the tray
-- `--tray` no longer dies on a hidraw permission dialog while seat ACLs catch up
-
-Upgrade from v0.8:
-
-```bash
-git pull --ff-only
-./install.sh --user
-systemctl --user daemon-reload
-```
-
-Then log out/in, or start the tray now with `g935-control --tray`. Udev does
-not need to be reinstalled for this fix.
-
-### Earlier: v0.8
-
-**G0–G3 bindings.** The bottom earcup mute button is G0; G1–G3 sit above it.
-In software mode, tap defaults are next / play-pause / back / mic mute. Hold
-(0.45s) is a second action. Media goes through Plasma’s keys, then MPRIS.
-Hardware mode still uses G0 as on-device mute.
-
-**Idle HID++ reads no longer steal the other process’s ACK.** The panel drain
-path and the daemon’s leftover-report read take the same transaction lock as
-`transact()`, so a busy hidraw cannot invent a power cycle. Presence debounce
-from v0.7 stays as a backstop.
-
-Also in v0.8:
-
-- Tray icon on Plasma 6 Wayland (real app icon, `--tray`; login autostart
-  landed in v0.8.1)
-- HID++ feature/function probe (`tools/g935-probe.py`)
-- Reconnect reapplies EQ in RAM only (explicit **Apply EQ** still writes EEPROM)
-- The unmute pulse no longer blocks the daemon for 1.5s (wheel ramps keep moving)
-- The panel starts without the receiver plugged in (settings and battery history)
-- After login, the **daemon** retries hidraw `EACCES` until seat ACLs land
-- The user unit starts after `graphical-session.target`
-- udev grants `0660`/`plugdev` as a fallback next to `uaccess`
-- The daemon logs battery samples when the panel is closed
-- Console log is capped; earcup grab requires volume-key bits on the evdev node
-
-First-time udev / `plugdev` (needed once, or when rules change):
-
-```bash
-./install.sh --udev          # then unplug/replug the receiver
-sudo usermod -aG plugdev "$USER"   # once, if you are not already in plugdev
-```
-
-Log out/in (or reboot) after adding `plugdev`.
-
-### Earlier: v0.7 presence / reconnect
-
-False “headset offline” cycles from HID++ TIMEOUT under concurrent panel +
-daemon traffic no longer re-trigger power-on DSP enable and lighting/EQ storms.
-Presence debounce uses a longer miss streak and a post-connect grace window.
-Software-mode DSP self-heal is rate-limited.
-
-### Earlier: v0.6 low-battery notifications
-
-Desktop toasts at **≤10%** (low) and **≤5%** (critical) while discharging;
-silent while charging; re-check on unplug. Needs `libnotify-bin` and a running
-panel.
-
-## Earcup wheel (from v0.5)
-
-The physical volume wheel feels like a real analog control instead of an
-unpredictable media key. The receiver's press duration is decoded into smooth
-1% changes: tiny movements stay precise, long sweeps accelerate progressively,
-reversals are filtered, and wheel-up shares the 0–200% headset scale.
-
-The tested balanced profile works out of the box. Six live comfort controls
-let users tune fine adjustment, fine cadence, acceleration point, fast cadence,
-maximum sweep distance, and reversal protection to taste. Calibration is no
-longer required; raw capture and auto-fit remain available under collapsed
-diagnostics for unusual hardware behavior.
-
-![Earcup wheel comfort controls with balanced defaults](screenshots/volwheel.png)
-
-## What it controls
-
-- **Sound:** on-headset DSP soundstage, 10-band hardware EQ
-  (32 Hz–16 kHz, ±12 dB), 18 categorized presets, and sidetone.
-- **Microphone:** boom-up mute state, host mute recovery, mic-button handling
-  (bottom earcup key), and daemon-backed auto-unmute in software mode.
-- **G-keys:** bottom→top G0 (earcup mute button) … G3. Software-mode taps
-  default to next / play-pause / back / mic mute. Hold is a second action.
-  Hardware mode leaves G0 as on-device mute and G1–G3 on-headset.
-- **Lighting:** independent controls for both RGB zones, including fixed,
-  breathing, cycling, color, period, waveform, intensity, ramp, and boot
-  animation where supported.
-- **Battery:** live charge, voltage and runtime, learned drain history,
-  estimated battery health, full-charge runtime loss, auto power-off, and
-  desktop notifications at 10% (low) / 5% (critical) while discharging.
-- **Desktop audio:** output/input visibility, default-device selection, tray
-  mixer, and per-device volume. Headset volume is real Pulse/PipeWire percent
-  on the G935 sink, 0–200%. 100% is hardware 0 dB; past that is software gain.
-- **Earcup wheel:** short receiver presses become fine changes, while the
-  longer held signal produced by a fast sweep is decoded into a continuous
-  series of real 1% changes. Each sweep has a configurable 50% ceiling.
-  Wheel, tray scroll, G-key volume, and sliders share the same 0–200% scale.
-  USB-mixer writes are rate-limited and an oscillation circuit breaker freezes
-  abusive rapid reversals before they can flood the headset hardware.
-  Settings expose fine adjustment, fine cadence, acceleration point, fast
-  cadence, sweep limit, and reversal protection, with the tested profile as
-  the balanced default. An optional collapsed capture/auto-fit tool measures
-  press duration, shows the raw timeline, saves every event for debugging, and
-  can fit those controls to an individual wheel.
-- **Hardware:** live firmware and feature discovery, G0–G3 events, reconnect
-  recovery, automatic left-channel-only detection/repair, and an advanced
-  HID++ console tucked into a collapsed section.
-
-The panel only exposes controls the connected headset reports as supported.
-EQ and lighting changes can be saved in headset memory.
+[Latest release: v0.9.0](https://github.com/mattmattmatt1/g935-linux/releases/tag/v0.9.0)
 
 ## Screenshots
 
 | Control | Lighting |
 |---|---|
-| ![Control page with software mode, sidetone, microphone, ten-band EQ, and preset menu](screenshots/control.png) | ![Lighting page with independent RGB zone effects and colors](screenshots/lighting.png) |
+| ![Control page with 10-band Hardware EQ, live response curve, sidetone, software mode, and microphone](screenshots/control.png) | ![Lighting page with live animated G935 earcup RGB preview and dual-zone controls](screenshots/lighting.png) |
 | **Battery Health** | **Settings** |
-| ![Battery Health page with power management, health, runtime loss, live drain, and history](screenshots/battery.png) | ![Settings page with device visibility and volume sliders with a 100 percent safety stop](screenshots/settings.png) |
+| ![Battery Health page with animated battery dashboard, KPI tiles, 7-day curve, and runtime gauge](screenshots/battery.png) | ![Settings page with 0–200% headset volume, desktop audio mixer, and earcup wheel controls](screenshots/settings.png) |
 
 <details>
 <summary>Tray menu</summary>
@@ -171,19 +21,162 @@ EQ and lighting changes can be saved in headset memory.
 
 </details>
 
-## ⚠️ Tested on exactly one setup
+## What's new in v0.9.0
 
-This has only been tested on:
+**Single-owner daemon, native `libpulse` audio, wheel lockup fixes, and a redesigned UI.**
 
-- **Logitech G935** (wireless receiver, USB PID `0a87`)
-- **Kubuntu / Ubuntu 26.04 LTS**, KDE Plasma 6.6 on **Wayland**, PipeWire
-- Python 3.14
+- **No more earcup-wheel reversal lockups:** Rewrote wheel pacing around a
+  post-write USB-mixer cooldown, 2% coalescing, 60 ms reversal settle,
+  same-buffer reversal cancellation, and held-reversal burst detection so rapid
+  up/down reversals can no longer freeze the headset or PipeWire mixer.
+- **Single-owner hardware daemon (`g935-dspd`):** The daemon now exclusively
+  owns `/dev/hidraw*`, `/dev/input/event*`, battery logging (`health.json`),
+  low-battery notifications, and headless G0–G3 tap/hold bindings. The GTK3
+  panel connects over a local UNIX JSON-RPC + event stream socket
+  (`$XDG_RUNTIME_DIR/g935-dspd.sock`, mode `0600`), eliminating cross-process
+  HID++ collisions and write races. If the daemon isn't running, the panel
+  transparently falls back to direct `hidraw`.
+- **Native `libpulse` client (`g935/pulse.py`):** Volume reads, writes, mute
+  toggles, and topology subscriptions talk directly to PipeWire/PulseAudio over
+  `ctypes` (`libpulse.so.0`, zero external Python packages) instead of spawning
+  `pactl` subprocesses on every tick, with transparent `pactl` fallback.
+- **Redesigned modular GTK3 UI (`g935/ui/`):**
+  - **Control:** 10-band Hardware EQ promoted to the top with a live smooth
+    Cairo frequency-response curve, followed by sidetone, a compact side-by-side
+    Software Mode + Microphone row, and collapsible G0–G3 bindings.
+  - **Lighting:** Live animated G935 earcup RGB preview (Zone 0 G-logo + Zone 1
+    front strip) responding in real time to mode, color, period, intensity, and
+    all 7 breathing waveforms before hitting **Apply**.
+  - **Battery Health:** Animated battery dashboard with ETA, 5 live KPI tiles,
+    and the 7-day charge curve immediately above the fold.
+  - **Zero idle churn:** Animations and heavy 7-day battery analytics only run
+    when the window is visible **and** their respective tab is active.
+- **Reliability fixes:** Stale `hidraw` reply draining and `EAGAIN`/`EINTR`
+  write retries, event-driven `select()` wakeup pipe in `HidWorker`, DST-safe
+  chart midnight ticks, Plasma notification replace-ID tracking (`--print-id`),
+  and charging-rail debounce hardening.
 
-Anything else — other headsets, other distros, GNOME, X11, PulseAudio — is
-uncharted. The code tries to degrade gracefully (features it can't discover are
-hidden, unknown devices prompt before probing), but you're in test-pilot
-territory. **Issues or success reports: hit me up on X
-[@MatthewPhone](https://x.com/MatthewPhone)** or open a GitHub issue.
+### Upgrade from v0.8.x
+
+```bash
+git pull --ff-only
+./install.sh --user
+systemctl --user daemon-reload
+systemctl --user restart g935-dsp.service
+systemctl --user restart 'app-g935\x2dcontrol@autostart.service'
+```
+
+Udev does not need to be reinstalled if you already installed v0.8 rules.
+
+---
+
+## Architecture
+
+```
+                         ┌──────────────────────────────────────────────┐
+                         │           g935-dspd (user service)           │
+  /dev/hidraw* ◄────────►│  • Single HID++ 2.0 owner & event reader     │
+  /dev/input/event* ────►│  • Earcup wheel decoder & reversal guard     │
+                         │  • Boom-mic unmute pulse & headless G0–G3    │
+  PipeWire / Pulse ◄────►│  • Native libpulse client (pactl fallback)   │
+  ~/.config/g935/ ◄─────►│  • Battery sampler, health.json, alerts      │
+                         └──────────────────────┬───────────────────────┘
+                                                │
+                         UNIX socket (0600): $XDG_RUNTIME_DIR/g935-dspd.sock
+                         Line-delimited JSON-RPC + broadcast event stream
+                                                │
+                         ┌──────────────────────▼───────────────────────┐
+                         │         g935-control (GTK3 + tray)           │
+                         │  • DeviceClient (daemon-first, direct        │
+                         │    hidraw fallback when daemon is stopped)   │
+                         │  • Modular pages + Cairo live visuals        │
+                         │  • PipeWire stereo-route watcher & repair    │
+                         └──────────────────────────────────────────────┘
+```
+
+- **Zero external Python dependencies:** Everything uses Python's standard
+  library plus system `python3-gi` (GTK3/Cairo) and `libpulse.so.0` via
+  `ctypes`.
+- **Single source of truth for hardware & health logs:** Because `g935-dspd`
+  serializes all HID++ transactions and owns `~/.config/g935/health.json`,
+  opening or closing the panel never races with background battery sampling,
+  power-on DSP restoration, or boom-mic handling.
+- **IPC methods (`g935/daemon_ipc.py`):** `get_state`, `hidpp`, `set_mode`,
+  `pause_wheel` (client-scoped for calibration), `update_health_settings`, and
+  `set_host_mic`, paired with server-pushed `battery`, `presence`, `mode`,
+  `mic`, `boom`, `hidpp_event`, and `link` events.
+
+---
+
+## What it controls
+
+- **Sound & EQ:** 10-band on-device hardware EQ (32 Hz–16 kHz, ±12 dB) with a
+  live response curve, 18 categorized presets, on-headset DSP soundstage toggle,
+  and sidetone (0–100%).
+- **Microphone:** Live boom-up/down status, ALSA host capture switch, one-click
+  unstick, and daemon-managed auto-unmute in software mode.
+- **G-keys (G0–G3):** Bottom→top `G0` (earcup mute button) through `G3`. In
+  software mode, tap defaults are next / play-pause / previous / mic mute, with
+  a configurable second action on 0.45 s hold. Works even when the panel is
+  closed as long as `g935-dspd` is running.
+- **Lighting:** Live animated earcup preview plus independent controls for both
+  RGB zones (Logo & Strip): Off, Fixed, Breathing (7 waveforms), Cycling,
+  color, period, intensity, ramp, and boot animation where supported.
+- **Battery Health:** Animated live battery readout, ETA, wear %, runtime lost
+  per full charge, 7-day charge/discharge curve, expected vs. actual runtime,
+  learned drain profile (mV/h by voltage bin), session history, auto power-off
+  timeout, and desktop notifications at **≤10%** (low) and **≤5%** (critical)
+  while discharging.
+- **Desktop audio & headset volume:** Output/input visibility, default-device
+  switching, tray mixer, and real PipeWire/PulseAudio 0–200% volume on the G935
+  sink (0–100% USB hardware mixer, 101–200% software gain).
+- **Earcup wheel:** Smooth duration-decoded ramps on the 0–200% headset scale
+  with USB-mixer pacing, reversal guard, 6 live comfort controls, and a
+  collapsible raw capture / auto-fit diagnostics tool.
+- **Hardware & diagnostics:** Live firmware & HID++ feature discovery, control
+  link status (daemon vs. direct), automatic left-ear-only PipeWire stereo
+  detection/repair, and a collapsed raw HID++ console.
+
+The panel only exposes controls the connected headset reports as supported.
+Explicit **Apply** saves EQ and lighting into headset EEPROM; reconnects
+re-apply RAM state only.
+
+## Earcup wheel
+
+The physical volume wheel feels like a smooth analog control instead of a
+jumpy media key. Short receiver presses make precise 1% steps, longer sweeps
+accelerate progressively up to a configurable sweep ceiling, and rapid
+up/down reversals are damped before they can flood the USB mixer.
+
+![Earcup wheel comfort controls](screenshots/volwheel.png)
+
+## The interface
+
+| Page | What is there |
+|---|---|
+| **Control** | 10-band Hardware EQ with live frequency-response curve and categorized presets at the top, followed by sidetone, side-by-side Software Mode & Microphone cards, and collapsible G0–G3 tap/hold bindings |
+| **Lighting** | Live animated G935 earcup RGB preview (Logo + Strip) above side-by-side zone controls and EEPROM Read/Load/Apply actions |
+| **Battery Health** | Animated battery dashboard with ETA, auto-off, and 5 KPI tiles, 7-day battery curve above the fold, health gauge + expected-vs-actual bars, session & drain charts, and collapsible spec/tracking settings |
+| **Hardware** | Firmware, discovered HID++ features, control-link transport, stereo-route status/repair, and collapsed raw HID++ console |
+| **Settings** | 0–200% headset volume bar, desktop audio mixer, earcup-wheel comfort controls (with collapsible diagnostics/auto-fit), and collapsible tray/mixer device visibility |
+
+Scroll-wheel input passes over sliders normally until you click a slider once,
+preventing accidental EQ, sidetone, or volume changes while scrolling a page.
+
+---
+
+## Tested environment
+
+This project is actively tested on:
+
+- **Logitech G935** (wireless USB receiver, PID `046d:0a87`)
+- **Kubuntu / Ubuntu 26.04 LTS**, KDE Plasma 6.6 on **Wayland**, PipeWire 1.6
+- Python 3.14 (unit tests also verified in CI on Python 3.12)
+
+Other headsets, distros, GNOME, X11, or classic PulseAudio should degrade
+gracefully (undiscovered features hide automatically, unknown devices prompt
+before probing), though they are less tested. **Issues or success reports:**
+open a GitHub issue or reach out on X [@MatthewPhone](https://x.com/MatthewPhone).
 
 ## Prerequisites
 
@@ -192,18 +185,13 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
                  alsa-utils pulseaudio-utils pipewire-bin libnotify-bin
 ```
 
-- `python3-gi` + GTK3 — the control panel
-- `gir1.2-ayatanaappindicator3-0.1` — tray icon (optional; without it the app
-  runs windowed)
-- `alsa-utils` (`amixer`) — boom-mic mute handling in software mode
-- `pulseaudio-utils` (`pactl`) — audio device pickers/volume (works with
-  PipeWire's PulseAudio-compatible server too)
-- `pipewire-bin` (`pw-link`) — detects and repairs the left-ear-only route
-  that can appear after suspend
-- `libnotify-bin` (`notify-send`) — desktop warnings for stereo-route breaks
-  and low / critical battery while discharging
-- `python3-hid` (or `pip install hid`) — only for the standalone
-  `tools/g935-enable.py` hidapi path; the GUI and daemon don't need it
+- `python3-gi` + `gir1.2-gtk-3.0` — GTK3 control panel and Cairo charts/visuals
+- `gir1.2-ayatanaappindicator3-0.1` — system tray icon (optional; runs windowed without it)
+- `alsa-utils` (`amixer`) — boom-mic ALSA capture switch handling in software mode
+- `libpulse0` / `pulseaudio-utils` — native `libpulse` audio control with `pactl` fallback
+- `pipewire-bin` (`pw-link`) — detects and repairs left-ear-only routes after suspend
+- `libnotify-bin` (`notify-send`) — desktop warnings for stereo-route breaks and low/critical battery
+- `python3-hid` — only needed for standalone research scripts in `tools/`; not used by the panel or daemon
 
 ## Install or upgrade
 
@@ -213,22 +201,26 @@ sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
 git clone https://github.com/mattmattmatt1/g935-linux.git
 cd g935-linux
 
-# Install the udev rule and mic-mute hwdb:
+# 1. Install udev rule (hidraw/input access) and mic-mute hwdb:
 ./install.sh --udev
-# Unplug and reconnect the wireless receiver after this step.
+sudo usermod -aG plugdev "$USER"   # once, if not already in plugdev
+# Unplug and replug the wireless receiver (and log out/in if plugdev was added).
 
-# Install the panel, shared Python package, command, and user service:
+# 2. Install the package, CLI entrypoints, user service, and login tray autostart:
 ./install.sh --user
-# or: make install-user
+# (or: make install-user)
 
-# Launch:
+# 3. Enable the single-owner background daemon:
+systemctl --user enable --now g935-dsp
+
+# 4. Launch the control panel:
 g935-control
 ```
 
-`./install.sh --user` also installs `~/.config/autostart/g935-control.desktop`
-(absolute `Exec=` so systemd actually starts it). The next login puts the
-panel in the tray (`g935-control --tray`). You can also run
-`python3 g935-control.py` directly from the checkout.
+`./install.sh --user` installs `~/.config/autostart/g935-control.desktop` with
+an absolute `Exec=` path so systemd's XDG autostart generator launches the tray
+icon cleanly at login (`g935-control --tray`). You can also run
+`python3 g935-control.py` directly from a checkout.
 
 ### Upgrade an existing checkout
 
@@ -236,196 +228,168 @@ panel in the tray (`g935-control --tray`). You can also run
 git pull --ff-only
 ./install.sh --user
 systemctl --user daemon-reload
-systemctl --user reenable --now g935-dsp
+systemctl --user restart g935-dsp.service
+systemctl --user restart 'app-g935\x2dcontrol@autostart.service'
 ```
 
-Quit and reopen the panel after upgrading. Re-running `--user` always matters:
-it copies the shared `g935/` package and both launch scripts into
-`~/.local/share/g935-linux/`.
+Re-running `./install.sh --user` refreshes `~/.local/share/g935-linux/`
+(including all `g935/` and `g935/ui/` modules) and both `~/.local/bin/`
+launchers. Re-run `./install.sh --udev` only when `99-g935.rules` or
+`70-g935-micmute.hwdb` changes.
 
-**Udev** is needed once per machine and again when rules change (v0.8 adds a
-`plugdev` fallback). If you installed before v0.5 and the earcup wheel cannot
-open `/dev/input/event*`, or you are upgrading to v0.8, re-run:
-
-```bash
-./install.sh --udev
-# then unplug and reconnect the wireless receiver
-```
-
-### Background service
-
-Enable the user service for software-mode mic handling and automatic DSP
-restoration whenever the headset powers on:
-
-```bash
-systemctl --user enable --now g935-dsp
-```
-
-The panel works without the service in hardware mode.
-
-## The interface
-
-| Page | What is there |
-|---|---|
-| **Control** | 10-band hardware EQ with live frequency-response curve and categorized presets at the top, followed by sidetone, software/hardware mode & microphone status, and collapsible G0–G3 tap/hold bindings |
-| **Lighting** | live animated G935 earcup RGB preview (G-logo + front strip) above side-by-side Logo and Primary/Strip controls |
-| **Battery Health** | animated battery dashboard with ETA & 5 live KPI tiles, 7-day charge curve above the fold, health gauge, expected-vs-actual runtime, learned drain profile, and collapsible power/spec settings |
-| **Hardware** | firmware, discovered HID++ features, control-link status, stereo-route state/repair, and the collapsed advanced console |
-| **Settings** | 0–200% headset volume, earcup-wheel comfort controls (with optional calibration), and collapsible audio device mixer/visibility |
-
-Scroll-wheel input passes over sliders normally until you click a slider once,
-preventing accidental EQ, sidetone, or volume changes while scrolling a page.
+---
 
 ## Volume: why 100% is quieter than Windows
 
-Linux 100% on this headset is the USB mixer’s **0 dB** stop (`HW_VOLUME_CTRL`).
-Windows G HUB adds extra digital gain on top, so the same “max” is louder there.
+Linux 100% on the G935 is the USB mixer's **0 dB** stop (`HW_VOLUME_CTRL`).
+Windows G HUB adds extra digital gain on top, so "100%" is louder there.
 
-**Loudness is the G935 Pulse/PipeWire volume.** Raising HDMI/IEC958 does
-nothing while you are listening on the headset. If you run EasyEffects in
-front of the G935, lock that sink at 100% and keep using the G935 node as the
-volume control — EasyEffects’ own volume is ignored on the monitor/filter
-path, and this panel hides `easyeffects_*` devices so they are not mixed here.
+**Loudness lives on the G935 PipeWire/PulseAudio sink.** Raising HDMI or
+analog speakers does nothing while listening on the headset. If you place
+EasyEffects in front of the G935, leave EasyEffects at 100% and adjust the
+G935 node itself (`easyeffects_*` nodes are hidden from this panel).
 
-To match Windows, set the **G935 sink** past 100%. PipeWire applies software
-gain on that node (`channelVolumes` / `softVolumes`). 150% is about **+10.6 dB**.
-The panel **Headset volume** bar, tray scroll, earcup wheel, and G-key volume
-and mute all write that real percent, 0–200%. 100% is marked as hardware max;
-the bar does not stop there.
+To match Windows loudness, slide the **G935 sink** past 100% (PipeWire applies
+software gain; 150% is roughly **+10.6 dB**). The panel's **Headset volume**
+slider, tray scroll, earcup wheel, and G-key volume actions all operate on that
+real 0–200% scale with a clear `100% HW` marker.
 
 ```bash
-# sanity check — this is the control that actually changes loudness
+# Sanity check — this is the node that actually controls loudness:
 pactl set-sink-volume alsa_output.usb-Logitech_G935_Gaming_Headset-00.analog-stereo 150%
 pactl get-sink-volume alsa_output.usb-Logitech_G935_Gaming_Headset-00.analog-stereo
 ```
 
-Do not remap 0–100% UI onto 0–150% Pulse. That hid the extra range and made
-the 100% mark a dead stop. Show the real Pulse percent past 100% instead.
-
-Plasma’s own volume popup/OSD is separate. Enable **Raise maximum volume**
-in System Settings → Sound if you want that popup to go past 100%. Plasma
-hard-codes a **150%** cap (`PulseAudio.MaximalVolume`) and cannot show 200%.
-Headset volume in this panel, the earcup wheel, G-key volume, and tray scroll
-still go to 200%. This repo does not write `~/.config/plasmaparc`.
+Plasma's built-in volume OSD caps display at 150% (`PulseAudio.MaximalVolume`,
+once **Raise maximum volume** is enabled in System Settings → Sound), while
+`g935-control`, the earcup wheel, tray scroll, and G-keys still reach 200%.
 
 ## The two modes
 
-The headset has a mode switch (`11 ff 05 2b 01/00`) that changes more than sound.
-**Default is hardware mode** (safe without the daemon). Flip the switch in the
-GUI for software mode—the G HUB-style host-managed behavior.
+The headset exposes a firmware mode switch (`11 ff 05 2b 01/00`) that governs
+both audio processing and button routing. **Default is hardware mode** (safe
+without the daemon). Flip **Software mode** on the Control page for the
+G HUB-style host-managed mode.
 
 | | **Hardware mode** (default) | **Software mode** |
 |---|---|---|
-| Sound | flat/narrow | DSP soundstage on |
-| Boom mute | handled fully in firmware, just works | host must manage it (`g935-dspd`) |
-| Mic button | works on-device | only emits an event (daemon handles it) |
-| G0–G3 | G0 is on-device mute; G1–G3 stay on-headset | diverted HID++ events; software bindings |
+| Sound | Flat / narrow | On-headset DSP soundstage ON |
+| Boom mute | Handled in firmware | Host-managed by `g935-dspd` |
+| Mic button | On-device mute | Diverted as `G0` tap/hold |
+| G1–G3 | On-headset macros | Diverted HID++ events (`G1`–`G3` bindings) |
 
-Mode is stored in `~/.config/g935/mode` and re-asserted by the daemon on every
-power-on. **If you use software mode, run the daemon.** Without it, raising the
-boom mutes the mic and nothing will unmute it (the panel warns you).
+Mode is persisted in `~/.config/g935/mode` and re-asserted by `g935-dspd` on
+every power-on. **Run `g935-dspd` whenever using software mode** — without it,
+raising the boom mutes the mic and nothing clears the latch.
 
 ### Who owns what
 
 | Job | Daemon running (`g935-dspd`) | Standalone (no daemon) |
 |---|---|---|
-| `/dev/hidraw*` & `/dev/input/event*` | **daemon** (single hardware owner; panel connects over `$XDG_RUNTIME_DIR/g935-dspd.sock`) | control panel (direct hidraw fallback) |
+| `/dev/hidraw*` & `/dev/input/event*` | **daemon** (single hardware owner; panel connects over `$XDG_RUNTIME_DIR/g935-dspd.sock`) | control panel (direct `hidraw` fallback) |
 | Power-on DSP enable & boom mute | **daemon** | control panel (no software auto-unmute) |
 | Earcup wheel & headless G0–G3 bindings | **daemon** (native `libpulse` with `pactl` fallback) | panel handles G0–G3 while open |
 | Battery logging & low-battery alerts | **daemon** (streams live updates to panel) | control panel |
 | EQ / lighting / sidetone / mode switch | panel via daemon IPC | control panel |
 
-## Battery health
+## Battery health & stereo repair
 
-The Battery Health tab logs voltage samples while the panel is open and builds:
+### Voltage-based battery health
 
-- **Battery wear and runtime lost per full charge** in a high-visibility summary
-- **Live remaining runtime** from recent discharge datapoints
-- **Expected vs actual** comparison against the rated runtime spec
-- **Learned drain profile** (mV/h by voltage bin) and session history graphs
+`g935-dspd` logs voltage samples continuously to `~/.config/g935/health.json`
+(even with the panel closed) and streams live readings to the panel:
 
-Data lives in `~/.config/g935/health.json`. The panel writes samples while it
-is open. If the daemon is running and the panel is closed, the daemon records
-the same voltage log so overnight / tray-less sessions still count. Health %
-needs longer off-charger sessions (merged ≥30 min / ≥8% drop); short sessions
-still feed live ETA and the profile. No coulomb counter exists — this is an
-honest voltage-based extrapolation, not a BMS.
+- **Wear & runtime lost per full charge** from longer off-charger sessions
+  (merged ≥30 min / ≥8% drop; short sessions still feed live ETA and drain bins)
+- **Live remaining runtime** and **expected vs. actual** bars against the
+  rated spec (8 h RGB on / 12 h RGB off, customizable)
+- **7-day charge & discharge curve** and **learned drain profile** (mV/h)
 
-**While charging**, the headset ADC often reports the *charger path* (rail
-spikes above 4.2 V), not resting cell voltage. The UI freezes SoC at the last
-off-charger reading and shows path mV separately; full-charge peaks are taken
-from rest after unplug, never from rail spikes.
+Because the G935 has no coulomb counter, this is an honest voltage-based
+extrapolation. While charging, the ADC frequently reads the **charger rail**
+(>4.2 V) rather than resting cell voltage — the tracker holds SoC at the last
+off-charger reading, shows charger path mV separately, and only records
+full-charge peaks from post-unplug rest.
 
-**Low battery notifications** fire once per discharge cycle via `notify-send`
-(notification tray): **low at ≤10%**, **critical at ≤5%**. Alerts are suppressed
-while charging. Unplugging re-checks immediately (unplug at 8% → low; at 4% →
-critical). Alerts also re-arm after SoC recovers past the threshold (with
-hysteresis so ADC noise near the boundary does not spam).
+**Low-battery notifications** fire once per discharge cycle via `notify-send`
+at **≤10%** (low) and **≤5%** (critical), stay silent while charging, re-check
+immediately on unplug, and use hysteresis + server-assigned notification IDs so
+Plasma never logs stale replace-ID warnings.
 
 ### Left-ear-only after sleep
 
 After suspend/resume, PipeWire/EasyEffects sometimes re-links only the left
-channel into the G935 (`playback_FL`) and leaves the right port unconnected
-(often named `playback_2`). The control panel checks every few seconds, shows
-a **🎧 L-only** warning + banner, desktop-notifies, and auto-runs `pw-link` to
-restore FR. Tray menu also gets **Fix stereo** while broken.
+channel (`playback_FL`) into the G935 and leaves the right channel (often
+`playback_2`) unlinked. The control panel monitors the graph, shows a
+**🎧 L-only** chip and banner, sends a notification, and automatically calls
+`pw-link` to restore stereo.
 
-## Layout
+---
+
+## Repository layout
 
 | Path | Purpose |
 |---|---|
-| `g935-control.py` | GTK3 control panel (daemon-first client with direct hidraw fallback) |
-| `g935-dspd.py` + `g935-dsp.service` | single-owner hardware daemon (HID++, wheel, boom mute, battery log, local UNIX JSON-RPC) |
-| `g935/` | shared library (HID++, `libpulse` audio client, daemon IPC, wheel, mic, battery, charts) |
-| `g935/ui/` | modular GTK3 pages, Cairo centerpiece visuals, tray controller, theme CSS, wheel calibration |
-| `99-g935.rules` | udev rule granting hidraw access |
-| `70-g935-micmute.hwdb` | masks KEY_MICMUTE so the desktop stays out of software mode |
-| `tools/` | research scripts (enable replay, sequence bisector) |
-| `tests/` | offline unit tests (`make test`) |
-| `install.sh` / `Makefile` | user + udev install (writes `~/.config/autostart/g935-control.desktop`) |
-| `easyeffects-g935.json` | optional EasyEffects preset (software EQ route) |
+| `g935-control.py` | GTK3 control panel (daemon-first client with direct `hidraw` fallback) |
+| `g935-dspd.py` + `g935-dsp.service` | Single-owner hardware daemon (HID++, wheel, boom mute, headless G-keys, battery log, UNIX JSON-RPC) |
+| `g935/` | Core library: `hidpp.py`, `pulse.py`, `daemon_ipc.py`, `device_client.py`, `volume_wheel.py`, `audio.py`, `battery.py`, `charts.py`, `bindings.py`, `features.py`, `mic.py`, `stereo_route.py`, `mode.py`, `app_settings.py` |
+| `g935/ui/` | Modular GTK3 UI: `control_page.py`, `lighting_page.py`, `battery_page.py`, `hardware_page.py`, `settings_page.py`, `visuals.py`, `lighting_math.py`, `theme.py`, `tray.py`, `wheel_calibration.py` |
+| `99-g935.rules` | udev rule granting `uaccess` + `plugdev` access to receiver `hidraw` and `input` nodes |
+| `70-g935-micmute.hwdb` | Masks `KEY_MICMUTE` so the desktop does not double-toggle mic mute in software mode |
+| `tools/` | Research & protocol utilities (`g935-probe.py`, `g935-enable-v2.py`, `g935-step.py`) |
+| `tests/` | Offline unit test suite (`make test`, 200+ pure-stdlib tests) |
+| `install.sh` / `Makefile` | User & udev installer + test/compile targets |
+| `easyeffects-g935.json` | Optional EasyEffects preset |
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| Permission denied on hidraw | `./install.sh --udev`, add yourself to `plugdev`, then replug the receiver |
-| Daemon logs `permission denied` for ~1 min after login | upgrade to v0.8 or later; `systemctl --user reenable --now g935-dsp`. It waits for seat ACLs instead of failing the session |
-| Tray icon missing (GNOME) | install AppIndicator extension, or run windowed |
-| Tray icon missing (Plasma) | the icon is the **panel**, not the daemon. `./install.sh --user` then `g935-control --tray`. Login autostart uses an **absolute** `Exec=` path (`~/.local/bin/g935-control --tray`) because systemd’s autostart generator does not search `PATH`. Look in the tray overflow (▲) if Application Status is hidden |
-| Mic stuck muted after boom up | enable daemon: `systemctl --user enable --now g935-dsp`, or switch to hardware mode |
-| "press unmute twice" | install `70-g935-micmute.hwdb` via `./install.sh --udev` |
-| Sound flat after power cycle | daemon not running, or mode is hardware — enable daemon / flip software mode |
-| Headset flickers offline / DSP re-enables every ~15–60s | upgrade to v0.8 or later; `./install.sh --user` and `systemctl --user reenable --now g935-dsp`, then reopen the panel |
-| Only the left ear works after sleep | install `pipewire-bin`; the panel should detect and repair the missing right-channel link |
-| Panel dead after unplug/replug | should auto-recover; if not, restart the panel (file a bug) |
-| Panel will not start with the dongle unplugged | upgrade to v0.8 or later — settings and battery history open offline |
-| `g935-control: command not found` | ensure `~/.local/bin` is on `PATH`, or run `python3 g935-control.py` |
-| Desktop file won’t launch from file manager | use the installed `g935-control` command / app menu entry, not the raw `.desktop` in the git checkout |
+| Permission denied on `hidraw` / `input` | `./install.sh --udev`, `sudo usermod -aG plugdev "$USER"`, replug receiver (and re-login if newly added to `plugdev`) |
+| Daemon logs `permission denied` briefly after login | Normal for a few seconds while seat ACLs settle; `g935-dspd` retries automatically |
+| Tray icon missing (Plasma) | The tray icon belongs to `g935-control --tray`, not `g935-dspd`. Run `./install.sh --user` so autostart has an absolute `Exec=` path, and check the tray overflow (▲) |
+| Tray icon missing (GNOME) | Install an AppIndicator extension, or run windowed |
+| Mic stuck muted after boom up | Ensure `g935-dspd` is active (`systemctl --user enable --now g935-dsp`), or switch to hardware mode |
+| "Press unmute twice" | Install `70-g935-micmute.hwdb` via `./install.sh --udev` |
+| Sound flat after power cycle | Enable `g935-dsp` and toggle **Software mode** on |
+| Only the left ear works after sleep | Install `pipewire-bin`; the panel detects and repairs the missing right link automatically |
+| `g935-control: command not found` | Add `~/.local/bin` to `PATH`, or run `python3 g935-control.py` |
 
 ## Development
 
 ```bash
-make test       # offline unit tests
+make test       # offline unit tests (pure stdlib; runs identically in CI)
 make compile    # bytecode compile check
 ```
 
-Research tools (fixed feature indices from 2026-07 captures; GUI discovers live):
+Research tools (fixed feature indices from captures; the GUI discovers live):
 
 ```bash
-python3 tools/g935-enable-v2.py   # full cold-connect with ACK/ERR
-python3 tools/g935-step.py        # interactive sequence bisector
-python3 tools/g935-probe.py       # GET-only feature/function sweep
-python3 tools/g935-probe.py --dry-run
+python3 tools/g935-enable-v2.py             # cold-connect sequence replay with ACK/ERR
+python3 tools/g935-step.py                  # interactive sequence bisector
+python3 tools/g935-probe.py --dry-run       # GET-only feature/function sweep
 python3 tools/g935-probe.py --followup --unlock-hidden
 ```
 
-`g935-probe.py` walks `IFeatureSet`, asks `IRoot getFeature` for a curated
-ID catalog (including `0x8320` Headset Out and `0x1E00` Enable Hidden
-Features), then sweeps functions `0–15` on each live feature. Known SET
-and DFU writes are skipped so zero-padded reports cannot flip software
-mode or write EQ/lighting. `--wide` / `--full` expand the ID space;
-`--unlock-hidden` is the only opt-in SET. See `notes/PROBE.md`.
+<details>
+<summary>Earlier release notes (v0.8.2 → v0.5)</summary>
+
+- **v0.8.2:** Keep volume on the G935 sink (including while suspended); tray
+  scroll 5% per notch; wait for Plasma StatusNotifier host; quiet duplicate
+  `--tray` exit; protect battery history from concurrent writes.
+- **v0.8.1:** Absolute `Exec=`/`TryExec=` in login autostart `.desktop` so
+  systemd starts the tray after reboot; quiet hidraw permission wait on `--tray`.
+- **v0.8:** G0–G3 tap/hold bindings; `hidraw` transaction locking; Plasma 6
+  Wayland tray icon; HID++ probe tool; RAM-only EQ on reconnect; non-blocking
+  boom unmute pulse; offline panel startup; `plugdev` udev fallback; daemon-side
+  battery logging.
+- **v0.7:** Presence debounce and reconnect grace window; rate-limited DSP
+  self-heal.
+- **v0.6:** Low (≤10%) and critical (≤5%) discharging battery notifications.
+- **v0.5:** Smooth duration-decoded earcup volume wheel with acceleration and
+  comfort controls.
+
+</details>
 
 ## License
 
