@@ -22,6 +22,7 @@ import subprocess
 import time
 
 from g935.paths import config_dir
+from g935.pulse import PulseClient, libpulse_available
 from g935.stereo_route import is_g935_sink
 
 EV_KEY = 0x01
@@ -351,11 +352,23 @@ class VolumeWheel:
 
     def __init__(self, log=None, settings_loader=load_wheel_settings,
                  calibration_loader=load_wheel_calibration,
-                 command_runner=None):
+                 command_runner=None, pulse_client=None):
         self.log = log or logging.getLogger("g935.volume_wheel")
         self.settings_loader = settings_loader
         self.calibration_loader = calibration_loader
+        self._custom_runner = command_runner is not None
         self.command_runner = command_runner or self._run
+        self._pulse = pulse_client
+        self._owns_pulse = False
+        if (self._pulse is None and not self._custom_runner
+                and libpulse_available()):
+            client = PulseClient(app_name="g935-dspd-wheel")
+            if client.connected:
+                self._pulse = client
+                self._owns_pulse = True
+            else:
+                client.close()
+        self.paused = False
         self.fd = None
         self.path = None
         self.next_retry = 0.0
@@ -388,9 +401,23 @@ class VolumeWheel:
             env=_AUDIO_ENV, timeout=2,
         )
 
+    def set_paused(self, paused: bool) -> None:
+        """Temporarily release the evdev grab (e.g. during calibration)."""
+        paused = bool(paused)
+        if paused == self.paused:
+            return
+        self.paused = paused
+        if paused:
+            self.close("paused for calibration")
+        else:
+            self.next_retry = 0.0
+
     def maintain(self, now=None):
         """Open/close the wheel as settings, permissions, and devices change."""
         now = time.monotonic() if now is None else now
+        if self.paused:
+            self.close("paused for calibration")
+            return
         enabled, _step = self.settings_loader()
         if not enabled:
             self.close("disabled in Settings")
@@ -398,7 +425,7 @@ class VolumeWheel:
         if self.fd is not None or now < self.next_retry:
             return
         self.next_retry = now + RETRY_S
-        if shutil.which("pactl") is None:
+        if self._pulse is None and shutil.which("pactl") is None:
             return
         path = find_wheel_device()
         if path is None:
@@ -628,36 +655,52 @@ class VolumeWheel:
             return None
         return max(0.0, min(deadlines) - now)
 
+    def shutdown(self):
+        self.close("daemon stopping")
+        if self._owns_pulse and self._pulse is not None:
+            self._pulse.close()
+            self._pulse = None
+
     def _volume_target(self):
         """G935 sink when it exists, otherwise whatever is the default.
 
         The earcup wheel is on the headset. ``@DEFAULT_SINK@`` follows HDMI
         or speakers when those are selected, so a spin would change the
         wrong device. The name is cached for a couple of seconds so a fast
-        sweep does not run ``pactl list`` on every percent.
+        sweep does not query the sink list on every percent.
         """
         now = time.monotonic()
         if self._sink_name and now < self._sink_until:
             return self._sink_name
-        reply = None
-        try:
-            reply = self.command_runner("list", "short", "sinks")
-        except (OSError, subprocess.SubprocessError):
-            reply = None
-        listed = reply is not None and not reply.returncode
+        listed = False
         found = None
-        if listed:
-            for line in (reply.stdout or "").splitlines():
-                parts = line.split("\t") if "\t" in line else line.split()
-                if len(parts) >= 2 and is_g935_sink(parts[1]):
-                    found = parts[1]
-                    break
+        if self._pulse is not None and not self._custom_runner:
+            ok, devs = self._pulse.list_sinks()
+            if ok:
+                listed = True
+                for dev in devs:
+                    if is_g935_sink(dev.name, dev.description):
+                        found = dev.name
+                        break
+        else:
+            reply = None
+            try:
+                reply = self.command_runner("list", "short", "sinks")
+            except (OSError, subprocess.SubprocessError):
+                reply = None
+            listed = reply is not None and not reply.returncode
+            if listed:
+                for line in (reply.stdout or "").splitlines():
+                    parts = line.split("\t") if "\t" in line else line.split()
+                    if len(parts) >= 2 and is_g935_sink(parts[1]):
+                        found = parts[1]
+                        break
         if found:
             self._sink_name = found
             self._sink_until = now + 2.0
             return found
         # A failed list is not proof the headset node left. Keep the last
-        # real name so one pactl error during a spin does not hit HDMI.
+        # real name so one error during a spin does not hit HDMI.
         # A successful list with no G935 node does fall through.
         if (not listed and self._sink_name
                 and is_g935_sink(self._sink_name)):
@@ -668,8 +711,13 @@ class VolumeWheel:
         return self._sink_name
 
     def _read_volume(self):
-        current_reply = self.command_runner(
-            "get-sink-volume", self._volume_target())
+        target = self._volume_target()
+        if self._pulse is not None and not self._custom_runner:
+            dev = self._pulse.get_device("sink", target)
+            if dev is not None:
+                return dev.volume_pct
+            raise RuntimeError("pulse get_device failed")
+        current_reply = self.command_runner("get-sink-volume", target)
         values = [
             int(value)
             for value in _PERCENT_RE.findall(current_reply.stdout or "")
@@ -679,8 +727,13 @@ class VolumeWheel:
         return round(sum(values) / len(values))
 
     def _set_volume(self, target):
+        sink = self._volume_target()
+        if self._pulse is not None and not self._custom_runner:
+            if not self._pulse.set_volume("sink", sink, int(target)):
+                raise RuntimeError("pulse set_volume failed")
+            return
         set_reply = self.command_runner(
-            "set-sink-volume", self._volume_target(), f"{int(target)}%")
+            "set-sink-volume", sink, f"{int(target)}%")
         if set_reply.returncode:
             raise RuntimeError(set_reply.stderr.strip() or "set failed")
 

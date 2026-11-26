@@ -8,9 +8,14 @@ import subprocess
 import threading
 import time
 
-import gi
-gi.require_version("Gtk", "3.0")
-from gi.repository import GLib
+try:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib
+except ImportError:  # headless / pure-stdlib test environments
+    GLib = None
+
+from g935.pulse import PulseClient, libpulse_available
 
 
 def classify_pactl_event(line: str) -> str | None:
@@ -54,13 +59,29 @@ class AudioControl:
 
     def __init__(self, on_change):
         self.on_change = on_change
-        self.available = shutil.which("pactl") is not None
         self._pending = None
         self._pending_kind = None
         self._stop = False
         self._proc = None
-        if self.available:
+        self._pulse = None
+        if libpulse_available():
+            client = PulseClient(
+                app_name="g935-control",
+                on_event=self._on_pulse_event,
+            )
+            if client.connected:
+                self._pulse = client
+            else:
+                client.close()
+        self.available = (
+            self._pulse is not None or shutil.which("pactl") is not None
+        )
+        if self._pulse is None and self.available:
             threading.Thread(target=self._subscribe_loop, daemon=True).start()
+
+    def _on_pulse_event(self, kind: str):
+        if not self._stop:
+            GLib.idle_add(self._poke, kind)
 
     @classmethod
     def _run_checked(cls, *args) -> tuple[bool, str]:
@@ -77,7 +98,21 @@ class AudioControl:
         _ok, out = cls._run_checked(*args)
         return out
 
+    @staticmethod
+    def _filter_visible(name: str) -> bool:
+        return "easyeffects" not in name and not name.endswith(".monitor")
+
     def _list_checked(self, kind) -> tuple[bool, list[tuple[str, str]]]:
+        if self._pulse is not None:
+            ok, devs = (
+                self._pulse.list_sinks()
+                if kind == "sinks" else self._pulse.list_sources()
+            )
+            if ok:
+                return True, [
+                    (d.name, d.description) for d in devs
+                    if self._filter_visible(d.name)
+                ]
         ok, out = self._run_checked("list", kind)
         if not ok:
             return False, []
@@ -87,7 +122,7 @@ class AudioControl:
             if line.startswith("Name:"):
                 name = line.split(":", 1)[1].strip()
             elif line.startswith("Description:") and name:
-                if "easyeffects" not in name and not name.endswith(".monitor"):
+                if self._filter_visible(name):
                     devs.append((name, line.split(":", 1)[1].strip()))
                 name = None
         return True, devs
@@ -99,17 +134,55 @@ class AudioControl:
     def list_sinks(self):           return self._list("sinks")
     def list_sinks_checked(self):   return self._list_checked("sinks")
     def list_sources(self):         return self._list("sources")
-    def default_sink(self):         return self._run("get-default-sink").strip()
-    def default_source(self):       return self._run("get-default-source").strip()
-    def set_default_sink(self, name):   self._run("set-default-sink", name)
-    def set_default_source(self, name): self._run("set-default-source", name)
+
+    def default_sink(self):
+        if self._pulse is not None:
+            dsink, _dsrc = self._pulse.default_devices()
+            if dsink:
+                return dsink
+        return self._run("get-default-sink").strip()
+
+    def default_source(self):
+        if self._pulse is not None:
+            _dsink, dsrc = self._pulse.default_devices()
+            if dsrc:
+                return dsrc
+        return self._run("get-default-source").strip()
+
+    def set_default_sink(self, name):
+        if self._pulse is not None and self._pulse.set_default("sink", name):
+            return
+        self._run("set-default-sink", name)
+
+    def set_default_source(self, name):
+        if self._pulse is not None and self._pulse.set_default("source", name):
+            return
+        self._run("set-default-source", name)
 
     def get_volume(self, kind, name):
+        if self._pulse is not None:
+            dev = self._pulse.get_device(kind, name)
+            if dev is not None:
+                return dev.volume_pct
         vals = [int(v) for v in re.findall(
             r"(\d+)%", self._run(f"get-{kind}-volume", name))]
         return round(sum(vals) / len(vals)) if vals else None
 
+    def get_mute(self, kind, name) -> bool | None:
+        if self._pulse is not None:
+            dev = self._pulse.get_device(kind, name)
+            if dev is not None:
+                return dev.mute
+        out = self._run(f"get-{kind}-mute", name).lower()
+        if "yes" in out:
+            return True
+        if "no" in out:
+            return False
+        return None
+
     def set_volume(self, kind, name, pct):
+        if self._pulse is not None and self._pulse.set_volume(kind, name, pct):
+            return
         # %-form applies to all channels (some sinks are 8ch)
         self._run(f"set-{kind}-volume", name, f"{int(pct)}%")
 
@@ -118,9 +191,13 @@ class AudioControl:
         self._run("set-sink-volume", "@DEFAULT_SINK@", f"{sign}{abs(delta_pct)}%")
 
     def toggle_default_mute(self):
+        if self._pulse is not None and self._pulse.toggle_mute("sink", "@DEFAULT_SINK@") is not None:
+            return
         self._run("set-sink-mute", "@DEFAULT_SINK@", "toggle")
 
     def toggle_mute(self, kind, name):
+        if self._pulse is not None and self._pulse.toggle_mute(kind, name) is not None:
+            return
         self._run(f"set-{kind}-mute", name, "toggle")
 
     def _subscribe_loop(self):
@@ -164,6 +241,12 @@ class AudioControl:
 
     def stop(self):
         self._stop = True
+        if self._pulse is not None:
+            try:
+                self._pulse.close()
+            except Exception:
+                pass
+            self._pulse = None
         if self._proc:
             try:
                 self._proc.terminate()

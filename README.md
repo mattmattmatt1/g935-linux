@@ -267,11 +267,11 @@ The panel works without the service in hardware mode.
 
 | Page | What is there |
 |---|---|
-| **Control** | software/hardware mode, live G keys with bindings, sidetone, microphone state, 10-band EQ, and a compact categorized Presets menu |
-| **Lighting** | independent Logo and Primary/Strip RGB effects and saved settings |
-| **Battery Health** | power management first, prominent wear and time-lost summary, live ETA/drain, history, learned profile, and session quality |
-| **Hardware** | firmware, discovered HID++ features, stereo-route state/repair, and the collapsed advanced console |
-| **Settings** | tray/mixer device visibility, adaptive earcup-wheel calibration, and 0–200% headset volume (100% HW, then software gain) |
+| **Control** | 10-band hardware EQ with live frequency-response curve and categorized presets at the top, followed by sidetone, software/hardware mode & microphone status, and collapsible G0–G3 tap/hold bindings |
+| **Lighting** | live animated G935 earcup RGB preview (G-logo + front strip) above side-by-side Logo and Primary/Strip controls |
+| **Battery Health** | animated battery dashboard with ETA & 5 live KPI tiles, 7-day charge curve above the fold, health gauge, expected-vs-actual runtime, learned drain profile, and collapsible power/spec settings |
+| **Hardware** | firmware, discovered HID++ features, control-link status, stereo-route state/repair, and the collapsed advanced console |
+| **Settings** | 0–200% headset volume, earcup-wheel comfort controls (with optional calibration), and collapsible audio device mixer/visibility |
 
 Scroll-wheel input passes over sliders normally until you click a slider once,
 preventing accidental EQ, sidetone, or volume changes while scrolling a page.
@@ -327,12 +327,13 @@ boom mutes the mic and nothing will unmute it (the panel warns you).
 
 ### Who owns what
 
-| Job | Daemon running | Daemon not running |
+| Job | Daemon running (`g935-dspd`) | Standalone (no daemon) |
 |---|---|---|
-| Power-on DSP enable | **daemon**, with panel reassertion after confirmed reconnects | control panel |
-| Boom mute / button | **daemon** | panel shows state only (Unstick button) |
-| EQ / lighting / sidetone | control panel | control panel |
-| Mode toggle (user switch) | panel writes mode file + command | same |
+| `/dev/hidraw*` & `/dev/input/event*` | **daemon** (single hardware owner; panel connects over `$XDG_RUNTIME_DIR/g935-dspd.sock`) | control panel (direct hidraw fallback) |
+| Power-on DSP enable & boom mute | **daemon** | control panel (no software auto-unmute) |
+| Earcup wheel & headless G0–G3 bindings | **daemon** (native `libpulse` with `pactl` fallback) | panel handles G0–G3 while open |
+| Battery logging & low-battery alerts | **daemon** (streams live updates to panel) | control panel |
+| EQ / lighting / sidetone / mode switch | panel via daemon IPC | control panel |
 
 ## Battery health
 
@@ -373,9 +374,10 @@ restore FR. Tray menu also gets **Fix stereo** while broken.
 
 | Path | Purpose |
 |---|---|
-| `g935-control.py` | GTK3 control panel |
-| `g935-dspd.py` + `g935-dsp.service` | power-on watcher + software-mode mic daemon |
-| `g935/` | shared library (HID++, mic, wheel, battery, audio, charts) |
+| `g935-control.py` | GTK3 control panel (daemon-first client with direct hidraw fallback) |
+| `g935-dspd.py` + `g935-dsp.service` | single-owner hardware daemon (HID++, wheel, boom mute, battery log, local UNIX JSON-RPC) |
+| `g935/` | shared library (HID++, `libpulse` audio client, daemon IPC, wheel, mic, battery, charts) |
+| `g935/ui/` | modular GTK3 pages, Cairo centerpiece visuals, tray controller, theme CSS, wheel calibration |
 | `99-g935.rules` | udev rule granting hidraw access |
 | `70-g935-micmute.hwdb` | masks KEY_MICMUTE so the desktop stays out of software mode |
 | `tools/` | research scripts (enable replay, sequence bisector) |

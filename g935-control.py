@@ -1,28 +1,15 @@
 #!/usr/bin/env python3
 """
-g935-control.py - GTK control panel for the Logitech G935 (HID++ over hidraw).
+g935-control.py - GTK3 control panel for the Logitech G935.
 
-Feature map (from the headset IFeatureSet, 2026-07-20):
-  idx 02 = 0x0003 DEVICE_INFORMATION   identity + firmware entity
-  idx 03 = 0x0005 DEVICE_NAME/TYPE     "G935 Gaming Headset"
-  idx 04 = 0x8070 COLOR_LED_EFFECTS   2 zones: 0=logo, 1=front strip
-  idx 05 = 0x8010 G-KEYS / software mode  052b 01/00; G1-G3 events
-  idx 06 = 0x8310 EQUALIZER           10 bands 32Hz-16kHz, +/-12 dB
-  idx 07 = 0x8300 SIDETONE            0-100
-  idx 08 = 0x1f20 ADC/BATTERY         voltage mV + flags
-
-Mode is persisted in ~/.config/g935/mode ("ghub"/"hardware"). g935-dspd keeps
-the mode across power-ons and owns boom-mic handling; the GUI also reasserts
-the persisted mode before replaying EQ/lighting after a confirmed reconnect.
-Default mode is hardware (stock) until the user opts in.
-
-Needs r/w on the hidraw node. Run: python3 g935-control.py
+Connects to g935-dspd over its local UNIX JSON-RPC socket when the daemon is
+running (single hardware owner — zero hidraw contention, zero health.json
+write races), and falls back transparently to direct hidraw when standalone.
 """
 from __future__ import annotations
 
 import argparse
 import fcntl
-import json
 import os
 import sys
 import threading
@@ -35,273 +22,84 @@ if _ROOT not in sys.path:
 
 import gi
 gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GLib
 
-from g935.app_icon import (
-    APP_ID, FALLBACK_ICON_NAME, ICON_NAME, icon_file, icon_theme_dir,
-    tray_png_path,
-)
+from g935.app_icon import APP_ID
 
-# Must run before Gtk is imported. Plasma 6 Wayland uses this as the window
-# app-id and looks up <id>.desktop for the taskbar icon.
+# Must run before Gtk is imported so Plasma 6 Wayland matches <id>.desktop.
 GLib.set_prgname(APP_ID)
 GLib.set_application_name("G935 Control")
 
-from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, Pango
+from gi.repository import Gdk, Gtk
 
 Gdk.set_program_class(APP_ID)
 
 from g935.app_settings import AppSettings
 from g935.audio import AudioControl
-from g935.bindings import (
-    ACTIONS, DEFAULT_HOLD_S, KEYS, KEY_LABELS, LAYERS, LAYER_LABELS,
-    Binding, HID_KEYS, HoldTracker, KeyBinding, bindings_to_data, describe,
-    key_for_index, media_call, normalize_bindings, run_command, cycle_name,
-)
 from g935.battery import (
     HEALTH_DEFAULTS, BatteryAlerts, HealthTracker, batt_percent, batt_state,
-    build_insights, merge_discharge_sessions, session_full_runtime_h,
 )
-from g935.chart_data import build_level_series
-from g935.charts import (
-    ChargeHistoryChart, DrainProfileChart, ExpectActualChart,
-    HealthGaugeChart, SessionRuntimeChart,
+from g935.bindings import (
+    DEFAULT_HOLD_S, HID_KEYS, KEY_LABELS, Binding, HoldTracker, KeyBinding,
+    bindings_to_data, cycle_name, describe, key_for_index, media_call,
+    normalize_bindings, run_command,
 )
 from g935.daemon_status import daemon_running, panel_lock_path, panel_running
+from g935.device_client import DeviceClient
 from g935.features import (
     DEVICE_TYPES, FEATURE_LABELS, LED_EFFECTS, LIGHT_MODES,
     build_light_params, format_frequency, parse_device_info, parse_eq_info,
     parse_firmware_info, parse_frequency_page, parse_gkey_control,
-    parse_gkey_mask,
-    parse_led_effect_info, parse_led_state, parse_led_zone_info,
+    parse_gkey_mask, parse_led_effect_info, parse_led_state,
+    parse_led_zone_info,
 )
-from g935.hidpp import (
-    ERROR_CODES, HidWorker, PollPresence, find_headset, open_hidraw,
-)
+from g935.hidpp import ERROR_CODES, PollPresence, find_headset, open_hidraw
 from g935.mic import (
-    BOOM_UP, BOOM_DOWN, BUTTON, read_boom, read_host_mic_switch, set_host_mic_switch,
+    BOOM_DOWN, BOOM_UP, BUTTON, read_boom, read_host_mic_switch,
+    set_host_mic_switch,
 )
 from g935.mode import load_mode, save_mode
 from g935.panel_ipc import bind_listener, notify_running_instance
-from g935.paths import config_dir, ensure_config_dir, runtime_dir
+from g935.paths import runtime_dir
 from g935.stereo_route import (
     fix_stereo, inspect_stereo, is_g935_sink, notify_user, notify_user_with_id,
 )
-from g935.tray_scroll import tray_scroll_notches
-from g935.volume_wheel import (
-    DEFAULT_FINE_STEP, DEFAULT_STEP, DIRECTION_GUARD_S, EVIOCGRAB,
-    FAST_ROLL_GAP_S, FINE_INTERVAL_S,
-    HOLD_REPEAT_DELAY_S, HOLD_REPEAT_INTERVAL_S, INPUT_EVENT,
-    KEY_VOLUMEDOWN, KEY_VOLUMEUP, MEDIUM_ROLL_GAP_S,
-    VOLUME_BOOST_MAX,
-    analyze_calibration, find_wheel_device, parse_key_events,
+from g935.ui.battery_page import build_battery_page, render_health_display
+from g935.ui.control_page import (
+    build_control_page, build_eq_sliders, set_gkey_pill_active,
+    sync_eq_curve, update_mic_badge,
 )
-
-# Ubuntu/Debian/Fedora ship the Ayatana fork; some distros still ship the
-# original namespace. Either works; without both we run windowed only.
-AppIndicator = None
-for _ns in ("AyatanaAppIndicator3", "AppIndicator3"):
-    try:
-        gi.require_version(_ns, "0.1")
-        AppIndicator = getattr(__import__("gi.repository", fromlist=[_ns]), _ns)
-        break
-    except (ValueError, ImportError, AttributeError):
-        continue
-
-
-TRAY_SNI_RETRY_S = 1
-TRAY_SNI_RETRY_MAX = 20
-
-
-def sni_watcher_present():
-    """True if a StatusNotifier tray host is on the session bus."""
-    try:
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-        res = bus.call_sync(
-            "org.freedesktop.DBus", "/org/freedesktop/DBus",
-            "org.freedesktop.DBus", "NameHasOwner",
-            GLib.Variant("(s)", ("org.kde.StatusNotifierWatcher",)),
-            GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, 500, None)
-        return bool(res.unpack()[0])
-    except Exception:
-        return False
-
-
-APP_CSS = """
-.g935-window {
-    background-color: @theme_bg_color;
-}
-.g935-status {
-    background-color: alpha(@theme_fg_color, 0.035);
-    border-bottom: 1px solid alpha(@theme_fg_color, 0.10);
-}
-.g935-chip {
-    background-color: alpha(@theme_fg_color, 0.07);
-    border: 1px solid alpha(@theme_fg_color, 0.10);
-    border-radius: 999px;
-    padding: 5px 10px;
-}
-.g935-card > border {
-    background-color: alpha(@theme_fg_color, 0.025);
-    border: 1px solid alpha(@theme_fg_color, 0.13);
-    border-radius: 10px;
-}
-.g935-section-title {
-    font-weight: 700;
-    font-size: 1.05em;
-    padding: 0 7px;
-}
-.g935-primary-title {
-    font-weight: 700;
-    font-size: 1.12em;
-}
-.g935-subtitle {
-    color: alpha(@theme_fg_color, 0.68);
-}
-.g935-key {
-    background-color: alpha(@theme_fg_color, 0.07);
-    border: 1px solid alpha(@theme_fg_color, 0.12);
-    border-radius: 999px;
-    padding: 4px 10px;
-    font-weight: 700;
-}
-.g935-zone {
-    background-color: alpha(@theme_fg_color, 0.035);
-    border: 1px solid alpha(@theme_fg_color, 0.08);
-    border-radius: 8px;
-    padding: 8px;
-}
-.g935-kpi > border {
-    background-color: alpha(@theme_fg_color, 0.03);
-    border: 1px solid alpha(@theme_fg_color, 0.08);
-    border-radius: 10px;
-}
-.g935-wear > border {
-    background-color: alpha(@warning_color, 0.06);
-    border: 1px solid alpha(@warning_color, 0.22);
-    border-radius: 10px;
-}
-.g935-wear-copy {
-    font-size: 0.92em;
-    color: alpha(@theme_fg_color, 0.78);
-}
-.g935-caption {
-    color: alpha(@theme_fg_color, 0.58);
-}
-.g935-console-expander {
-    background-color: alpha(@theme_fg_color, 0.025);
-    border: 1px solid alpha(@theme_fg_color, 0.13);
-    border-radius: 10px;
-    padding: 10px;
-}
-.g935-preset-menu {
-    padding: 12px;
-}
-.g935-preset-category {
-    color: alpha(@theme_fg_color, 0.68);
-    font-weight: 700;
-    padding-top: 4px;
-}
-button.g935-preset-item {
-    padding: 7px 12px;
-}
-.g935-info-key {
-    color: alpha(@theme_fg_color, 0.62);
-}
-.g935-page {
-    background-color: transparent;
-}
-.g935-card button {
-    min-height: 28px;
-}
-"""
-
-
-def install_app_css():
-    provider = Gtk.CssProvider()
-    provider.load_from_data(APP_CSS.encode("utf-8"))
-    screen = Gdk.Screen.get_default()
-    if screen is not None:
-        Gtk.StyleContext.add_provider_for_screen(
-            screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-
-def style(widget, *classes):
-    context = widget.get_style_context()
-    for css_class in classes:
-        context.add_class(css_class)
-    return widget
-
-
-def window_icon_name() -> str:
-    theme = Gtk.IconTheme.get_default()
-    if theme.has_icon(ICON_NAME):
-        return ICON_NAME
-    if theme.has_icon(FALLBACK_ICON_NAME):
-        return FALLBACK_ICON_NAME
-    return ICON_NAME
-
-
-def apply_window_icon(window) -> None:
-    theme = Gtk.IconTheme.get_default()
-    path = icon_file()
-    if theme.has_icon(ICON_NAME):
-        window.set_icon_name(ICON_NAME)
-        return
-    if path:
-        try:
-            window.set_icon_from_file(path)
-            return
-        except Exception:
-            pass
-    window.set_icon_name(FALLBACK_ICON_NAME)
-
-
-def sni_icon_name() -> str:
-    """StatusNotifierItem.IconName: absolute PNG path, else a Breeze icon.
-
-    Plasma 6 ignores Ayatana IconThemePath. A theme name that is not in
-    Breeze often produces an empty tray slot. rgbcommand on this machine
-    uses an absolute path as IconName and that shows.
-    """
-    src = icon_file()
-    dest = tray_png_path()
-    if src:
-        try:
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(src, 64, 64)
-            pixbuf.savev(dest, "png", [], [])
-            return dest
-        except Exception:
-            if os.path.isabs(src):
-                return src
-    return FALLBACK_ICON_NAME
-
-
-def brand_image() -> Gtk.Image:
-    path = icon_file()
-    if path:
-        image = Gtk.Image.new_from_file(path)
-        image.set_pixel_size(20)
-        return image
-    return Gtk.Image.new_from_icon_name(
-        window_icon_name(), Gtk.IconSize.BUTTON)
-
+from g935.ui.hardware_page import build_hardware_page
+from g935.ui.lighting_page import (
+    build_lighting_page, build_lighting_rows, sync_lighting_preview,
+)
+from g935.ui.settings_page import (
+    build_settings_page, build_volume_rows, update_headset_vol_badge,
+)
+from g935.ui.theme import (
+    apply_window_icon, brand_image, install_app_css, set_chip_tone, style,
+)
+from g935.ui.tray import TrayController
+from g935.ui.wheel_calibration import WheelCalibrationWizard
+from g935.volume_wheel import (
+    DEFAULT_FINE_STEP, DEFAULT_STEP, DIRECTION_GUARD_S, FINE_INTERVAL_S,
+    HOLD_REPEAT_DELAY_S, HOLD_REPEAT_INTERVAL_S, VOLUME_BOOST_MAX,
+)
 
 # HID++ 2.0 features this app knows how to drive. Indices are discovered live.
 FEATURES = [
     ("devinfo",  0x0003),
     ("devname",  0x0005),
-    ("gkeys",    0x8010),   # + the G935 "G HUB mode" side effect
+    ("gkeys",    0x8010),
     ("lighting", 0x8070),
     ("eq",       0x8310),
     ("sidetone", 0x8300),
     ("battery",  0x1f20),
 ]
 
-WHEEL_CAPTURE_FILE = os.path.join(config_dir(), "wheel-capture.json")
-ALSA_USBID = "046d:0a87"    # reassigned from the device profile in main()
+ALSA_USBID = "046d:0a87"
 MIC_SWITCH_NAME = "Mic Capture Switch"
 
 
@@ -345,11 +143,11 @@ G935_CONNECT_BURST = [
     ("lighting", 2, "0102"), ("lighting", 2, "0103"),
     ("gkeys", 2, "01"), ("lighting", 8, "0101"),
     ("sidetone", 0, ""), ("sidetone", 1, "64"),
-    ("lighting", 3, "010200b4ff1388000700"), ("lighting", 3, "000200b4ff1388000800"),
+    ("lighting", 3, "010200b4ff1388000700"),
+    ("lighting", 3, "000200b4ff1388000800"),
     ("lighting", 4, "0001"), ("battery", 1, ""), ("eq", 2, ""),
 ]
 
-# ---------- device profiles ----------
 DEVICE_PROFILES = {
     0x0A87: {
         "name": "G935",
@@ -380,58 +178,60 @@ GENERIC_PROFILE = {
 
 class App(Gtk.Window):
     def __init__(self, dev_path, pid, hid_name, start_in_tray=False):
-        self.profile = {**GENERIC_PROFILE,
-                        **DEVICE_PROFILES.get(pid, {"name": hid_name})}
+        self.profile = {
+            **GENERIC_PROFILE,
+            **DEVICE_PROFILES.get(pid, {"name": hid_name}),
+        }
         self._start_in_tray = start_in_tray
-        self._tray_sni_tries = 0
-        self._tray_waiting = False
         super().__init__(title=f"{self.profile['name']} Control")
         style(self, "g935-window")
-        self.set_default_size(840, 900)
+        self.set_default_size(860, 900)
         apply_window_icon(self)
-        self.connected = None   # None = unknown, True/False after first battery poll
-        # match daemon: short TIMEOUT streaks during reassert must not look
-        # like power-off (that re-triggers a full lighting/EQ storm).
-        self._battery_presence = PollPresence(miss_limit=6, grace_s=45.0)
-        self.pid = pid
 
+        self.pid = pid
+        self.connected = None
+        self._battery_presence = PollPresence(miss_limit=6, grace_s=45.0)
         self.settings = AppSettings()
-        self.features = {}        # feature attr -> discovered index
-        self.feature_meta = {}    # attr -> (feature id, type flags, version)
+        self.health = HealthTracker(auto_save_scrub=False)
+        self._bindings = normalize_bindings(self.settings.data.get("bindings"))
+        self._holds = HoldTracker(DEFAULT_HOLD_S)
+        self._hold_src = None
+
+        self.features = {}
+        self.feature_meta = {}
         self.discovered = False
         self._discovering = False
-        self.section_frames = {}  # feature attr -> widget to show/hide
-        self.mixer_win = None
-        self.indicator = None
-        self.tray_batt_item = None
-        self._tray_status = None
-        self._tray_scroll_acc = 0
-        self._tray_menu_sig = None
+        self.section_frames = {}
         self._headset_sink_cache = None
         self._last_known_g935_sink = None
-        self._vol_pending = {}    # (kind, name) -> debounce source id
+        self._vol_pending = {}
         self._vol_containers = []
         self._vol_interacting = False
         self._headset_vol_pending = None
-        self._daemon_poll = None
         self._gkey_mask = 0
         self._gkey_count = 0
-        self._gkey_control = None  # 0x8010 fn1 byte; not software-mode
+        self._gkey_control = None
         self._g0_down = False
         self._g0_flash_src = None
         self._just_discovered = False
         self._last_batt_display = None
         self._health_ui_dirty = False
+        self._batt_alerts = BatteryAlerts()
         self._batt_notify_ids = {}
+        self._stereo_broken = False
+        self._stereo_fixing = False
         self._stereo_checking = False
+        self._stereo_dismissed_until = 0.0
+        self._wheel_wizard: WheelCalibrationWizard | None = None
         self._device_firmware = []
         self._device_name_parts = bytearray()
         self._device_name_count = 0
         self._light_caps = {}
 
         boom = self.profile["has_boom_mic"]
-        self.worker = HidWorker(
-            dev_path, self.log_traffic,
+        self.worker = DeviceClient(
+            dev_path,
+            self.log_traffic,
             mic_cb=self.on_mic_event if boom else None,
             boom_cb=self.on_boom_change if boom else None,
             poll_boom=boom,
@@ -441,11 +241,16 @@ class App(Gtk.Window):
             boom_reader=read_boom if boom else None,
             idle_add=GLib.idle_add,
             event_cb=self.on_hidpp_event,
+            battery_cb=self._on_daemon_battery,
+            presence_cb=self._on_daemon_presence,
+            mode_cb=self._on_daemon_mode,
+            transport_cb=self._on_transport_change,
         )
         self.worker.start()
         self.audio = AudioControl(self._on_audio_change)
+        self.tray = TrayController(self)
 
-        # ---- header bar: page switcher + live status ----
+        # ---- HeaderBar ----
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         self.set_titlebar(hb)
@@ -460,44 +265,47 @@ class App(Gtk.Window):
 
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(140)
         switcher = Gtk.StackSwitcher()
         switcher.set_stack(self.stack)
         hb.set_custom_title(switcher)
 
-        # ---- status bar, inside the window above the pages (visible on both) ----
+        # ---- Top status bar ----
         self.conn_label = Gtk.Label()
-        self.conn_label.set_markup(
-            "<span foreground='gray'>●</span> Connecting")
-        self.conn_label.set_tooltip_text("headset connection")
+        self.conn_label.set_markup("<span foreground='gray'>●</span> Connecting")
+        self.conn_label.set_tooltip_text("Headset wireless connection")
         style(self.conn_label, "g935-chip")
+
+        self.mode_chip = Gtk.Label()
+        style(self.mode_chip, "g935-chip")
+        self.mode_chip.set_tooltip_text("Active headset mode and daemon status")
+
         self.batt_label = Gtk.Label()
         self.batt_label.set_markup("🔋 …")
-        self.batt_label.set_tooltip_text("battery")
+        self.batt_label.set_tooltip_text("Battery level")
         style(self.batt_label, "g935-chip")
-        self.mic_label = Gtk.Label()
-        self.mic_label.set_markup("🎤 …")
-        self.mic_label.set_tooltip_text("boom position (polled from the headset)")
-        style(self.mic_label, "g935-chip")
+
         self.stereo_label = Gtk.Label()
-        self.stereo_label.set_markup("")
         self.stereo_label.set_no_show_all(True)
         self.stereo_label.hide()
         self.stereo_label.set_tooltip_text("PipeWire stereo route (L/R into headset)")
         style(self.stereo_label, "g935-chip")
 
+        self.mic_label = Gtk.Label()
+        self.mic_label.set_markup("🎤 …")
+        self.mic_label.set_tooltip_text("Boom-mic position")
+        style(self.mic_label, "g935-chip")
+
         status = Gtk.Box(spacing=8)
         style(status, "g935-status")
-        status.set_margin_start(0)
-        status.set_margin_end(0)
-        status.set_margin_top(0)
-        status.set_margin_bottom(0)
         status.set_border_width(10)
         status.pack_start(self.conn_label, False, False, 0)
+        status.pack_start(self.mode_chip, False, False, 0)
         status.pack_start(self.batt_label, False, False, 0)
         status.pack_start(self.stereo_label, False, False, 0)
         status.pack_end(self.mic_label, False, False, 0)
 
-        # Banner when right-channel link is missing after sleep/resume
+        # ---- Stereo warning banner ----
         self.stereo_banner = Gtk.InfoBar()
         self.stereo_banner.set_message_type(Gtk.MessageType.WARNING)
         self.stereo_banner.set_show_close_button(True)
@@ -517,995 +325,68 @@ class App(Gtk.Window):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         outer.pack_start(status, False, False, 0)
         outer.pack_start(self.stereo_banner, False, False, 0)
-        outer.pack_start(Gtk.Separator(), False, False, 0)
         outer.pack_start(self.stack, True, True, 0)
         self.add(outer)
 
-        self._stereo_broken = False
-        self._stereo_fixing = False
-        self._stereo_last_notify = 0.0
-        self._stereo_dismissed_until = 0.0  # user closed banner; quiet until change
-        self._batt_alerts = BatteryAlerts()
+        # ---- Pages (modular builders in g935/ui/) ----
+        control_box = self._page("control", "Control")
+        build_control_page(self, control_box, _read_host_mic, _set_host_mic)
 
-        # ================= Control page (everything except the console) =================
-        sound = self._page("control", "Control", scroll=True)
-
-        gk = self._frame(sound, "Software mode")
-        row = Gtk.Box(spacing=8)
-        lbl = Gtk.Label(xalign=0)
-        style(lbl, "g935-primary-title")
-        lbl.set_text("Open soundstage + host-managed controls")
-        row.pack_start(lbl, True, True, 0)
-        self.dsp_sw = Gtk.Switch()
-        self.dsp_sw.set_active(load_mode() == "ghub")
-        self.dsp_sw.set_tooltip_text(
-            "Saved target mode. 0x8010 function 1 ACKs on this firmware but "
-            "does not follow the software-mode SET, so the switch is the "
-            "target and software mode is reasserted periodically.")
-        self.dsp_sw.connect("notify::active", self.on_dsp_toggle)
-        row.pack_end(self.dsp_sw, False, False, 0)
-        gk.pack_start(row, False, False, 0)
-        self.mode_note = Gtk.Label(xalign=0)
-        style(self.mode_note, "g935-subtitle")
-        self.mode_note.set_line_wrap(True)
-        gk.pack_start(self.mode_note, False, False, 0)
-        key_row = Gtk.Box(spacing=8)
-        live_label = Gtk.Label(label="Live G keys", xalign=0)
-        style(live_label, "g935-subtitle")
-        key_row.pack_start(live_label, False, False, 0)
-        self.gkey_labels = {}
-        for name in KEYS:
-            key = Gtk.Label(label=KEY_LABELS[name])
-            style(key, "g935-key")
-            key.set_sensitive(False)
-            key_row.pack_start(key, False, False, 0)
-            self.gkey_labels[name] = key
-        self.gkey_last = Gtk.Label(label="waiting for an event", xalign=0)
-        style(self.gkey_last, "g935-subtitle")
-        key_row.pack_start(self.gkey_last, True, True, 8)
-        gk.pack_start(key_row, False, False, 0)
-        self._bindings = normalize_bindings(self.settings.data.get("bindings"))
-        self._holds = HoldTracker(DEFAULT_HOLD_S)
-        self._hold_src = None
-        self._bind_combos = {}
-        self._bind_cmds = {}
-        bind_note = Gtk.Label(xalign=0)
-        style(bind_note, "g935-subtitle")
-        bind_note.set_line_wrap(True)
-        bind_note.set_markup(
-            "<small>Bottom→top: <b>G0</b> is the earcup mute button, then "
-            "G1–G3. Software mode only. Tap vs hold (0.45s). Hardware mode "
-            "keeps G0 as on-device mute and G1–G3 on-headset.</small>")
-        gk.pack_start(bind_note, False, False, 0)
-        for key in KEYS:
-            block = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            head = Gtk.Label(label=KEY_LABELS[key], xalign=0)
-            style(head, "g935-primary-title")
-            block.pack_start(head, False, False, 0)
-            combos = {}
-            cmds = {}
-            for layer in LAYERS:
-                row = Gtk.Box(spacing=8)
-                tag = Gtk.Label(label=LAYER_LABELS[layer], xalign=0)
-                style(tag, "g935-subtitle")
-                tag.set_size_request(36, -1)
-                row.pack_start(tag, False, False, 0)
-                combo = Gtk.ComboBoxText()
-                for action_id, label in ACTIONS:
-                    combo.append(action_id, label)
-                slot = self._bindings[key].layer(layer)
-                combo.set_active_id(slot.action)
-                combo.connect("changed", self.on_binding_changed, key, layer)
-                row.pack_start(combo, True, True, 0)
-                cmd = Gtk.Entry()
-                cmd.set_placeholder_text("command")
-                cmd.set_text(slot.command)
-                cmd.connect("changed", self.on_binding_command, key, layer)
-                cmd.set_no_show_all(True)
-                cmd.set_visible(slot.action == "command")
-                row.pack_start(cmd, True, True, 0)
-                block.pack_start(row, False, False, 0)
-                combos[layer] = combo
-                cmds[layer] = cmd
-            gk.pack_start(block, False, False, 4)
-            self._bind_combos[key] = combos
-            self._bind_cmds[key] = cmds
-        self.section_frames["gkeys"] = gk.get_parent()
-        self._update_mode_note()
-
-        st = self._frame(sound, "Sidetone (your mic mixed into your ears)")
-        self.section_frames["sidetone"] = st.get_parent()
-        self.sidetone = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.sidetone.set_hexpand(True)
-        self.sidetone.set_value(100)
-        self._guard_slider_scroll(self.sidetone)
-        self._sidetone_pending = None
-        self.sidetone.connect("value-changed", self.on_sidetone)
-        st.pack_start(self.sidetone, False, False, 0)
-
-        if self.profile["has_boom_mic"]:
-            mic = self._frame(sound, "Microphone")
-            self.mic_big = Gtk.Label(xalign=0)
-            style(self.mic_big, "g935-primary-title")
-            self.mic_big.set_markup("<span size='large'>🎤 reading boom position…</span>")
-            mic.pack_start(self.mic_big, False, False, 2)
-            row = Gtk.Box(spacing=8)
-            row.pack_start(Gtk.Label(label="Host capture switch (ALSA / USB-audio mute layer)",
-                                     xalign=0), True, True, 0)
-            self.hostmic_sw = Gtk.Switch()
-            self.hostmic_sw.set_active(_read_host_mic() is not False)
-            self.hostmic_sw.connect("notify::active", self.on_hostmic_toggle)
-            row.pack_end(self.hostmic_sw, False, False, 0)
-            mic.pack_start(row, False, False, 0)
-            b = Gtk.Button(label="Unstick mic (force host unmute)")
-            b.connect("clicked", lambda *_: (_set_host_mic(True),
-                                             self._refresh_hostmic()))
-            action_row = Gtk.Box()
-            action_row.pack_end(b, False, False, 0)
-            mic.pack_start(action_row, False, False, 0)
-            self.mic_note = Gtk.Label(xalign=0)
-            style(self.mic_note, "g935-subtitle")
-            self.mic_note.set_line_wrap(True)
-            mic.pack_start(self.mic_note, False, False, 0)
-            mic_key = Gtk.Label(xalign=0)
-            style(mic_key, "g935-subtitle")
-            mic_key.set_line_wrap(True)
-            mic_key.set_markup(
-                "<small>Bottom earcup key is <b>G0</b> (<tt>08 01</tt>). "
-                "In software mode it uses the G0 binding (default: next track). "
-                "G3 tap is mic mute.</small>")
-            mic.pack_start(mic_key, False, False, 0)
-            self._update_mic_note()
-        else:
-            self.mic_label.set_no_show_all(True)
-            self.mic_label.set_visible(False)
-
-        eq = self._frame(sound, "Hardware EQ (on-device, ±12 dB)")
-        self.section_frames["eq"] = eq.get_parent()
-        self.eq_box = eq
-        self.eq_sliders = []
-        if self.profile["eq_bands"]:
-            self._build_eq_sliders(self.profile["eq_bands"])
-
-        # ================= Lighting page =================
-        lighting_page = self._page("lighting", "Lighting", scroll=True)
-        li = self._frame(lighting_page, "On-headset lighting")
+        lighting_box = self._page("lighting", "Lighting")
+        build_lighting_page(self, lighting_box)
         self.section_frames["lighting"] = self.stack.get_child_by_name("lighting")
-        self.light_box = li
-        self.zone_widgets = {}
-        if self.profile["zones"]:
-            self._build_lighting_rows(self.profile["zones"])
 
-        # ================= Battery Health page =================
-        self.health = HealthTracker()
-
-        hp = self._page("health", "Battery Health", scroll=True)
-
-        # Power belongs with battery behavior and is intentionally first.
-        power = self._frame(hp, "Power management")
-        self.power_frame = power.get_parent()
-        row = Gtk.Box(spacing=8)
-        row.pack_start(Gtk.Label(
-            label="Automatically power off after", xalign=0),
-            True, True, 0)
-        self.power_timeout = Gtk.SpinButton.new_with_range(0, 255, 1)
-        self.power_timeout.set_value(15)
-        row.pack_start(self.power_timeout, False, False, 0)
-        unit = Gtk.Label(label="minutes")
-        style(unit, "g935-subtitle")
-        row.pack_start(unit, False, False, 0)
-        b = Gtk.Button(label="Apply")
-        b.get_style_context().add_class("suggested-action")
-        b.connect("clicked", self.on_power_timeout_apply)
-        row.pack_end(b, False, False, 0)
-        power.pack_start(row, False, False, 0)
-        note = Gtk.Label(
-            label="Set 0 minutes to keep the headset on indefinitely.", xalign=0)
-        style(note, "g935-subtitle")
-        power.pack_start(note, False, False, 0)
-
-        # Put wear in its own high-contrast card so health and lost runtime are
-        # understandable without reading the charts.
-        wear = self._frame(hp, "Battery wear")
-        style(wear.get_parent(), "g935-wear")
-        wear_row = Gtk.Box(spacing=10)
-        wear_row.set_homogeneous(True)
-        self.kpi_health = self._kpi_card(wear_row, "Estimated health")
-        self.kpi_lost = self._kpi_card(
-            wear_row, "Runtime lost per full charge")
-        wear.pack_start(wear_row, False, False, 2)
-        self.health_wear_description = Gtk.Label(xalign=0)
-        style(self.health_wear_description, "g935-wear-copy")
-        self.health_wear_description.set_line_wrap(True)
-        wear.pack_start(self.health_wear_description, False, False, 2)
-
-        # ---- Hero: remaining time + status + insights ----
-        hero = self._frame(hp, "At a glance")
-        self.health_remain = Gtk.Label(xalign=0)
-        self.health_remain.set_markup(
-            "<span size='xx-large' weight='bold'>—</span>")
-        self.health_remain.set_line_wrap(True)
-        hero.pack_start(self.health_remain, False, False, 0)
-
-        self.health_status = Gtk.Label(xalign=0)
-        self.health_status.set_markup("<span size='large'>…</span>")
-        self.health_status.set_line_wrap(True)
-        hero.pack_start(self.health_status, False, False, 0)
-
-        self.health_session = Gtk.Label(xalign=0)
-        style(self.health_session, "g935-caption")
-        self.health_session.set_line_wrap(True)
-        hero.pack_start(self.health_session, False, False, 0)
-
-        self.health_insights = Gtk.Label(xalign=0)
-        self.health_insights.set_line_wrap(True)
-        self.health_insights.set_markup("")
-        hero.pack_start(self.health_insights, False, False, 4)
-
-        # KPI strip — supporting runtime metrics
-        kpi_row = Gtk.Box(spacing=8)
-        kpi_row.set_homogeneous(True)
-        self.kpi_full = self._kpi_card(kpi_row, "Full runtime")
-        self.kpi_charge = self._kpi_card(kpi_row, "Full charge-up")
-        self.kpi_drain = self._kpi_card(kpi_row, "Live drain")
-        hero.pack_start(kpi_row, False, False, 6)
-
-        # ---- Charge history (the visual story) ----
-        hist_f = self._frame(hp, "Battery level")
-        self.chart_history = ChargeHistoryChart()
-        hist_f.pack_start(self.chart_history, False, False, 2)
-        self.history_caption = Gtk.Label(xalign=0)
-        style(self.history_caption, "g935-caption")
-        self.history_caption.set_line_wrap(True)
-        hist_f.pack_start(self.history_caption, False, False, 0)
-
-        # ---- Health gauge + remaining comparison ----
-        compare = self._frame(hp, "Health & time left")
-        row = Gtk.Box(spacing=8)
-        self.chart_gauge = HealthGaugeChart()
-        self.chart_gauge.set_size_request(200, 150)
-        self.chart_gauge.set_hexpand(False)
-        row.pack_start(self.chart_gauge, False, False, 0)
-        self.chart_expect = ExpectActualChart()
-        row.pack_start(self.chart_expect, True, True, 0)
-        compare.pack_start(row, False, False, 2)
-        self.health_detail = Gtk.Label(xalign=0)
-        style(self.health_detail, "g935-caption")
-        self.health_detail.set_line_wrap(True)
-        compare.pack_start(self.health_detail, False, False, 2)
-
-        # ---- Sessions ----
-        sess_f = self._frame(hp, "Usage sessions")
-        self.chart_sessions = SessionRuntimeChart()
-        sess_f.pack_start(self.chart_sessions, False, False, 2)
-        self.health_hist = Gtk.Label(xalign=0)
-        style(self.health_hist, "g935-caption")
-        self.health_hist.set_line_wrap(True)
-        self.health_hist.set_markup("<small>no sessions recorded</small>")
-        sess_f.pack_start(self.health_hist, False, False, 2)
-
-        chg_f = self._frame(hp, "Charge-ups")
-        self.health_charges = Gtk.Label(xalign=0)
-        style(self.health_charges, "g935-caption")
-        self.health_charges.set_line_wrap(True)
-        self.health_charges.set_markup(
-            "<small>no charge-ups recorded — plug in off-charger after a "
-            "real drain so rest voltage is known on both sides</small>")
-        chg_f.pack_start(self.health_charges, False, False, 2)
-
-        # ---- Drain profile ----
-        prof_f = self._frame(hp, "Drain profile (learned)")
-        self.chart_profile = DrainProfileChart()
-        prof_f.pack_start(self.chart_profile, False, False, 2)
-        self.health_profile = Gtk.Label(xalign=0)
-        style(self.health_profile, "g935-caption")
-        self.health_profile.set_line_wrap(True)
-        self.health_profile.set_markup("<small>collecting discharge datapoints…</small>")
-        prof_f.pack_start(self.health_profile, False, False, 0)
-
-        # ---- Tracking + how to read (collapsed) ----
-        about = Gtk.Expander(label="How these numbers work")
-        about.set_expanded(False)
-        about_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        about_box.set_border_width(8)
-        about.add(about_box)
-        hp.pack_start(about, False, False, 0)
-
-        track_row = Gtk.Box(spacing=8)
-        track_lbl = Gtk.Label(xalign=0)
-        track_lbl.set_markup("<b>Track battery health</b>  "
-                             "(log charge/discharge while the panel is open)")
-        track_row.pack_start(track_lbl, True, True, 0)
-        self.track_sw = Gtk.Switch()
-        self.track_sw.set_active(self.health.settings["tracking"])
-        self.track_sw.connect("notify::active", self.on_track_toggle)
-        track_row.pack_end(self.track_sw, False, False, 0)
-        about_box.pack_start(track_row, False, False, 0)
-
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup(
-            "<small>The G935 only reports <b>voltage + charging flag</b> — no coulomb "
-            "counter. Health is an honest extrapolation: observed drain over solid "
-            "sessions → projected full-to-empty runtime, compared to the rated spec.\n\n"
-            "<b>While charging</b>, the ADC often reads the <i>charger path</i> (rail "
-            "spikes to ~4.3 V+), not resting cell voltage. SoC % freezes at the last "
-            "off-charger reading; the raw path mV is shown separately. Full-charge "
-            "peaks are taken from rest after unplug, never from rail spikes.\n\n"
-            "<b>Blue</b> = measured from your datapoints. <b>Amber</b> = rated/expected. "
-            "<b>Green</b> on the history chart = charging (held SoC, not rail %).\n"
-            "Short discharges stitch across brief headset-off gaps (≤15 min). "
-            "A solid health evidence point needs ~30 min on-time and ≥8% drop.\n"
-            "After 3 qualifying sessions, remaining time is anchored to the median "
-            "full-runtime history; a faster live drain can shorten it. Before then, "
-            "recent drain and the voltage-bin profile provide the early estimate. "
-            "A live rate needs ≥10 min and ≥3% movement so ADC wobble cannot create "
-            "an implausibly long ETA.\n"
-            "Charge-up time uses rest voltage before plug-in and after unplug "
-            "(never the charger rail). A solid fill needs ≥15 min on the dock "
-            "and ≥25% SoC gain ending at ≥55%. Empty-to-full is extrapolated "
-            "from that; dock-idle after full is ignored.</small>")
-        about_box.pack_start(note, False, False, 0)
-
-        # ---- Spec (collapsed for aftermarket cells) ----
-        spec_exp = Gtk.Expander(
-            label="Battery specification (stock G935 — edit for aftermarket cells)")
-        spec_exp.set_expanded(False)
-        spec = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        spec.set_border_width(8)
-        spec_exp.add(spec)
-        hp.pack_start(spec_exp, False, False, 0)
-
-        self.spec_spins = {}
-        for key, label, lo, hi, step in (
-                ("design_capacity_mah", "Design capacity (mAh)", 300, 5000, 50),
-                ("rated_runtime_h_rgb_on", "Rated runtime, RGB on (h)", 1, 40, 0.5),
-                ("rated_runtime_h_rgb_off", "Rated runtime, RGB off (h)", 1, 40, 0.5),
-                ("full_mv", "Full-charge voltage (mV)", 3900, 4400, 10),
-                ("empty_mv", "Empty voltage (mV)", 3000, 3700, 10),
-                ("rated_charge_h", "Rated empty-to-full charge (h)", 0.5, 8, 0.25)):
-            row = Gtk.Box(spacing=8)
-            row.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
-            sp = Gtk.SpinButton.new_with_range(lo, hi, step)
-            if step < 1:
-                sp.set_digits(1)
-            sp.set_value(self.health.settings[key])
-            sp.connect("value-changed", self.on_spec_changed, key)
-            row.pack_end(sp, False, False, 0)
-            spec.pack_start(row, False, False, 0)
-            self.spec_spins[key] = sp
-        row = Gtk.Box(spacing=8)
-        row.pack_start(Gtk.Label(label="Compare against", xalign=0), True, True, 0)
-        self.profile_combo = Gtk.ComboBoxText()
-        for t in ("RGB lighting on spec", "RGB lighting off spec"):
-            self.profile_combo.append_text(t)
-        self.profile_combo.set_active(
-            0 if self.health.settings["runtime_profile"] == "rgb_on" else 1)
-        self.profile_combo.connect("changed", self.on_profile_changed)
-        row.pack_end(self.profile_combo, False, False, 0)
-        spec.pack_start(row, False, False, 0)
-        b = Gtk.Button(label="Reset to stock G935 values")
-        b.connect("clicked", self.on_spec_reset)
-        spec.pack_start(b, False, False, 0)
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup(
-            "<small>Stock cell: 1100 mAh 3.7 V Li-Po (part 533-000132), "
-            "4200 mV full / 3500 mV empty, rated 8 h with default RGB or "
-            "12 h lights-off at 50% volume, about 2 h empty-to-full on USB. "
-            "Aftermarket cells claim up to 2500 mAh. Spec fields set the "
-            "<i>expected</i> side of the comparison; measured drain and "
-            "charge-up build the <i>real</i> side.</small>")
-        spec.pack_start(note, False, False, 0)
-
-        # Keep aliases so older refresh paths / tests don't break if referenced
-        self.health_live = self.health_status
-        self.health_est = self.kpi_health["value"]
-
-        self._refresh_health_display(None, None, "…")
+        health_box = self._page("health", "Battery Health")
+        build_battery_page(self, health_box)
         self.section_frames["battery"] = self.stack.get_child_by_name("health")
 
-        # ================= Hardware page =================
-        hw = self._page("hardware", "Hardware", scroll=True)
+        hw_box = self._page("hardware", "Hardware")
+        build_hardware_page(self, hw_box)
 
-        ident = self._frame(hw, "Headset identity")
-        self.hw_values = {}
-        for key, title in (
-                ("name", "Marketing name"),
-                ("type", "Device type"),
-                ("usb", "USB product ID"),
-                ("unit", "Unit ID"),
-                ("model", "Model ID"),
-                ("transport", "Reported transports"),
-                ("firmware", "Firmware"),
-                ("entities", "Firmware entities")):
-            self.hw_values[key] = self._info_row(ident, title)
-        self.hw_values["usb"].set_text(f"046D:{self.pid:04X}")
+        settings_box = self._page("settings", "Settings")
+        build_settings_page(self, settings_box)
 
-        caps = self._frame(hw, "Advertised HID++ features")
-        self.hw_features = Gtk.Label(xalign=0)
-        self.hw_features.set_selectable(True)
-        self.hw_features.set_line_wrap(True)
-        self.hw_features.set_text("Discovering…")
-        caps.pack_start(self.hw_features, False, False, 0)
+        self._update_mode_chip()
+        self._refresh_health_display(None, None, "…")
 
-        live = self._frame(hw, "Live capability details")
-        self.hw_caps = Gtk.Label(xalign=0)
-        self.hw_caps.set_selectable(True)
-        self.hw_caps.set_line_wrap(True)
-        self.hw_caps.set_text("Probing…")
-        live.pack_start(self.hw_caps, False, False, 0)
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup(
-            "<small>Only functions acknowledged by this headset firmware are "
-            "shown as controls. Newer HID++ functions that return “invalid "
-            "function” are intentionally omitted.</small>")
-        live.pack_start(note, False, False, 4)
-
-        # Raw protocol tools live at the bottom of Hardware and stay out of the
-        # way until explicitly expanded.
-        self.console_expander = Gtk.Expander()
-        style(self.console_expander, "g935-console-expander")
-        self.console_expander.set_expanded(False)
-        console_title = Gtk.Box(spacing=8)
-        title = Gtk.Label()
-        title.set_markup("<b>Advanced HID++ console</b>")
-        console_title.pack_start(title, False, False, 0)
-        subtitle = Gtk.Label(label="raw traffic and developer commands")
-        style(subtitle, "g935-subtitle")
-        console_title.pack_start(subtitle, False, False, 0)
-        self.console_expander.set_label_widget(console_title)
-        console = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        console.set_border_width(8)
-        self.console_expander.add(console)
-        hw.pack_start(self.console_expander, False, False, 0)
-
-        note = Gtk.Label(xalign=0)
-        style(note, "g935-subtitle")
-        note.set_line_wrap(True)
-        note.set_text(
-            "Developer controls can change on-device state directly. "
-            "Use raw commands only when you know the HID++ frame.")
-        console.pack_start(note, False, False, 0)
-
-        if self.profile["connect_burst"]:
-            row = Gtk.Box(spacing=8)
-            b = Gtk.Button(label="Apply G HUB connect defaults (full sequence)")
-            b.connect("clicked", self.on_full_sequence)
-            row.pack_start(b, True, True, 0)
-            console.pack_start(row, False, False, 0)
-
-        row = Gtk.Box(spacing=8)
-        self.raw_entry = Gtk.Entry()
-        self.raw_entry.set_placeholder_text("raw HID++ hex, e.g. 11ff062b")
-        self.raw_entry.connect("activate", self.on_raw_send)
-        row.pack_start(self.raw_entry, True, True, 0)
-        b = Gtk.Button(label="Send")
-        b.connect("clicked", self.on_raw_send)
-        row.pack_start(b, False, False, 0)
-        console.pack_start(row, False, False, 0)
-
-        self.logbuf = Gtk.TextBuffer()
-        view = Gtk.TextView(buffer=self.logbuf, editable=False, monospace=True)
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_size_request(-1, 280)
-        scroll.add(view)
-        console.pack_start(scroll, False, False, 0)
-        self.logview = view
-
-        # ================= Settings page =================
-        sp = self._page("settings", "Settings", scroll=True)
-
-        devf = self._frame(sp, "Tray & audio devices (unchecked = hidden from "
-                               "tray menu and mixer)")
-        self.dev_toggle_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        devf.pack_start(self.dev_toggle_box, False, False, 0)
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup("<small>easyeffects devices and monitor sources are managed "
-                        "automatically and never listed.</small>")
-        devf.pack_start(note, False, False, 0)
-
-        volf = self._frame(sp, "Volume")
-        boost_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        boost_title = Gtk.Label(label="Headset volume", xalign=0)
-        style(boost_title, "g935-primary-title")
-        boost_copy.pack_start(boost_title, False, False, 0)
-        boost_note = Gtk.Label(xalign=0)
-        style(boost_note, "g935-subtitle")
-        boost_note.set_line_wrap(True)
-        boost_note.set_text(
-            "Real Pulse/PipeWire percent on the G935 sink. 100% is the USB "
-            "mixer’s 0 dB stop (quieter than Windows). The bar keeps going to "
-            "200% as software gain. EasyEffects stays at 100%; its limiter "
-            "sits in front of this.")
-        boost_copy.pack_start(boost_note, False, False, 0)
-        volf.pack_start(boost_copy, False, False, 0)
-        boost_row = Gtk.Box(spacing=8)
-        self.headset_vol = Gtk.Scale.new_with_range(
-            Gtk.Orientation.HORIZONTAL, 0, VOLUME_BOOST_MAX, 1)
-        self.headset_vol.set_digits(0)
-        self.headset_vol.set_hexpand(True)
-        self.headset_vol.add_mark(100, Gtk.PositionType.BOTTOM, "100% HW")
-        self.headset_vol.add_mark(150, Gtk.PositionType.BOTTOM, "150%")
-        self.headset_vol.add_mark(200, Gtk.PositionType.BOTTOM, "200%")
-        self._guard_slider_scroll(self.headset_vol)
-        self.headset_vol.connect("button-press-event", self._on_vol_press)
-        self.headset_vol.connect_after("button-release-event", self._on_vol_release)
-        self.headset_vol.connect("value-changed", self.on_headset_vol_changed)
-        boost_row.pack_start(self.headset_vol, True, True, 0)
-        self.headset_vol_value = Gtk.Label(label="—")
-        boost_row.pack_start(self.headset_vol_value, False, False, 0)
-        volf.pack_start(boost_row, False, False, 2)
-        self._sync_headset_vol_slider()
-
-        wheel_row = Gtk.Box(spacing=8)
-        wheel_copy = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        wheel_title = Gtk.Label(
-            label="Headset earcup wheel", xalign=0)
-        style(wheel_title, "g935-primary-title")
-        wheel_copy.pack_start(wheel_title, False, False, 0)
-        wheel_note = Gtk.Label(xalign=0)
-        style(wheel_note, "g935-subtitle")
-        wheel_note.set_line_wrap(True)
-        wheel_note.set_text(
-            "Fine movements use short presses; fast sweeps are decoded from "
-            "how long the receiver holds the direction. Every percentage is "
-            "applied as a smooth 1% step. "
-            "Direction chatter and runaway repeats are filtered. "
-            "Wheel and tray scroll use the same 0–200% scale as this bar.")
-        wheel_copy.pack_start(wheel_note, False, False, 0)
-        wheel_row.pack_start(wheel_copy, True, True, 0)
-        self.wheel_sw = Gtk.Switch()
-        self.wheel_sw.set_active(self.settings.data["wheel_enabled"])
-        self.wheel_sw.connect(
-            "notify::active", self.on_wheel_setting_changed)
-        wheel_row.pack_end(self.wheel_sw, False, False, 0)
-        volf.pack_start(wheel_row, False, False, 0)
-
-        feel_heading = Gtk.Box(spacing=8)
-        feel_title = Gtk.Label(label="Wheel feel", xalign=0)
-        style(feel_title, "g935-primary-title")
-        feel_heading.pack_start(feel_title, True, True, 0)
-        reset_feel = Gtk.Button(label="Reset balanced defaults")
-        reset_feel.connect("clicked", self.on_wheel_defaults)
-        feel_heading.pack_end(reset_feel, False, False, 0)
-        volf.pack_start(feel_heading, False, False, 4)
-
-        feel_grid = Gtk.Grid(column_spacing=12, row_spacing=8)
-        feel_grid.set_hexpand(True)
-        self._wheel_feel_controls = {}
-
-        def add_feel_control(row, attr, key, title, detail,
-                             lower, upper, step, suffix):
-            copy = Gtk.Box(
-                orientation=Gtk.Orientation.VERTICAL, spacing=1)
-            label = Gtk.Label(label=title, xalign=0)
-            copy.pack_start(label, False, False, 0)
-            sub = Gtk.Label(label=detail, xalign=0)
-            style(sub, "g935-subtitle")
-            sub.set_line_wrap(True)
-            copy.pack_start(sub, False, False, 0)
-            feel_grid.attach(copy, 0, row, 1, 1)
-
-            spin_box = Gtk.Box(spacing=5)
-            spin = Gtk.SpinButton.new_with_range(lower, upper, step)
-            spin.set_value(self.settings.data[key])
-            spin.connect("value-changed", self.on_wheel_setting_changed)
-            spin_box.pack_start(spin, False, False, 0)
-            spin_box.pack_start(
-                Gtk.Label(label=suffix), False, False, 0)
-            feel_grid.attach(spin_box, 1, row, 1, 1)
-            setattr(self, attr, spin)
-            self._wheel_feel_controls[key] = spin
-
-        add_feel_control(
-            0, "wheel_fine_step", "wheel_fine_step",
-            "Fine adjustment", "Immediate change from a tiny movement.",
-            1, 5, 1, "%")
-        add_feel_control(
-            1, "wheel_fine_interval", "wheel_fine_interval_ms",
-            "Fine cadence", "Lower feels more responsive during slow motion.",
-            40, 150, 1, "ms")
-        add_feel_control(
-            2, "wheel_hold_delay", "wheel_hold_delay_ms",
-            "Acceleration point",
-            "How long a movement stays in the gentle fine-control range.",
-            120, 600, 5, "ms")
-        add_feel_control(
-            3, "wheel_hold_interval", "wheel_hold_interval_ms",
-            "Fast cadence", "Delay between each 1% change during a fast sweep.",
-            25, 60, 1, "ms")
-        add_feel_control(
-            4, "wheel_step", "wheel_step",
-            "Maximum fast-sweep change",
-            "Caps the total change produced by one continuous sweep.",
-            10, 50, 1, "%")
-        add_feel_control(
-            5, "wheel_direction_guard", "wheel_direction_guard_ms",
-            "Reversal protection",
-            "Filters brief opposite reports; set to 0 for immediate reversal.",
-            0, 1000, 10, "ms")
-        volf.pack_start(feel_grid, False, False, 2)
-
-        diagnostics = Gtk.Expander(label="Diagnostics & auto-fit")
-        diagnostics_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        diagnostics_box.set_border_width(8)
-        diagnostics_note = Gtk.Label(xalign=0)
-        diagnostics_note.set_line_wrap(True)
-        diagnostics_note.set_text(
-            "Optional. Capture records the receiver's raw press/release "
-            "timeline and can fit the controls above. Manual tuning works "
-            "without running it.")
-        diagnostics_box.pack_start(
-            diagnostics_note, False, False, 0)
-        calibration_row = Gtk.Box(spacing=8)
-        self.wheel_calibration_status = Gtk.Label(xalign=0)
-        style(self.wheel_calibration_status, "g935-subtitle")
-        self.wheel_calibration_status.set_line_wrap(True)
-        calibration_row.pack_start(
-            self.wheel_calibration_status, True, True, 0)
-        calibrate = Gtk.Button(label="Capture & auto-fit…")
-        calibrate.connect("clicked", self.on_wheel_calibrate)
-        calibration_row.pack_end(calibrate, False, False, 0)
-        diagnostics_box.pack_start(calibration_row, False, False, 0)
-        diagnostics.add(diagnostics_box)
-        volf.pack_start(diagnostics, False, False, 2)
-        self._refresh_wheel_calibration_status()
-        volf.pack_start(Gtk.Separator(), False, False, 2)
-
-        self.settings_vol_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        volf.pack_start(self.settings_vol_box, False, False, 0)
-        self._vol_containers.append(self.settings_vol_box)
-
-        # feature discovery first; all device state is asserted from its
-        # completion callback. The 5s heartbeat retries discovery while the
-        # headset is off and polls battery once it's known.
+        # ---- Background timers & tray ----
         self._start_discovery()
         GLib.timeout_add_seconds(5, self.heartbeat)
         GLib.timeout_add_seconds(3, self._poll_daemon_status)
         GLib.timeout_add_seconds(8, self._poll_stereo_route)
-        self._setup_tray()
+        self.tray.setup()
         self._ipc_sock = None
         self.connect("delete-event", self.on_delete_event)
         self.connect("show", self._on_window_show)
-        GLib.idle_add(self._on_audio_change)   # first tray/settings population
-        GLib.idle_add(self._poll_stereo_route_once)  # first stereo check
+        self.connect("hide", self._on_view_changed)
+        self.stack.connect("notify::visible-child-name", self._on_view_changed)
+        GLib.idle_add(self._on_audio_change)
+        GLib.idle_add(self._poll_stereo_route_once)
 
-    # ---------- helpers ----------
-    def _page(self, name, title, scroll=False):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+    def _page(self, name: str, title: str):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         style(box, "g935-page")
-        box.set_border_width(14)
-        if scroll:
-            sw = Gtk.ScrolledWindow()
-            sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            sw.set_shadow_type(Gtk.ShadowType.NONE)
-            sw.add(box)
-            self.stack.add_titled(sw, name, title)
-        else:
-            self.stack.add_titled(box, name, title)
+        box.set_border_width(16)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_shadow_type(Gtk.ShadowType.NONE)
+        sw.add(box)
+        self.stack.add_titled(sw, name, title)
         return box
 
-    def _frame(self, parent, title):
-        f = Gtk.Frame()
-        style(f, "g935-card")
-        title_widget = Gtk.Label(label=title, xalign=0)
-        style(title_widget, "g935-section-title")
-        f.set_label_widget(title_widget)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_border_width(12)
-        f.add(box)
-        parent.pack_start(f, False, False, 0)
-        return box
-
-    def _info_row(self, parent, title):
-        row = Gtk.Box(spacing=10)
-        key = Gtk.Label(label=title, xalign=0)
-        style(key, "g935-info-key")
-        key.set_size_request(155, -1)
-        value = Gtk.Label(label="—", xalign=0)
-        value.set_selectable(True)
-        value.set_line_wrap(True)
-        row.pack_start(key, False, False, 0)
-        row.pack_start(value, True, True, 0)
-        parent.pack_start(row, False, False, 0)
-        return value
-
-    def _kpi_card(self, parent, title):
-        """Compact metric card: title + big value + small subtitle."""
-        frame = Gtk.Frame()
-        style(frame, "g935-kpi")
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        box.set_border_width(8)
-        frame.add(box)
-        title_lbl = Gtk.Label(xalign=0)
-        title_lbl.set_markup(f"<small>{GLib.markup_escape_text(title)}</small>")
-        value_lbl = Gtk.Label(xalign=0)
-        value_lbl.set_markup("<span size='large' weight='bold'>—</span>")
-        sub_lbl = Gtk.Label(xalign=0)
-        sub_lbl.set_markup("<small> </small>")
-        sub_lbl.set_line_wrap(True)
-        box.pack_start(title_lbl, False, False, 0)
-        box.pack_start(value_lbl, False, False, 0)
-        box.pack_start(sub_lbl, False, False, 0)
-        parent.pack_start(frame, True, True, 0)
-        return {"frame": frame, "title": title_lbl, "value": value_lbl, "sub": sub_lbl}
-
-    def _set_kpi(self, card, value_markup, sub_text=""):
-        card["value"].set_markup(value_markup)
-        esc = GLib.markup_escape_text(sub_text) if sub_text else " "
-        card["sub"].set_markup(f"<small>{esc}</small>")
-
-    def _guard_slider_scroll(self, scale):
-        """Let the page scroll over a slider until that slider is clicked."""
-        scale.set_can_focus(True)
-        scale.set_tooltip_text(
-            "Click once to focus this slider before adjusting it with the wheel.")
-        scale.connect("button-press-event", self._focus_slider)
-        scale.connect("scroll-event", self._on_guarded_slider_scroll)
-
-    @staticmethod
-    def _focus_slider(scale, _event):
-        scale.grab_focus()
-        return False
-
-    @staticmethod
-    def _on_guarded_slider_scroll(scale, event):
-        if scale.has_focus():
-            return False
-
-        # Consuming the event protects the value; forward the same motion to
-        # the containing page so scrolling over a bank of EQ sliders still
-        # moves the page naturally.
-        parent = scale.get_parent()
-        while parent is not None and not isinstance(parent, Gtk.ScrolledWindow):
-            parent = parent.get_parent()
-        if parent is None:
-            return True
-
-        adj = parent.get_vadjustment()
-        step = max(float(adj.get_step_increment()), 36.0)
-        direction = event.direction
-        if direction == Gdk.ScrollDirection.UP:
-            delta = -step
-        elif direction == Gdk.ScrollDirection.DOWN:
-            delta = step
-        elif direction == Gdk.ScrollDirection.SMOOTH:
-            ok, _dx, dy = event.get_scroll_deltas()
-            if not ok:
-                return True
-            delta = dy * step
-        else:
-            return True
-        upper = max(adj.get_lower(), adj.get_upper() - adj.get_page_size())
-        adj.set_value(min(upper, max(adj.get_lower(), adj.get_value() + delta)))
-        return True
-
-    def _build_eq_sliders(self, band_names):
-        sliders = Gtk.Box(spacing=4, homogeneous=True)
-        self.eq_sliders = []
-        self.eq_band_labels = []
-        for name in band_names:
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            s = Gtk.Scale.new_with_range(Gtk.Orientation.VERTICAL, -12, 12, 1)
-            s.set_inverted(True)          # +12 at top
-            s.set_size_request(-1, 150)
-            s.set_value(0)
-            s.add_mark(0, Gtk.PositionType.LEFT, None)
-            self._guard_slider_scroll(s)
-            s.connect("value-changed", self._mark_eq_custom)
-            col.pack_start(s, True, True, 0)
-            band_label = Gtk.Label(label=name)
-            col.pack_start(band_label, False, False, 0)
-            sliders.pack_start(col, True, True, 0)
-            self.eq_sliders.append(s)
-            self.eq_band_labels.append(band_label)
-        self.eq_box.pack_start(sliders, False, False, 0)
-
-        preset_row = Gtk.Box(spacing=10)
-        preset_label = Gtk.Label(xalign=0)
-        preset_label.set_markup("<b>Preset</b>")
-        preset_row.pack_start(preset_label, False, False, 0)
-        preset_note = Gtk.Label(
-            label="choose a tuned profile", xalign=0)
-        style(preset_note, "g935-subtitle")
-        preset_row.pack_start(preset_note, True, True, 0)
-
-        self.eq_preset_button = Gtk.MenuButton()
-        self.eq_preset_button.set_label("Presets")
-        self.eq_preset_button.set_size_request(185, -1)
-        preset_row.pack_end(self.eq_preset_button, False, False, 0)
-        self.eq_box.pack_start(preset_row, False, False, 0)
-
-        popover = Gtk.Popover.new(self.eq_preset_button)
-        popover.set_position(Gtk.PositionType.BOTTOM)
-        menu_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-        style(menu_box, "g935-preset-menu")
-        menu_box.set_border_width(8)
-        popover.add(menu_box)
-        self.eq_preset_button.set_popover(popover)
-
-        categories = (
-            ("Reference", ("Flat", "G HUB baseline")),
-            ("Tone", ("Bass boost", "Deep bass", "Warm", "V-shape",
-                      "Treble boost", "Late night")),
-            ("Voice & games", ("Vocal clarity", "Podcast", "FPS footsteps",
-                               "Cinematic", "Immersive")),
-            ("Music", ("Rock", "Electronic", "Classical", "Jazz", "Acoustic")),
-        )
-        available = self.profile["eq_presets"]
-        for category, names in categories:
-            valid = [
-                name for name in names
-                if name in available and (
-                    available[name] is None
-                    or len(available[name]) == len(band_names))
-            ]
-            if not valid:
-                continue
-            category_label = Gtk.Label(label=category, xalign=0)
-            style(category_label, "g935-preset-category")
-            menu_box.pack_start(category_label, False, False, 0)
-            grid = Gtk.Grid(column_spacing=6, row_spacing=6)
-            for index, name in enumerate(valid):
-                button = Gtk.Button(label=name)
-                style(button, "g935-preset-item")
-                button.set_hexpand(True)
-                button.set_halign(Gtk.Align.FILL)
-                button.connect(
-                    "clicked", self.on_eq_preset_menu, name, popover)
-                grid.attach(button, index % 3, index // 3, 1, 1)
-            menu_box.pack_start(grid, False, False, 0)
-        menu_box.show_all()
-        row = Gtk.Box(spacing=6)
-        b = Gtk.Button(label="Apply EQ")
-        b.get_style_context().add_class("suggested-action")
-        b.connect("clicked", self.on_eq_apply)
-        row.pack_start(b, True, True, 0)
-        b = Gtk.Button(label="Read active")
-        b.set_tooltip_text("Read the EQ currently active in headset RAM")
-        b.connect("clicked", lambda *_: self.send("eq", 2, "01", cb=self.got_eq))
-        row.pack_start(b, True, True, 0)
-        b = Gtk.Button(label="Load saved")
-        b.set_tooltip_text("Load the custom EQ stored in headset EEPROM")
-        b.connect("clicked", lambda *_: self.send("eq", 2, "00", cb=self.got_eq))
-        row.pack_start(b, True, True, 0)
-        self.eq_box.pack_start(row, False, False, 0)
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup(
-            "<small>Apply updates the active EQ immediately and saves it in "
-            "headset memory.</small>")
-        self.eq_box.pack_start(note, False, False, 0)
-        self.eq_box.show_all()
-
-    def _build_lighting_rows(self, zone_names):
-        saved_all = self.settings.data["lighting"]
-        for zone, zname in enumerate(zone_names):
-            saved = saved_all.get(str(zone), {})
-            zone_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            style(zone_box, "g935-zone")
-            zone_box.set_border_width(8)
-            row = Gtk.Box(spacing=8)
-            name = Gtk.Label(label=zname, xalign=0)
-            style(name, "g935-primary-title")
-            name.set_size_request(84, -1)
-            row.pack_start(name, False, False, 0)
-            combo = Gtk.ComboBoxText()
-            for e in LIGHT_MODES:
-                combo.append_text(e)
-            combo.set_active(saved.get("mode", 2))
-            row.pack_start(combo, False, False, 0)
-            color = Gtk.ColorButton()
-            rgba = Gdk.RGBA(); rgba.parse(saved.get("color", "#00B4FF"))
-            color.set_rgba(rgba)
-            row.pack_start(color, False, False, 0)
-            b = Gtk.Button(label="Apply")
-            b.get_style_context().add_class("suggested-action")
-            b.connect("clicked", self.on_light_apply, zone)
-            row.pack_end(b, False, False, 0)
-            zone_box.pack_start(row, False, False, 0)
-
-            opts = Gtk.Box(spacing=7)
-            period_label = Gtk.Label(label="Period")
-            style(period_label, "g935-subtitle")
-            opts.pack_start(period_label, False, False, 0)
-            period = Gtk.SpinButton.new_with_range(500, 20000, 100)
-            period.set_value(saved.get("period", 5000))
-            opts.pack_start(period, False, False, 0)
-            intensity_label = Gtk.Label(label="Intensity")
-            style(intensity_label, "g935-subtitle")
-            opts.pack_start(intensity_label, False, False, 0)
-            intensity = Gtk.SpinButton.new_with_range(0, 100, 1)
-            intensity.set_value(saved.get(
-                "intensity", self.profile["zone_brt"].get(zone, 100)))
-            opts.pack_start(intensity, False, False, 0)
-            waveform = Gtk.ComboBoxText()
-            for text in ("Default", "Sine", "Square", "Triangle",
-                         "Sawtooth", "Shark fin", "Exponential"):
-                waveform.append_text(text)
-            waveform.set_active(saved.get("waveform", 0))
-            opts.pack_start(waveform, False, False, 0)
-            ramp = Gtk.ComboBoxText()
-            for text in ("Default ramp", "Ramp", "No ramp"):
-                ramp.append_text(text)
-            ramp.set_active(saved.get("ramp", 2))
-            opts.pack_start(ramp, False, False, 0)
-            zone_box.pack_start(opts, False, False, 0)
-            self.light_box.pack_start(zone_box, False, False, 0)
-            self.zone_widgets[zone] = {
-                "name": name, "mode": combo, "color": color,
-                "period": period, "intensity": intensity,
-                "waveform": waveform, "ramp": ramp,
-            }
-            combo.connect("changed", self._update_light_fields, zone)
-            self._update_light_fields(combo, zone)
-        read_row = Gtk.Box(spacing=6)
-        self.light_read_active = Gtk.Button(label="Read active")
-        self.light_read_active.set_tooltip_text(
-            "Load the effects currently playing from headset RAM")
-        self.light_read_active.connect(
-            "clicked", lambda *_: self._read_lighting(0))
-        self.light_read_active.set_sensitive(False)
-        read_row.pack_start(self.light_read_active, True, True, 0)
-        self.light_read_saved = Gtk.Button(label="Load saved")
-        self.light_read_saved.set_tooltip_text(
-            "Load the effects stored in headset EEPROM")
-        self.light_read_saved.connect(
-            "clicked", lambda *_: self._read_lighting(1))
-        self.light_read_saved.set_sensitive(False)
-        read_row.pack_start(self.light_read_saved, True, True, 0)
-        self.light_box.pack_start(read_row, False, False, 0)
-        self.light_boot_row = Gtk.Box(spacing=8)
-        self.light_boot_row.pack_start(
-            Gtk.Label(label="Headset boot-up animation", xalign=0),
-            True, True, 0)
-        self.light_boot_switch = Gtk.Switch()
-        self.light_boot_switch.set_active(True)
-        self.light_boot_switch.connect(
-            "notify::active", self.on_light_boot_toggle)
-        self.light_boot_row.pack_end(
-            self.light_boot_switch, False, False, 0)
-        self.light_boot_row.set_no_show_all(True)
-        self.light_boot_row.hide()
-        self.light_box.pack_start(self.light_boot_row, False, False, 0)
-        note = Gtk.Label(xalign=0)
-        note.set_line_wrap(True)
-        note.set_markup(
-            "<small>Apply updates the active effect and saves it in headset "
-            "memory. Reconnect reapplication is RAM-only.</small>")
-        self.light_box.pack_start(note, False, False, 0)
-        self.light_box.show_all()
-
-    def _update_light_fields(self, combo, zone):
-        widgets = self.zone_widgets[zone]
-        mode = combo.get_active()
-        widgets["color"].set_sensitive(mode in (1, 2))
-        widgets["period"].set_sensitive(mode in (2, 3))
-        widgets["intensity"].set_sensitive(mode in (2, 3))
-        widgets["waveform"].set_sensitive(mode == 2)
-        widgets["ramp"].set_sensitive(mode == 1)
-
-    # ---------- HID++ feature discovery / command building ----------
-    def cmd(self, feat, fn, params=""):
-        """Frame for a discovered feature: 11 ff <idx> <fn<<4|swid> <params>.
-        None if the device doesn't have the feature."""
+    # ---------- HID++ feature discovery ----------
+    def cmd(self, feat: str, fn: int, params: str = ""):
         idx = self.features.get(feat)
         if idx is None:
             return None
         return f"11ff{idx:02x}{(fn << 4) | 0x0b:02x}{params}"
 
-    def send(self, feat, fn, params="", cb=None):
+    def send(self, feat: str, fn: int, params: str = "", cb=None) -> None:
         hx = self.cmd(feat, fn, params)
         if hx:
             self.worker.submit(hx, cb)
 
-    def _start_discovery(self):
+    def _start_discovery(self) -> None:
         if self.discovered or self._discovering:
             return
         self._discovering = True
@@ -1515,7 +396,7 @@ class App(Gtk.Window):
         self._disc_queue = list(FEATURES)
         self._disc_next()
 
-    def _disc_next(self):
+    def _disc_next(self) -> None:
         if not self._disc_queue:
             if self._disc_err and not self._disc_found:
                 return self._walk_featureset()
@@ -1524,26 +405,22 @@ class App(Gtk.Window):
         self._disc_retried = False
         self._disc_probe()
 
-    def _disc_probe(self):
+    def _disc_probe(self) -> None:
         attr, fid = self._disc_cur
-        # IRoot getFeature(featureID): reply[4] = index, 0 = not present
-        self.worker.submit(f"11ff000b{fid:04x}",
-                           lambda st, rep, a=attr: self._got_feature(a, st, rep))
+        self.worker.submit(
+            f"11ff000b{fid:04x}",
+            lambda st, rep, a=attr: self._got_feature(a, st, rep))
 
-    def _got_feature(self, attr, status, reply):
+    def _got_feature(self, attr, status, reply) -> None:
         if status == "GONE" or not self._discovering:
-            # A late reply after the receiver dropped must not finish
-            # discovery with an empty map (heartbeat would then stop retrying).
             self._discovering = False
             return
         if status == "TIMEOUT":
-            # one retry: g935-dspd shares the hidraw and a collided reply
-            # looks identical to a powered-off headset
             if not self._disc_retried:
                 self._disc_retried = True
                 self._disc_probe()
                 return
-            self._discovering = False      # headset off - heartbeat retries
+            self._discovering = False
             self._mark_disconnected()
             return
         if status == "ACK" and reply[4]:
@@ -1558,11 +435,10 @@ class App(Gtk.Window):
             self._disc_err = True
         self._disc_next()
 
-    def _walk_featureset(self):
-        """Fallback when IRoot getFeature errors: walk IFeatureSet instead."""
+    def _walk_featureset(self) -> None:
         self.worker.submit("11ff010b", self._got_feat_count)
 
-    def _got_feat_count(self, status, reply):
+    def _got_feat_count(self, status, reply) -> None:
         if status == "GONE" or not self._discovering:
             self._discovering = False
             return
@@ -1575,7 +451,7 @@ class App(Gtk.Window):
         self._walk_left = list(range(1, min(reply[4], 32) + 1))
         self._walk_next()
 
-    def _walk_next(self):
+    def _walk_next(self) -> None:
         if not self._walk_left:
             wanted = {fid: attr for attr, fid in FEATURES}
             for idx, fid in self._walk_ids.items():
@@ -1583,10 +459,11 @@ class App(Gtk.Window):
                     self._disc_found[wanted[fid]] = idx
             return self._finish_discovery()
         i = self._walk_left.pop(0)
-        self.worker.submit(f"11ff011b{i:02x}",
-                           lambda st, rep, i=i: self._got_feat_id(i, st, rep))
+        self.worker.submit(
+            f"11ff011b{i:02x}",
+            lambda st, rep, idx=i: self._got_feat_id(idx, st, rep))
 
-    def _got_feat_id(self, i, status, reply):
+    def _got_feat_id(self, i, status, reply) -> None:
         if status == "GONE" or not self._discovering:
             self._discovering = False
             return
@@ -1606,14 +483,15 @@ class App(Gtk.Window):
                 )
         self._walk_next()
 
-    def _finish_discovery(self):
+    def _finish_discovery(self) -> None:
         self.features = self._disc_found
         self.feature_meta = self._disc_meta
         self.discovered = True
         self._discovering = False
-        self.log("--- discovered features: "
-                 + (", ".join(f"{a}={i:02x}" for a, i in self.features.items())
-                    or "none") + " ---")
+        self.log(
+            "--- discovered features: "
+            + (", ".join(f"{a}={i:02x}" for a, i in self.features.items()) or "none")
+            + " ---")
         for attr, widget in self.section_frames.items():
             present = attr in self.features
             widget.set_no_show_all(not present)
@@ -1634,30 +512,26 @@ class App(Gtk.Window):
         self._just_discovered = True
         self._assert_device_state(initial=True)
 
-    def _got_light_info(self, status, reply):
+    # ---------- Capability & identity probes ----------
+    def _got_light_info(self, status, reply) -> None:
         if status != "ACK":
             return
         n = reply[4] if 1 <= reply[4] <= 8 else 1
-        self._light_zone_count = n
-        nv_capabilities = (
-            (reply[5] << 8) | reply[6] if len(reply) > 6 else 0)
-        ext_capabilities = (
-            (reply[7] << 8) | reply[8] if len(reply) > 8 else 0)
-        readable = bool(ext_capabilities & 1)
+        nv_caps = (reply[5] << 8) | reply[6] if len(reply) > 6 else 0
+        ext_caps = (reply[7] << 8) | reply[8] if len(reply) > 8 else 0
+        readable = bool(ext_caps & 1)
         if not self.zone_widgets:
-            self._build_lighting_rows([f"Zone {z}" for z in range(n)])
+            build_lighting_rows(self, [f"Zone {z}" for z in range(n)])
             self._apply_saved_lighting()
         if hasattr(self, "light_read_active"):
             self.light_read_active.set_sensitive(readable)
             self.light_read_saved.set_sensitive(readable)
         if hasattr(self, "light_boot_row"):
-            supported = bool(nv_capabilities & 1)
+            supported = bool(nv_caps & 1)
             self.light_boot_row.set_no_show_all(not supported)
             self.light_boot_row.set_visible(supported)
             if supported:
-                self.send(
-                    "lighting", 4, "0001",
-                    cb=self._got_light_boot_state)
+                self.send("lighting", 4, "0001", cb=self._got_light_boot_state)
         self._light_caps = {}
         for zone in range(n):
             self.send(
@@ -1665,7 +539,7 @@ class App(Gtk.Window):
                 cb=lambda st, rep, z=zone: self._got_light_zone(z, st, rep))
         self._update_capability_summary()
 
-    def _got_light_zone(self, zone, status, reply):
+    def _got_light_zone(self, zone, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -1681,12 +555,11 @@ class App(Gtk.Window):
                 cb=lambda st, rep, z=zone: self._got_light_effect(z, st, rep))
         self._update_capability_summary()
 
-    def _got_light_effect(self, zone, status, reply):
+    def _got_light_effect(self, zone, status, reply) -> None:
         if status != "ACK":
             return
         try:
-            _z, index, effect_id, capabilities, period = \
-                parse_led_effect_info(reply)
+            _z, index, effect_id, capabilities, period = parse_led_effect_info(reply)
         except ValueError:
             return
         if zone not in self._light_caps:
@@ -1699,7 +572,7 @@ class App(Gtk.Window):
         }
         self._update_capability_summary()
 
-    def _got_eq_info(self, status, reply):
+    def _got_eq_info(self, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -1710,19 +583,20 @@ class App(Gtk.Window):
         n = info.bands
         if 1 <= n <= 12:
             if not self.eq_sliders:
-                self._build_eq_sliders([str(i + 1) for i in range(n)])
+                build_eq_sliders(self, [str(i + 1) for i in range(n)])
             for slider in self.eq_sliders:
                 slider.set_range(info.minimum_db, info.maximum_db)
+            sync_eq_curve(self)
             self._eq_freqs = []
             self._request_eq_frequency_page(0)
             self.send("eq", 2, "01", cb=self.got_eq)
             self._update_capability_summary()
-        else:                              # can't size the EQ - hide it
+        else:
             w = self.section_frames["eq"]
             w.set_no_show_all(True)
             w.set_visible(False)
 
-    def _request_eq_frequency_page(self, start):
+    def _request_eq_frequency_page(self, start: int) -> None:
         total = self._eq_info.bands
         if start >= total:
             self._set_eq_frequency_labels()
@@ -1733,7 +607,7 @@ class App(Gtk.Window):
             cb=lambda st, rep, s=start, n=count:
             self._got_eq_frequency_page(s, n, st, rep))
 
-    def _got_eq_frequency_page(self, start, count, status, reply):
+    def _got_eq_frequency_page(self, start, count, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -1745,13 +619,14 @@ class App(Gtk.Window):
         self._eq_freqs[start:start + count] = page
         self._request_eq_frequency_page(start + count)
 
-    def _set_eq_frequency_labels(self):
+    def _set_eq_frequency_labels(self) -> None:
         for label, frequency in zip(
                 getattr(self, "eq_band_labels", []), self._eq_freqs):
             label.set_text(format_frequency(frequency))
+        sync_eq_curve(self)
         self._update_capability_summary()
 
-    def _got_gkey_info(self, status, reply):
+    def _got_gkey_info(self, status, reply) -> None:
         if status == "ACK":
             self._gkey_count = min(reply[4], 32)
             self.gkey_labels["g0"].set_visible(True)
@@ -1759,10 +634,10 @@ class App(Gtk.Window):
                 self.gkey_labels[name].set_visible(i < self._gkey_count)
             self._update_capability_summary()
 
-    def _request_gkey_control(self):
+    def _request_gkey_control(self) -> None:
         self.send("gkeys", 1, cb=self._got_gkey_control)
 
-    def _got_gkey_control(self, status, reply):
+    def _got_gkey_control(self, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -1771,28 +646,27 @@ class App(Gtk.Window):
             return
         self._update_capability_summary()
 
-    def _update_feature_summary(self):
+    def _update_feature_summary(self) -> None:
         lines = ["Root / Feature Set  · protocol discovery"]
-        for attr, index in sorted(self.features.items(), key=lambda item: item[1]):
+        for attr, index in sorted(self.features.items(), key=lambda x: x[1]):
             fid, flags, version = self.feature_meta.get(
                 attr, (dict(FEATURES).get(attr, 0), 0, 0))
             label = FEATURE_LABELS.get(fid, attr)
             flag_text = f" · flags 0x{flags:02X}" if flags else ""
             lines.append(
-                f"Index {index:02X}  · 0x{fid:04X} {label}  · v{version}"
-                f"{flag_text}")
+                f"Index {index:02X}  · 0x{fid:04X} {label}  · v{version}{flag_text}")
         self.hw_features.set_text("\n".join(lines))
 
-    def _update_capability_summary(self):
+    def _update_capability_summary(self) -> None:
         lines = []
         if self._gkey_count:
             lines.append(
-                f"G keys: G0 (earcup mute button) + G1–G{self._gkey_count} "
-                "(HID++); tap/hold bindings in software mode")
+                f"G keys: G0 (earcup mute) + G1–G{self._gkey_count} (HID++); "
+                "tap/hold bindings in software mode")
         if self._gkey_control is not None:
             lines.append(
                 f"G-key control GET: 0x{self._gkey_control:02X} "
-                "(constant on this firmware; not the mode bit)")
+                "(constant on this firmware; not mode readback)")
         info = getattr(self, "_eq_info", None)
         if info:
             freqs = getattr(self, "_eq_freqs", [])
@@ -1801,35 +675,30 @@ class App(Gtk.Window):
                 f"Equalizer: {info.bands} bands, {info.minimum_db:+d} to "
                 f"{info.maximum_db:+d} dB"
                 + (f" ({freq_text} Hz)" if len(freqs) == info.bands else ""))
-            lines.append("EQ storage: active RAM + saved headset EEPROM")
         if self._light_caps:
             for zone in sorted(self._light_caps):
                 cap = self._light_caps[zone]
                 effects = ", ".join(
-                    effect["name"] for _idx, effect
-                    in sorted(cap["effects"].items()))
-                lines.append(
-                    f"Lighting {cap['name']}: {effects or 'probing effects…'}")
+                    e["name"] for _i, e in sorted(cap["effects"].items()))
+                lines.append(f"Lighting {cap['name']}: {effects or 'probing…'}")
         if "sidetone" in self.features:
             lines.append("Sidetone: level 0–100")
         if "battery" in self.features:
             timeout = getattr(self, "_power_timeout_minutes", None)
-            timeout_text = (
+            t_str = (
                 "never" if timeout == 0 else
                 f"{timeout} minutes" if timeout is not None else "probing…")
-            lines.append(
-                "Power: ADC voltage, charge-state flags, auto-off "
-                f"{timeout_text}")
+            lines.append(f"Power: ADC voltage, charge-state flags, auto-off {t_str}")
         self.hw_caps.set_text("\n".join(lines) if lines else "Probing…")
 
-    def _probe_device_identity(self):
+    def _probe_device_identity(self) -> None:
         if "devinfo" in self.features:
             self.send("devinfo", 0, cb=self._got_device_info)
         if "devname" in self.features:
             self.send("devname", 0, cb=self._got_device_name_count)
             self.send("devname", 2, cb=self._got_device_type)
 
-    def _got_device_info(self, status, reply):
+    def _got_device_info(self, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -1838,25 +707,20 @@ class App(Gtk.Window):
             return
         self.hw_values["unit"].set_text(info.unit_id)
         self.hw_values["model"].set_text(info.model_id)
-        devinfo_version = self.feature_meta.get("devinfo", (0, 0, 0))[2]
-        if devinfo_version == 0:
-            # Transport semantics were standardized after v0. G935 returns
-            # 0x03 here despite being a LIGHTSPEED USB-receiver headset.
-            transport = f"v0 raw value 0x{info.transport_mask:02X}"
-        else:
-            transport = (
-                ", ".join(info.transports) if info.transports
-                else "Not reported")
+        devinfo_ver = self.feature_meta.get("devinfo", (0, 0, 0))[2]
+        transport = (
+            f"v0 raw value 0x{info.transport_mask:02X}" if devinfo_ver == 0
+            else (", ".join(info.transports) or "Not reported")
+        )
         self.hw_values["transport"].set_text(transport)
         self.hw_values["entities"].set_text(str(info.entity_count))
         self._device_firmware = []
         for entity in range(min(info.entity_count, 16)):
             self.send(
                 "devinfo", 1, f"{entity:02x}",
-                cb=lambda st, rep, e=entity:
-                self._got_firmware_info(e, st, rep))
+                cb=lambda st, rep, e=entity: self._got_firmware_info(e, st, rep))
 
-    def _got_firmware_info(self, entity, status, reply):
+    def _got_firmware_info(self, entity, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -1870,16 +734,16 @@ class App(Gtk.Window):
         self._device_firmware.append((entity, text))
         self._device_firmware.sort()
         self.hw_values["firmware"].set_text(
-            "\n".join(value for _index, value in self._device_firmware))
+            "\n".join(v for _i, v in self._device_firmware))
 
-    def _got_device_name_count(self, status, reply):
+    def _got_device_name_count(self, status, reply) -> None:
         if status != "ACK":
             return
         self._device_name_count = min(reply[4], 255)
         self._device_name_parts = bytearray()
         self._request_device_name_chunk(0)
 
-    def _request_device_name_chunk(self, start):
+    def _request_device_name_chunk(self, start: int) -> None:
         if start >= self._device_name_count:
             name = bytes(self._device_name_parts[:self._device_name_count])
             self.hw_values["name"].set_text(
@@ -1887,10 +751,9 @@ class App(Gtk.Window):
             return
         self.send(
             "devname", 1, f"{start:02x}",
-            cb=lambda st, rep, s=start:
-            self._got_device_name_chunk(s, st, rep))
+            cb=lambda st, rep, s=start: self._got_device_name_chunk(s, st, rep))
 
-    def _got_device_name_chunk(self, start, status, reply):
+    def _got_device_name_chunk(self, start, status, reply) -> None:
         if status != "ACK":
             return
         remaining = self._device_name_count - start
@@ -1900,33 +763,29 @@ class App(Gtk.Window):
         self._device_name_parts.extend(chunk)
         self._request_device_name_chunk(start + len(chunk))
 
-    def _got_device_type(self, status, reply):
+    def _got_device_type(self, status, reply) -> None:
         if status == "ACK":
             self.hw_values["type"].set_text(
                 DEVICE_TYPES.get(reply[4], f"Type {reply[4]}"))
 
-    def _assert_device_state(self, initial):
-        """The single re-assert path, used after discovery and on power-on.
-
-        The panel and g935-dspd may both assert the same persisted mode. The
-        SET is idempotent, and sending it before lighting/EQ prevents a
-        confirmed reconnect replay from leaving the switch visually enabled
-        while the on-headset soundstage is actually flat.
-        """
+    def _assert_device_state(self, initial: bool) -> None:
         self.send("gkeys", 2, f"{1 if self.dsp_sw.get_active() else 0:02x}")
         self._apply_saved_lighting()
         if initial:
             self.send("sidetone", 0, cb=self.got_sidetone)
-            # EQ is read by _got_eq_info once band count/range are confirmed.
         else:
             self._apply_sidetone()
             self._apply_eq(persistence=0)
-        # HID++ burst on the shared hidraw — keep presence from declaring
-        # offline mid-reassert (which would re-enter this path).
         self._battery_presence.note_activity(25.0)
 
-    def on_link_change(self, up):
-        """HidWorker reopened (or lost) the hidraw node after unplug/replug."""
+    # ---------- Link, transport & logging ----------
+    def _on_transport_change(self, via_daemon: bool) -> None:
+        if hasattr(self, "hw_values") and "transport_link" in self.hw_values:
+            self.hw_values["transport_link"].set_text(self.worker.transport_label)
+        self._update_mode_chip()
+        self.log(f"--- control link: {self.worker.transport_label} ---")
+
+    def on_link_change(self, up: bool) -> None:
         if up:
             self.log("--- receiver link up: rediscovering ---")
             self.discovered = False
@@ -1941,7 +800,9 @@ class App(Gtk.Window):
             self.features = {}
             self._mark_disconnected()
 
-    def log(self, text):
+    def log(self, text: str) -> None:
+        if not hasattr(self, "logbuf"):
+            return
         self.logbuf.insert(self.logbuf.get_end_iter(), text + "\n")
         count = self.logbuf.get_line_count()
         if count > 2000:
@@ -1951,10 +812,10 @@ class App(Gtk.Window):
         mark = self.logbuf.create_mark(None, self.logbuf.get_end_iter(), False)
         self.logview.scroll_mark_onscreen(mark)
 
-    def log_traffic(self, hx, status, reply):
+    def log_traffic(self, hx, status, reply) -> None:
         if status == "ACK":
             h = reply.hex()
-            while h.endswith("00"):    # trim padding bytes, not meaningful nibbles
+            while h.endswith("00"):
                 h = h[:-2]
             self.log(f"→ {hx:<30} ✓ {h}")
         elif status == "ERR":
@@ -1966,65 +827,83 @@ class App(Gtk.Window):
         else:
             self.log(f"→ {hx:<30} … no reply")
 
-    def _set_mic_status(self, markup_small, markup_big):
-        self.mic_label.set_markup(markup_small)
-        self.mic_big.set_markup(f"<span size='large'>{markup_big}</span>")
+    # ---------- Software mode & G-key bindings ----------
+    def _update_mode_chip(self) -> None:
+        if not hasattr(self, "mode_chip"):
+            return
+        sw_on = self.dsp_sw.get_active()
+        d_up = self.worker.via_daemon or daemon_running()
+        if sw_on and d_up:
+            self.mode_chip.set_markup("<b>DSP</b> · daemon")
+            set_chip_tone(self.mode_chip, "ok")
+        elif sw_on:
+            self.mode_chip.set_markup("<b>DSP</b> · no daemon")
+            set_chip_tone(self.mode_chip, "warn")
+        else:
+            self.mode_chip.set_markup("HW mode")
+            set_chip_tone(self.mode_chip, None)
 
-    # ---------- software DSP / G-key diversion ----------
-    def on_dsp_toggle(self, sw, _pspec):
-        # Function 2 is the mode SET. Function 1 ACKs but stays 0x01 on the
-        # G935, so the switch remains the saved target, not a device readback.
+    def on_dsp_toggle(self, sw, _pspec) -> None:
         on = sw.get_active()
+        mode = "ghub" if on else "hardware"
+        save_mode(mode)
         self.send("gkeys", 2, f"{1 if on else 0:02x}")
-        save_mode("ghub" if on else "hardware")
         self._request_gkey_control()
         self._update_mode_note()
         self._update_mic_note()
+        self._update_mode_chip()
 
-    def _update_mode_note(self):
+    def _on_daemon_mode(self, mode: str) -> None:
+        want = mode == "ghub"
+        if self.dsp_sw.get_active() != want:
+            self.dsp_sw.handler_block_by_func(self.on_dsp_toggle)
+            self.dsp_sw.set_active(want)
+            self.dsp_sw.handler_unblock_by_func(self.on_dsp_toggle)
+            self._update_mode_note()
+            self._update_mic_note()
+            self._update_mode_chip()
+
+    def _update_mode_note(self) -> None:
         if self.dsp_sw.get_active():
-            if daemon_running():
+            if self.worker.via_daemon or daemon_running():
                 self.mode_note.set_markup(
-                    "<small>Software mode: open soundstage ON; G0–G3 fire the "
-                    "bindings below. Mic boom is managed by <b>g935-dspd</b>. "
-                    "G0 is the bottom earcup key.</small>")
+                    "<small>Software mode active: open DSP soundstage ON, "
+                    "G0–G3 fire your bindings, and <b>g935-dspd</b> manages "
+                    "boom mute and the earcup wheel.</small>")
             else:
                 self.mode_note.set_markup(
                     "<small><span foreground='#e01b24'><b>Software mode without "
-                    "g935-dspd:</b> "
-                    "boom mute will stick until the daemon is running.</span> "
-                    "Start it with: <tt>systemctl --user enable --now g935-dsp</tt></small>")
+                    "g935-dspd:</b> boom mute will stick until the daemon runs.</span> "
+                    "Start with: <tt>systemctl --user enable --now g935-dsp</tt></small>")
         else:
             self.mode_note.set_markup(
-                "<small>Hardware mode (default): stock flat sound; mic is fully "
-                "self-managed (boom up = mute, boom down = unmute, G0 still "
-                "toggles mute on-device). G1–G3 stay on-headset. "
-                "Flip the switch for the open G HUB soundstage.</small>")
+                "<small>Hardware mode: stock flat sound; boom mute and earcup "
+                "buttons are handled directly in headset firmware.</small>")
 
-    def on_binding_changed(self, combo, key, layer):
+    def on_binding_changed(self, combo, key, layer) -> None:
         action = combo.get_active_id() or "none"
         prev = self._bindings[key].layer(layer)
         self._set_binding_layer(key, layer, Binding(action, prev.command))
         self._bind_cmds[key][layer].set_visible(action == "command")
         self._save_bindings()
 
-    def on_binding_command(self, entry, key, layer):
+    def on_binding_command(self, entry, key, layer) -> None:
         prev = self._bindings[key].layer(layer)
         self._set_binding_layer(key, layer, Binding(prev.action, entry.get_text()))
         self._save_bindings()
 
-    def _set_binding_layer(self, key, layer, slot: Binding):
+    def _set_binding_layer(self, key, layer, slot: Binding) -> None:
         cur = self._bindings[key]
-        if layer == "hold":
-            self._bindings[key] = KeyBinding(cur.tap, slot)
-        else:
-            self._bindings[key] = KeyBinding(slot, cur.hold)
+        self._bindings[key] = (
+            KeyBinding(cur.tap, slot) if layer == "hold"
+            else KeyBinding(slot, cur.hold)
+        )
 
-    def _save_bindings(self):
+    def _save_bindings(self) -> None:
         self.settings.data["bindings"] = bindings_to_data(self._bindings)
         self.settings.save()
 
-    def _fire_binding(self, key, layer):
+    def _fire_binding(self, key: str, layer: str) -> None:
         kb = self._bindings.get(key)
         if kb is None:
             return
@@ -2036,15 +915,14 @@ class App(Gtk.Window):
         self.log(
             f"--- {KEY_LABELS[key]} {layer} {label}: "
             f"{'ok' if ok else 'failed'} {detail} ---")
-        self.gkey_last.set_text(
-            f"{KEY_LABELS[key]} {layer}: {label}")
+        self.gkey_last.set_text(f"{KEY_LABELS[key]} {layer}: {label}")
 
-    def _arm_hold_check(self):
+    def _arm_hold_check(self) -> None:
         if self._hold_src is not None:
             return
         self._hold_src = GLib.timeout_add(50, self._hold_tick)
 
-    def _hold_tick(self):
+    def _hold_tick(self) -> bool:
         for key in self._holds.due(time.monotonic()):
             self._fire_binding(key, "hold")
         if self._holds.pending():
@@ -2087,8 +965,7 @@ class App(Gtk.Window):
             current = (
                 self.eq_preset_button.get_label()
                 if hasattr(self, "eq_preset_button") else "")
-            nxt = cycle_name(
-                names, current, 1 if action == "next_eq" else -1)
+            nxt = cycle_name(names, current, 1 if action == "next_eq" else -1)
             if not nxt:
                 return False, "no presets"
             self.on_eq_preset(None, nxt)
@@ -2100,7 +977,7 @@ class App(Gtk.Window):
             return run_command(binding.command)
         return False, f"unknown {action}"
 
-    def on_hidpp_event(self, report):
+    def on_hidpp_event(self, report: bytes) -> None:
         if len(report) < 8:
             return
         if report[2] != self.features.get("gkeys") or report[3] != 0:
@@ -2116,7 +993,7 @@ class App(Gtk.Window):
         for i in range(min(count, len(HID_KEYS))):
             bit = 1 << i
             down = bool(mask & bit)
-            self.gkey_labels[HID_KEYS[i]].set_sensitive(down)
+            set_gkey_pill_active(self.gkey_labels[HID_KEYS[i]], down)
             key = key_for_index(i)
             if changed & bit:
                 events.append(f"G{i + 1} {'down' if down else 'up'}")
@@ -2124,12 +1001,9 @@ class App(Gtk.Window):
                     if down:
                         self._holds.press(key, now)
                         self._arm_hold_check()
-                    else:
-                        if self._holds.release(key) == "tap":
-                            self._fire_binding(key, "tap")
+                    elif self._holds.release(key) == "tap":
+                        self._fire_binding(key, "tap")
             elif changed == 0 and down and key:
-                # A repeated identical "down" with no intervening release is
-                # a new click on press-only firmware, not a stuck key.
                 events.append(f"G{i + 1} down")
                 if self._holds.release(key) == "tap":
                     self._fire_binding(key, "tap")
@@ -2141,28 +1015,34 @@ class App(Gtk.Window):
             self.gkey_last.set_text(text)
             self.log(f"--- G-key event: {text} ---")
 
-    def _update_mic_note(self):
+    # ---------- Mic ----------
+    def _set_mic_status(self, markup_small: str, markup_big: str) -> None:
+        self.mic_label.set_markup(markup_small)
+        if hasattr(self, "mic_big"):
+            self.mic_big.set_markup(markup_big)
+
+    def _update_mic_note(self) -> None:
         if not hasattr(self, "mic_note"):
             return
         if not self.dsp_sw.get_active():
             self.mic_note.set_markup(
-                "<small>Hardware mode: boom mute is fully on-device. Host switch is a "
-                "separate mute layer.</small>")
-        elif daemon_running():
+                "<small>Hardware mode: boom mute is handled on-device. "
+                "Host switch is an independent capture layer.</small>")
+        elif self.worker.via_daemon or daemon_running():
             self.mic_note.set_markup(
-                "<small>Software mode: g935-dspd clears the boom flag with a slow host-mute "
-                "pulse ~2s after boom-down, and implements the button toggle.</small>")
+                "<small>Software mode: g935-dspd clears the boom flag with a "
+                "1.5s host-mute pulse after boom-down.</small>")
         else:
             self.mic_note.set_markup(
-                "<small><span foreground='#e01b24'>Daemon not running — boom mute will "
-                "stick after raising the mic. Start g935-dsp, or use Unstick / hardware "
-                "mode.</span></small>")
+                "<small><span foreground='#e01b24'>Daemon not running — boom "
+                "mute will stick after raising the mic.</span></small>")
 
-    # ---------- host mic switch ----------
-    def on_hostmic_toggle(self, sw, _pspec):
+    def on_hostmic_toggle(self, sw, _pspec) -> None:
         _set_host_mic(sw.get_active())
 
-    def _refresh_hostmic(self):
+    def _refresh_hostmic(self) -> None:
+        if not hasattr(self, "hostmic_sw"):
+            return
         state = _read_host_mic()
         if state is None:
             return
@@ -2170,37 +1050,35 @@ class App(Gtk.Window):
         self.hostmic_sw.set_active(state)
         self.hostmic_sw.handler_unblock_by_func(self.on_hostmic_toggle)
 
-    # ---------- mic state ----------
-    def on_boom_change(self, down):
-        """Boom position, polled from the headset itself (see read_boom). The
-        0x08 event stream is only a notification channel - our own host-mute
-        writes echo back through it looking exactly like real boom moves."""
+    def on_boom_change(self, down: bool) -> None:
+        update_mic_badge(self, down)
         if not down:
-            self._set_mic_status("🎤 <b>muted</b>", "🎤 muted (boom up)")
+            self._set_mic_status("🎤 <b>muted</b>", "Boom raised — headset mute flag set")
+            set_chip_tone(self.mic_label, "bad")
             self.log("--- boom raised: headset mute flag SET ---")
         elif self.dsp_sw.get_active():
-            self._set_mic_status("🎤 <b>live</b>", "🎤 boom down — daemon unmutes (~2s)")
+            self._set_mic_status("🎤 <b>live</b>", "Boom lowered — daemon clears mute (~2s)")
+            set_chip_tone(self.mic_label, "ok")
             self.log("--- boom lowered: daemon runs the unmute pulse ---")
         else:
-            self._set_mic_status("🎤 <b>live</b>", "🎤 live (boom down)")
+            self._set_mic_status("🎤 <b>live</b>", "Boom lowered — microphone live")
+            set_chip_tone(self.mic_label, "ok")
             self.log("--- boom lowered: unmuted (hardware mode) ---")
 
-    def _clear_g0_flash(self):
+    def _clear_g0_flash(self) -> bool:
         self._g0_flash_src = None
         if not self._g0_down and "g0" in self.gkey_labels:
-            self.gkey_labels["g0"].set_sensitive(False)
+            set_gkey_pill_active(self.gkey_labels["g0"], False)
         return False
 
-    def on_mic_event(self, bits):
+    def on_mic_event(self, bits: int) -> None:
         button = bool(bits & BUTTON) and not bits & (BOOM_UP | BOOM_DOWN)
         hold_set = self._bindings["g0"].hold.action != "none"
         if button:
-            # 0x08 often sends press-only (08 01) without a release report.
-            # When no hold is bound, fire on every press so G0 never sticks.
             if not hold_set:
                 self._g0_down = False
                 if "g0" in self.gkey_labels:
-                    self.gkey_labels["g0"].set_sensitive(True)
+                    set_gkey_pill_active(self.gkey_labels["g0"], True)
                     if self._g0_flash_src is not None:
                         GLib.source_remove(self._g0_flash_src)
                     self._g0_flash_src = GLib.timeout_add(
@@ -2208,10 +1086,8 @@ class App(Gtk.Window):
                 if self.dsp_sw.get_active():
                     self._fire_binding("g0", "tap")
             else:
-                if self._g0_down:
-                    # Press-only repeat while hold is bound: flush prior tap.
-                    if self._holds.release("g0") == "tap":
-                        self._fire_binding("g0", "tap")
+                if self._g0_down and self._holds.release("g0") == "tap":
+                    self._fire_binding("g0", "tap")
                 self._g0_down = True
                 self._on_g0_edge(True)
             self.log("--- G0 (earcup key) ---")
@@ -2220,9 +1096,9 @@ class App(Gtk.Window):
             self._g0_down = False
             self._on_g0_edge(False)
 
-    def _on_g0_edge(self, down):
+    def _on_g0_edge(self, down: bool) -> None:
         if "g0" in self.gkey_labels:
-            self.gkey_labels["g0"].set_sensitive(down)
+            set_gkey_pill_active(self.gkey_labels["g0"], down)
         if not self.dsp_sw.get_active():
             return
         hold_set = self._bindings["g0"].hold.action != "none"
@@ -2237,70 +1113,76 @@ class App(Gtk.Window):
         else:
             self._holds.release("g0")
 
-    # ---------- sidetone ----------
-    def on_sidetone(self, _scale):
+    # ---------- Sidetone ----------
+    def on_sidetone(self, scale) -> None:
+        val = int(round(scale.get_value()))
+        if hasattr(self, "sidetone_badge"):
+            self.sidetone_badge.set_text(f"{val}%")
         if self._sidetone_pending:
             GLib.source_remove(self._sidetone_pending)
-        self._sidetone_pending = GLib.timeout_add(200, self._apply_sidetone)
+        self._sidetone_pending = GLib.timeout_add(160, self._apply_sidetone)
 
-    def _apply_sidetone(self):
+    def _apply_sidetone(self) -> bool:
         self._sidetone_pending = None
         self.send("sidetone", 1, f"{int(self.sidetone.get_value()):02x}")
         return False
 
-    def got_sidetone(self, status, reply):
+    def got_sidetone(self, status, reply) -> None:
         if status == "ACK":
             self.sidetone.handler_block_by_func(self.on_sidetone)
             self.sidetone.set_value(reply[4])
             self.sidetone.handler_unblock_by_func(self.on_sidetone)
+            if hasattr(self, "sidetone_badge"):
+                self.sidetone_badge.set_text(f"{int(reply[4])}%")
 
-    # ---------- power management ----------
-    def _got_power_timeout(self, status, reply):
+    # ---------- Power management ----------
+    def _got_power_timeout(self, status, reply) -> None:
         if status != "ACK":
             return
         self._power_timeout_minutes = reply[4]
         self.power_timeout.set_value(reply[4])
         self._update_capability_summary()
 
-    def on_power_timeout_apply(self, _btn):
+    def on_power_timeout_apply(self, _btn) -> None:
         minutes = int(self.power_timeout.get_value())
         self.send(
             "battery", 2, f"{minutes:02x}",
             cb=self._got_power_timeout_after_write)
 
-    def _got_power_timeout_after_write(self, status, _reply):
+    def _got_power_timeout_after_write(self, status, _reply) -> None:
         if status == "ACK":
-            self._power_timeout_minutes = int(
-                self.power_timeout.get_value())
+            self._power_timeout_minutes = int(self.power_timeout.get_value())
             self._update_capability_summary()
 
     # ---------- EQ ----------
-    def _mark_eq_custom(self, _scale):
+    def _mark_eq_custom(self, _scale) -> None:
         if hasattr(self, "eq_preset_button"):
             self.eq_preset_button.set_label("Presets")
+        sync_eq_curve(self)
 
-    def on_eq_preset_menu(self, button, name, popover):
+    def on_eq_preset_menu(self, button, name, popover) -> None:
         popover.popdown()
         self.on_eq_preset(button, name)
 
-    def on_eq_preset(self, _btn, name):
+    def on_eq_preset(self, _btn, name: str) -> None:
         gains = self.profile["eq_presets"][name] or [0] * len(self.eq_sliders)
         for s, v in zip(self.eq_sliders, gains):
             s.set_value(v)
         self.eq_preset_button.set_label(name)
+        sync_eq_curve(self)
         self.on_eq_apply(None)
 
-    def _apply_eq(self, persistence=1):
+    def _apply_eq(self, persistence: int = 1) -> None:
         if not self.eq_sliders:
             return
-        gains = "".join(f"{int(s.get_value()) & 0xFF:02x}" for s in self.eq_sliders)
-        # Persistence 1 updates RAM and EEPROM; 0 is RAM-only (reconnect).
+        gains = "".join(
+            f"{int(s.get_value()) & 0xFF:02x}" for s in self.eq_sliders)
         self.send("eq", 3, f"{persistence:02x}" + gains)
 
-    def on_eq_apply(self, _btn):
+    def on_eq_apply(self, _btn) -> None:
         self._apply_eq(persistence=1)
 
-    def got_eq(self, status, reply):
+    def got_eq(self, status, reply) -> None:
         if status != "ACK":
             return
         for s, b in zip(self.eq_sliders, reply[4:4 + len(self.eq_sliders)]):
@@ -2312,38 +1194,40 @@ class App(Gtk.Window):
              if (gains or [0] * len(self.eq_sliders)) == current),
             "Presets")
         self.eq_preset_button.set_label(matched)
+        sync_eq_curve(self)
 
-    # ---------- lighting ----------
-    def _got_light_boot_state(self, status, reply):
+    # ---------- Lighting ----------
+    def _update_light_fields(self, combo, zone) -> None:
+        widgets = self.zone_widgets[zone]
+        mode = combo.get_active()
+        widgets["color"].set_sensitive(mode in (1, 2))
+        widgets["period"].set_sensitive(mode in (2, 3))
+        widgets["intensity"].set_sensitive(mode in (2, 3))
+        widgets["waveform"].set_sensitive(mode == 2)
+        widgets["ramp"].set_sensitive(mode == 1)
+        sync_lighting_preview(self, zone)
+
+    def _got_light_boot_state(self, status, reply) -> None:
         if status != "ACK" or len(reply) < 9:
             return
         state = reply[6]
         self._light_boot_params = (reply[7], reply[8])
-        self.light_boot_switch.handler_block_by_func(
-            self.on_light_boot_toggle)
-        # State 0 means the factory default (enabled); 1/2 are enabled/disabled.
+        self.light_boot_switch.handler_block_by_func(self.on_light_boot_toggle)
         self.light_boot_switch.set_active(state != 2)
-        self.light_boot_switch.handler_unblock_by_func(
-            self.on_light_boot_toggle)
+        self.light_boot_switch.handler_unblock_by_func(self.on_light_boot_toggle)
 
-    def on_light_boot_toggle(self, switch, _pspec):
+    def on_light_boot_toggle(self, switch, _pspec) -> None:
         state = 1 if switch.get_active() else 2
         param1, param2 = getattr(self, "_light_boot_params", (0, 0))
-        self.send(
-            "lighting", 5,
-            f"0001{state:02x}{param1:02x}{param2:02x}")
+        self.send("lighting", 5, f"0001{state:02x}{param1:02x}{param2:02x}")
 
-    def _light_params(self, zone, persistence=0):
+    def _light_params(self, zone, persistence: int = 0) -> str:
         widgets = self.zone_widgets[zone]
         mode = widgets["mode"].get_active()
         rgba = widgets["color"].get_rgba()
-        r, g, b = (
-            round(rgba.red * 255),
-            round(rgba.green * 255),
-            round(rgba.blue * 255),
-        )
+        rgb = (round(rgba.red * 255), round(rgba.green * 255), round(rgba.blue * 255))
         return build_light_params(
-            zone, mode, (r, g, b),
+            zone, mode, rgb,
             period_ms=int(widgets["period"].get_value()),
             intensity=int(widgets["intensity"].get_value()),
             waveform=widgets["waveform"].get_active(),
@@ -2351,15 +1235,17 @@ class App(Gtk.Window):
             persistence=persistence,
         )
 
-    def on_light_apply(self, _btn, zone):
-        # Persistence 1 updates the active effect and saved EEPROM together.
+    def on_light_apply(self, _btn, zone) -> None:
         self.send("lighting", 3, self._light_params(zone, persistence=1))
         widgets = self.zone_widgets[zone]
         rgba = widgets["color"].get_rgba()
         self.settings.data["lighting"][str(zone)] = {
             "mode": widgets["mode"].get_active(),
-            "color": "#%02X%02X%02X" % (round(rgba.red * 255), round(rgba.green * 255),
-                                        round(rgba.blue * 255)),
+            "color": "#%02X%02X%02X" % (
+                round(rgba.red * 255),
+                round(rgba.green * 255),
+                round(rgba.blue * 255),
+            ),
             "period": int(widgets["period"].get_value()),
             "intensity": int(widgets["intensity"].get_value()),
             "waveform": widgets["waveform"].get_active(),
@@ -2367,23 +1253,22 @@ class App(Gtk.Window):
         }
         self.settings.save()
 
-    def _apply_saved_lighting(self):
-        # Zones the user never Applied are left alone. Reconnect uses volatile
-        # writes because the deliberate Apply already saved the EEPROM state.
+    def on_light_apply_all(self, _btn) -> None:
+        for zone in sorted(self.zone_widgets):
+            self.on_light_apply(None, zone)
+
+    def _apply_saved_lighting(self) -> None:
         for zone in self.zone_widgets:
             if str(zone) in self.settings.data["lighting"]:
-                self.send(
-                    "lighting", 3,
-                    self._light_params(zone, persistence=0))
+                self.send("lighting", 3, self._light_params(zone, persistence=0))
 
-    def _read_lighting(self, source):
+    def _read_lighting(self, source: int) -> None:
         for zone in self.zone_widgets:
             self.send(
                 "lighting", 14, f"{zone:02x}{source:02x}",
-                cb=lambda st, rep, z=zone:
-                self._got_lighting_state(z, st, rep))
+                cb=lambda st, rep, z=zone: self._got_lighting_state(z, st, rep))
 
-    def _got_lighting_state(self, zone, status, reply):
+    def _got_lighting_state(self, zone, status, reply) -> None:
         if status != "ACK":
             return
         try:
@@ -2408,211 +1293,54 @@ class App(Gtk.Window):
             widgets["waveform"].set_active(min(state.waveform, 6))
         if state.mode == 1:
             widgets["ramp"].set_active(min(state.ramp, 2))
+        sync_lighting_preview(self, zone)
 
-    # ---------- console ----------
-    def on_full_sequence(self, _btn):
+    # ---------- Developer console ----------
+    def on_full_sequence(self, _btn) -> None:
         self.log("--- G HUB connect sequence ---")
-        self.dsp_sw.set_active(True)   # sequence includes gkeys 01 = G HUB mode
+        self.dsp_sw.set_active(True)
         for feat, fn, params in self.profile["connect_burst"]:
             self.send(feat, fn, params)
         self.send("sidetone", 0, cb=self.got_sidetone)
         self.send("eq", 2, "01", cb=self.got_eq)
 
-    def on_raw_send(self, _w):
+    def on_raw_send(self, _w) -> None:
         hx = self.raw_entry.get_text().strip().replace(" ", "")
         if hx:
             self.worker.submit(hx)
 
-    # ---------- tray ----------
-    def _retry_tray(self):
-        self._setup_tray()
-        return False
-
-    def _setup_tray(self):
-        if self.indicator:
-            return
-        if AppIndicator is None:
-            self._tray_waiting = False
-            self.log("--- tray skipped: Ayatana AppIndicator not installed ---")
-            return
-        if not sni_watcher_present():
-            self._tray_sni_tries += 1
-            if self._tray_sni_tries <= TRAY_SNI_RETRY_MAX:
-                self._tray_waiting = True
-                if self._tray_sni_tries == 1:
-                    self.log("--- tray host not ready, waiting ---")
-                GLib.timeout_add_seconds(TRAY_SNI_RETRY_S, self._retry_tray)
-                return
-            self._tray_waiting = False
-            # Ayatana registers itself when the watcher appears later.
-            # Giving up here left --tray with no icon for the rest of the session.
-            self.log("--- tray host still missing; registering anyway ---")
-        self._tray_waiting = False
-        icon = sni_icon_name()
-        category = AppIndicator.IndicatorCategory.APPLICATION_STATUS
-        self.indicator = AppIndicator.Indicator.new(APP_ID, icon, category)
-        theme_dir = icon_theme_dir()
-        if theme_dir:
-            self.indicator.set_icon_theme_path(theme_dir)
-        try:
-            self.indicator.set_icon_full(icon, "G935 Control")
-        except Exception:
-            self.indicator.set_icon(icon)
-        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
-        self.indicator.set_title(f"{self.profile['name']} Control")
-        try:
-            self.indicator.connect("scroll-event", self.on_tray_scroll)
-        except TypeError:
-            pass
-        self._rebuild_tray_menu()
-        self.log(f"--- tray active ({icon}) ---")
-
-    def on_tray_scroll(self, _ind, delta, direction):
-        # DOWN is wheel-up: Ayatana flips Plasma's positive angleDelta.y.
-        if direction == Gdk.ScrollDirection.DOWN:
-            way = "down"
-        elif direction == Gdk.ScrollDirection.UP:
-            way = "up"
-        else:
-            way = "other"
-        notches, self._tray_scroll_acc = tray_scroll_notches(
-            way, delta, self._tray_scroll_acc)
-        if notches == 0:
-            return
-        name = self._headset_sink()
-        if not name:
-            return
-        cur = self.audio.get_volume("sink", name)
-        if cur is None:
-            return
-        new = max(0, min(VOLUME_BOOST_MAX, cur + notches * 5))
-        if new != cur:
-            self.audio.set_volume("sink", name, new)
-
-    def _tray_header_label(self):
-        name = self.profile["name"]
-        text = self._tray_status
-        if text:
-            return f"{name} — {text}"
-        return name
-
-    def _update_tray_battery(self, text):
-        self._tray_status = text
-        if self.indicator:
-            self.indicator.set_title(f"{self.profile['name']} · {text}")
-        if self.tray_batt_item:
-            self.tray_batt_item.set_label(self._tray_header_label())
-
-    def _audio_snapshot(self):
-        return (
-            self.audio.list_sinks(),
-            self.audio.default_sink(),
-            self.audio.list_sources(),
-            self.audio.default_source(),
-        )
-
-    def _tray_menu_signature(self, snapshot=None):
-        """Identity of the menu. Volume changes are not part of it."""
-        all_sinks, def_sink, all_sources, def_source = (
-            snapshot if snapshot is not None else self._audio_snapshot()
-        )
-        hidden_sinks = set(self.settings.data["hidden_sinks"])
-        hidden_sources = set(self.settings.data["hidden_sources"])
-        sinks = tuple(
-            (name, desc) for name, desc in all_sinks
-            if name not in hidden_sinks)
-        sources = tuple(
-            (name, desc) for name, desc in all_sources
-            if name not in hidden_sources)
-        return (
-            sinks, def_sink,
-            sources, def_source,
-            bool(getattr(self, "_stereo_broken", False)),
-        )
-
-    def _rebuild_tray_menu(self, snapshot=None):
-        if not self.indicator:
-            return
-        if snapshot is None:
-            snapshot = self._audio_snapshot()
-        signature = self._tray_menu_signature(snapshot)
-        if signature == self._tray_menu_sig and self.tray_batt_item:
-            self.tray_batt_item.set_label(self._tray_header_label())
-            return
-        self._tray_menu_sig = signature
-        menu = Gtk.Menu()
-
-        self.tray_batt_item = Gtk.MenuItem(label=self._tray_header_label())
-        self.tray_batt_item.set_sensitive(False)
-        menu.append(self.tray_batt_item)
-        menu.append(Gtk.SeparatorMenuItem())
-
-        all_sinks, def_sink, all_sources, def_source = snapshot
-        hidden_sinks = set(self.settings.data["hidden_sinks"])
-        hidden_sources = set(self.settings.data["hidden_sources"])
-        for kind, devs, hidden, default, setter in (
-                ("Output", all_sinks,
-                 hidden_sinks,
-                 def_sink, self.audio.set_default_sink),
-                ("Input", all_sources,
-                 hidden_sources,
-                 def_source, self.audio.set_default_source)):
-            hdr = Gtk.MenuItem(label=kind)
-            hdr.set_sensitive(False)
-            menu.append(hdr)
-            visible = [(name, desc) for name, desc in devs if name not in hidden]
-            # The first radio in a new group is born active, and GTK ignores
-            # set_active(False) on that only item. A hidden placeholder keeps
-            # the check off when the real default is filtered out.
-            group = None
-            if not any(name == default for name, _desc in visible):
-                group = Gtk.RadioMenuItem.new_with_label_from_widget(None, "")
-                group.set_active(True)
-            for name, desc in visible:
-                item = Gtk.RadioMenuItem.new_with_label_from_widget(group, desc)
-                group = group or item
-                item.set_active(name == default)   # before connect: no echo
-                item.connect("activate",
-                             lambda it, n=name, f=setter:
-                             it.get_active() and f(n))
-                menu.append(item)
-            menu.append(Gtk.SeparatorMenuItem())
-
-        it = Gtk.MenuItem(label="Mixer…")
-        it.connect("activate", lambda *_: self._show_mixer())
-        menu.append(it)
-        if getattr(self, "_stereo_broken", False):
-            it = Gtk.MenuItem(label="Fix stereo (right earcup)")
-            it.connect("activate", self.on_fix_stereo)
-            menu.append(it)
-        it = Gtk.MenuItem(label="Show/Hide Control Panel")
-        it.connect("activate", lambda *_: (self.hide() if self.get_visible()
-                                           else self.present()))
-        menu.append(it)
-        menu.append(Gtk.SeparatorMenuItem())
-        it = Gtk.MenuItem(label="Quit")
-        it.connect("activate", self.on_quit)
-        menu.append(it)
-
-        menu.show_all()
-        self.indicator.set_menu(menu)
-
-    def on_delete_event(self, *_):
-        if self.indicator or self._tray_waiting:  # hide to tray, keep running
+    # ---------- Window lifecycle & single-instance IPC ----------
+    def on_delete_event(self, *_) -> bool:
+        if self.tray.indicator or self.tray.waiting:
             self.hide()
             return True
-        return False                # no tray: normal close -> destroy -> quit
+        return False
 
-    def _on_window_show(self, *_):
-        if self._health_ui_dirty:
-            self._health_ui_dirty = False
-            if self._last_batt_display is not None:
-                self._refresh_health_display(
-                    *self._last_batt_display, force_ui=True)
-            else:
-                self._refresh_health_display(None, None, "…", force_ui=True)
+    def _on_window_show(self, *_) -> None:
+        self._on_view_changed()
 
-    def listen_for_activation(self, sock=None):
+    def _on_view_changed(self, *_) -> None:
+        visible = bool(self.get_visible())
+        page = self.stack.get_visible_child_name()
+        if hasattr(self, "light_preview"):
+            if visible and page == "lighting":
+                sync_lighting_preview(self)
+            self.light_preview.set_animating(visible and page == "lighting")
+        if hasattr(self, "batt_graphic"):
+            self.batt_graphic.set_animating(visible and page == "health")
+        if visible and page == "health":
+            if self.worker.via_daemon:
+                if self.health.reload_if_changed():
+                    self._health_ui_dirty = True
+            if self._health_ui_dirty:
+                self._health_ui_dirty = False
+                if self._last_batt_display is not None:
+                    self._refresh_health_display(
+                        *self._last_batt_display, force_ui=True)
+                else:
+                    self._refresh_health_display(None, None, "…", force_ui=True)
+
+    def listen_for_activation(self, sock=None) -> None:
         if sock is not None:
             self._ipc_sock = sock
         if getattr(self, "_ipc_sock", None) is None:
@@ -2624,7 +1352,7 @@ class App(Gtk.Window):
         GLib.io_add_watch(
             self._ipc_sock.fileno(), GLib.IO_IN, self._on_activation)
 
-    def _on_activation(self, *_):
+    def _on_activation(self, *_) -> bool:
         try:
             self._ipc_sock.recv(64)
         except OSError:
@@ -2632,25 +1360,37 @@ class App(Gtk.Window):
         self.present()
         return True
 
-    def on_quit(self, *_):
+    def on_quit(self, *_) -> None:
         if getattr(self, "_quitting", False):
             return
         self._quitting = True
-        dialog = getattr(self, "_wheel_cal_dialog", None)
-        if dialog is not None:
-            dialog.response(Gtk.ResponseType.CANCEL)
+        if hasattr(self, "light_preview"):
+            self.light_preview.set_animating(False)
+        if hasattr(self, "batt_graphic"):
+            self.batt_graphic.set_animating(False)
+        if self._wheel_wizard is not None:
+            self._wheel_wizard.cancel()
         self.audio.stop()
+        was_daemon = self.worker.via_daemon
         try:
             self.worker.stop()
         except Exception:
             pass
-        self.health.save()
+        if not was_daemon:
+            self.health.save()
         self.settings.save()
         Gtk.main_quit()
 
-    # ---------- audio devices: settings toggles, volume rows, mixer ----------
-    def _nudge_headset_volume(self, delta):
-        """G-key volume. Absolute percent on the G935 node, capped at 200."""
+    # ---------- Audio devices, volume & wheel settings ----------
+    def _audio_snapshot(self):
+        return (
+            self.audio.list_sinks(),
+            self.audio.default_sink(),
+            self.audio.list_sources(),
+            self.audio.default_source(),
+        )
+
+    def _nudge_headset_volume(self, delta: int):
         name = self._headset_sink()
         if not name:
             return False, "no sink"
@@ -2676,483 +1416,133 @@ class App(Gtk.Window):
                     self._last_known_g935_sink = sink_name
                     break
         elif self._last_known_g935_sink:
-            # A failed pactl list does not mean the headset left; keep the
-            # last real G935 node instead of jumping to HDMI/speakers.
             name = self._last_known_g935_sink
         if name is None:
             name = self.audio.default_sink()
         self._headset_sink_cache = (now + 2.0, name)
         return name
 
-    def _sync_headset_vol_slider(self):
+    def _sync_headset_vol_slider(self) -> None:
         if getattr(self, "headset_vol", None) is None:
             return
         if self._vol_interacting or self._headset_vol_pending:
             return
         name = self._headset_sink()
         raw = self.audio.get_volume("sink", name) if name else None
+        muted = self.audio.get_mute("sink", name) if name else None
         if raw is None:
-            self.headset_vol_value.set_text("—")
+            update_headset_vol_badge(self, None, None)
             return
         self.headset_vol.handler_block_by_func(self.on_headset_vol_changed)
         self.headset_vol.set_value(raw)
         self.headset_vol.handler_unblock_by_func(self.on_headset_vol_changed)
-        self.headset_vol_value.set_text(f"{int(raw)}%")
+        update_headset_vol_badge(self, raw, muted)
 
-    def on_headset_vol_changed(self, scale):
+    def on_headset_vol_changed(self, scale) -> None:
         pct = int(round(scale.get_value()))
-        self.headset_vol_value.set_text(f"{pct}%")
+        update_headset_vol_badge(self, pct, False)
         if self._headset_vol_pending:
             GLib.source_remove(self._headset_vol_pending)
         self._headset_vol_pending = GLib.timeout_add(
-            80, self._flush_headset_vol, pct)
+            60, self._flush_headset_vol, pct)
 
-    def _flush_headset_vol(self, pct):
+    def _flush_headset_vol(self, pct: int) -> bool:
         self._headset_vol_pending = None
         name = self._headset_sink()
         if name:
             self.audio.set_volume("sink", name, pct)
         return False
 
-    def _on_vol_press(self, _scale, _event):
+    def on_headset_mute_toggle(self, _btn) -> None:
+        name = self._headset_sink()
+        if name:
+            self.audio.toggle_mute("sink", name)
+            GLib.timeout_add(60, lambda: (self._sync_headset_vol_slider(), False)[1])
+
+    def _on_vol_press(self, _scale, _event) -> bool:
         self._vol_interacting = True
         return False
 
-    def _on_vol_release(self, _scale, _event):
+    def _on_vol_release(self, _scale, _event) -> bool:
         self._vol_interacting = False
         return False
 
-    def on_wheel_setting_changed(self, *_args):
+    def on_wheel_setting_changed(self, *args) -> None:
         self.settings.data["wheel_enabled"] = self.wheel_sw.get_active()
         for key, control in self._wheel_feel_controls.items():
             self.settings.data[key] = int(control.get_value())
-        source = _args[0] if _args else None
+        source = args[0] if args else None
         if source is not self.wheel_sw:
             self.settings.data["wheel_calibrated"] = False
         self.settings.save()
         self._refresh_wheel_calibration_status()
 
-    def _sync_wheel_feel_controls(self):
+    def _sync_wheel_feel_controls(self) -> None:
         for key, control in self._wheel_feel_controls.items():
             control.handler_block_by_func(self.on_wheel_setting_changed)
             control.set_value(self.settings.data[key])
             control.handler_unblock_by_func(self.on_wheel_setting_changed)
 
-    def on_wheel_defaults(self, *_args):
-        defaults = {
+    def on_wheel_defaults(self, *_args) -> None:
+        self.settings.data.update({
             "wheel_fine_step": DEFAULT_FINE_STEP,
             "wheel_fine_interval_ms": round(FINE_INTERVAL_S * 1000),
             "wheel_hold_delay_ms": round(HOLD_REPEAT_DELAY_S * 1000),
-            "wheel_hold_interval_ms": round(
-                HOLD_REPEAT_INTERVAL_S * 1000),
+            "wheel_hold_interval_ms": round(HOLD_REPEAT_INTERVAL_S * 1000),
             "wheel_step": DEFAULT_STEP,
-            "wheel_direction_guard_ms": round(
-                DIRECTION_GUARD_S * 1000),
-        }
-        self.settings.data.update(defaults)
-        self.settings.data["wheel_calibrated"] = False
+            "wheel_direction_guard_ms": round(DIRECTION_GUARD_S * 1000),
+            "wheel_calibrated": False,
+        })
         self._sync_wheel_feel_controls()
         self.settings.save()
         self._refresh_wheel_calibration_status()
 
-    def _refresh_wheel_calibration_status(self):
+    def _refresh_wheel_calibration_status(self) -> None:
         if self.settings.data.get("wheel_calibrated"):
             self.wheel_calibration_status.set_text(
-                "Last capture was applied · "
-                f"fast rate after "
-                f"{self.settings.data['wheel_hold_delay_ms']} ms · "
-                f"1% every "
-                f"{self.settings.data['wheel_hold_interval_ms']} ms · "
+                f"Calibrated · fast rate after {self.settings.data['wheel_hold_delay_ms']} ms · "
+                f"every {self.settings.data['wheel_hold_interval_ms']} ms · "
                 f"up to {self.settings.data['wheel_step']}% per sweep")
         else:
             self.wheel_calibration_status.set_text(
                 "Manual comfort settings active. Capture is optional.")
 
-    def on_wheel_calibrate(self, *_args):
-        if getattr(self, "_wheel_cal_dialog", None) is not None:
-            self._wheel_cal_dialog.present()
+    def on_wheel_calibrate(self, *_args) -> None:
+        if self._wheel_wizard is not None and self._wheel_wizard.dialog is not None:
+            self._wheel_wizard.dialog.present()
             return
-
-        original_enabled = self.settings.data["wheel_enabled"]
-        self.settings.data["wheel_enabled"] = False
-        self.settings.save()
-        self.wheel_sw.handler_block_by_func(self.on_wheel_setting_changed)
-        self.wheel_sw.set_active(False)
-        self.wheel_sw.handler_unblock_by_func(self.on_wheel_setting_changed)
-
-        dialog = Gtk.Dialog(
-            title="Calibrate G935 volume wheel",
-            transient_for=self, modal=True)
-        dialog.set_default_size(620, 460)
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        next_button = dialog.add_button("Next", Gtk.ResponseType.APPLY)
-        next_button.set_sensitive(False)
-        self._wheel_cal_dialog = dialog
-        self._wheel_cal_fd = None
-        self._wheel_cal_watch = None
-        self._wheel_cal_stage = None
-        self._wheel_cal_samples = {
-            "slow_up": [], "slow_down": [],
-            "fast_up": [], "fast_down": [],
-        }
-        self._wheel_cal_pending = {}
-        self._wheel_cal_raw = []
-        self._wheel_cal_capture_saved = False
-
-        box = dialog.get_content_area()
-        box.set_spacing(12)
-        box.set_border_width(16)
-
-        heading = Gtk.Label(xalign=0)
-        style(heading, "g935-primary-title")
-        heading.set_line_wrap(True)
-        box.pack_start(heading, False, False, 0)
-
-        instruction = Gtk.Label(xalign=0)
-        instruction.set_line_wrap(True)
-        box.pack_start(instruction, False, False, 0)
-
-        progress = Gtk.ProgressBar()
-        progress.set_show_text(True)
-        box.pack_start(progress, False, False, 0)
-
-        live = Gtk.Label(xalign=0)
-        live.set_selectable(True)
-        live.set_line_wrap(True)
-        live.set_size_request(-1, 125)
-        style(live, "g935-zone")
-        box.pack_start(live, False, False, 0)
-
-        target_row = Gtk.Box(spacing=8)
-        target_row.pack_start(Gtk.Label(
-            label="Target fast rolls from 0–100%", xalign=0),
-            True, True, 0)
-        target_rolls = Gtk.SpinButton.new_with_range(3, 5, 1)
-        target_rolls.set_value(3)
-        target_row.pack_end(target_rolls, False, False, 0)
-        box.pack_start(target_row, False, False, 0)
-
-        foot = Gtk.Label(xalign=0)
-        style(foot, "g935-subtitle")
-        foot.set_line_wrap(True)
-        foot.set_text(
-            "The daemon releases the media-key interface only while this "
-            "wizard is open. Volume will not change during capture. Every "
-            "raw press, repeat, release, direction, and timestamp is recorded "
-            "locally for debugging.")
-        box.pack_start(foot, False, False, 0)
-
-        self._wheel_cal_widgets = {
-            "heading": heading, "instruction": instruction,
-            "progress": progress, "live": live,
-            "next": next_button,
-        }
-        stages = (
-            ("slow_up", "Slow upward calibration",
-             "Make exactly 5 small, deliberate upward rolls—the finest "
-             "movements you would use near your target volume. Then click Next.",
-             5, KEY_VOLUMEUP),
-            ("slow_down", "Slow downward calibration",
-             "Make exactly 5 small, deliberate downward rolls. Pause between "
-             "them as you would for fine adjustment, then click Next.",
-             5, KEY_VOLUMEDOWN),
-            ("fast_up", "Fast upward calibration",
-             "Make 3 separate fast upward sweeps toward 100%. The receiver "
-             "reports each sweep as one held UP press, so let it release "
-             "fully between samples. Then click Next.",
-             3, KEY_VOLUMEUP),
-            ("fast_down", "Fast downward calibration",
-             "Make 3 separate fast downward sweeps toward 0%. Let the "
-             "receiver release fully between samples, then click Next.",
-             3, KEY_VOLUMEDOWN),
-        )
-
-        GLib.timeout_add(150, self._wheel_cal_try_open)
-        result = None
-        applied = False
+        self._wheel_wizard = WheelCalibrationWizard(self)
         try:
-            for key, title, copy, target, expected_code in stages:
-                self._wheel_cal_stage = key
-                self._wheel_cal_target = target
-                self._wheel_cal_expected = expected_code
-                heading.set_text(title)
-                instruction.set_text(copy)
-                next_button.set_label("Next")
-                self._wheel_cal_update_live()
-                dialog.show_all()
-                response = dialog.run()
-                if response != Gtk.ResponseType.APPLY:
-                    break
-            else:
-                self._wheel_cal_stage = None
-                result = analyze_calibration(
-                    self._wheel_cal_samples,
-                    int(target_rolls.get_value()))
-                capture_path = self._wheel_cal_save_capture(result)
-                counts = result["counts"]
-                fast_ms = [round(value * 1000)
-                           for value in result["fast_gaps"]]
-                slow_ms = [round(value * 1000)
-                           for value in result["slow_gaps"]]
-                max_step = result["wheel_step"]
-                slow_holds_ms = [
-                    round(value * 1000)
-                    for value in result["slow_holds"]
-                ]
-                fast_holds_ms = [
-                    round(value * 1000)
-                    for value in result["fast_holds"]
-                ]
-                fine_step = result["wheel_fine_step"]
-                heading.set_text("Calibration result")
-                instruction.set_text(
-                    "Review the measured data below. Apply saves this profile "
-                    "and returns the wheel to the background service.")
-                live.set_text(
-                    "Headset-reported rolls\n"
-                    f"  Slow up {counts['slow_up']}/5 · "
-                    f"Slow down {counts['slow_down']}/5\n"
-                    f"  Fast up {counts['fast_up']}/3 · "
-                    f"Fast down {counts['fast_down']}/3\n"
-                    f"  Opposite-direction reports: "
-                    f"{result['wrong_directions']}\n\n"
-                    f"Raw input events captured: "
-                    f"{len(self._wheel_cal_raw)}\n"
-                    f"Neutral gaps · fast {fast_ms or ['none']} ms · "
-                    f"slow {slow_ms or ['none']} ms\n"
-                    f"Fine holds: {slow_holds_ms or ['none']} ms\n"
-                    f"Fast holds: {fast_holds_ms or ['none']} ms\n"
-                    f"Duration decoder · first {fine_step}% immediately · "
-                    f"gentle steps every "
-                    f"{result['wheel_fine_interval_ms']} ms before "
-                    f"{result['wheel_hold_delay_ms']} ms · "
-                    f"then fast rate at 1% every "
-                    f"{result['wheel_hold_interval_ms']} ms\n"
-                    f"Maximum per sweep: {max_step}%\n\n"
-                    f"Full event trace saved to {capture_path}")
-                progress.set_fraction(1)
-                progress.set_text("Ready to apply")
-                next_button.set_label("Apply calibration")
-                next_button.set_sensitive(True)
-                dialog.show_all()
-                response = dialog.run()
-                if response == Gtk.ResponseType.APPLY:
-                    for key, value in result.items():
-                        if key.startswith("wheel_"):
-                            self.settings.data[key] = value
-                    applied = True
+            self._wheel_wizard.run()
         finally:
-            if (getattr(self, "_wheel_cal_raw", None)
-                    and not self._wheel_cal_capture_saved):
-                self._wheel_cal_save_capture(result)
-            self._wheel_cal_cleanup()
-            dialog.destroy()
-            self._wheel_cal_dialog = None
-            self.settings.data["wheel_enabled"] = original_enabled
-            self.settings.save()
-            self.wheel_sw.handler_block_by_func(
-                self.on_wheel_setting_changed)
-            self.wheel_sw.set_active(original_enabled)
-            self.wheel_sw.handler_unblock_by_func(
-                self.on_wheel_setting_changed)
-            if applied and result is not None:
-                self._sync_wheel_feel_controls()
-            self._refresh_wheel_calibration_status()
+            self._wheel_wizard = None
 
-    def _wheel_cal_try_open(self):
-        if getattr(self, "_wheel_cal_dialog", None) is None:
-            return False
-        if self._wheel_cal_fd is not None:
-            return False
-        path = find_wheel_device()
-        if path is None:
-            self._wheel_cal_widgets["live"].set_text(
-                "Waiting for the G935 input device…")
-            return True
-        fd = None
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            fcntl.ioctl(fd, EVIOCGRAB, 1)
-        except OSError as exc:
-            if fd is not None:
-                os.close(fd)
-            self._wheel_cal_widgets["live"].set_text(
-                f"Waiting for the daemon to release {path}…\n{exc}")
-            return True
-        self._wheel_cal_fd = fd
-        self._wheel_cal_watch = GLib.io_add_watch(
-            fd, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
-            self._wheel_cal_on_io)
-        self._wheel_cal_widgets["next"].set_sensitive(True)
-        self._wheel_cal_update_live()
-        return False
-
-    def _wheel_cal_on_io(self, fd, condition):
-        if condition & (GLib.IO_HUP | GLib.IO_ERR):
-            self._wheel_cal_watch = None
-            self._wheel_cal_widgets["live"].set_text(
-                "Wheel device disconnected. Reconnect it and restart calibration.")
-            return False
-        try:
-            data = os.read(fd, INPUT_EVENT.size * 64)
-        except (BlockingIOError, OSError):
-            return True
-        stage = self._wheel_cal_stage
-        if stage is None:
-            return True
-        events = self._wheel_cal_samples[stage]
-        for timestamp, code, value in parse_key_events(data):
-            self._wheel_cal_raw.append({
-                "stage": stage,
-                "timestamp": timestamp,
-                "code": code,
-                "value": value,
-            })
-            if value == 1:
-                event = {
-                    "press": timestamp, "release": None, "code": code,
-                }
-                events.append(event)
-                self._wheel_cal_pending[code] = event
-            elif value == 0:
-                event = self._wheel_cal_pending.pop(code, None)
-                if event is not None:
-                    event["release"] = timestamp
-        self._wheel_cal_update_live()
-        return True
-
-    def _wheel_cal_update_live(self):
-        widgets = getattr(self, "_wheel_cal_widgets", None)
-        stage = getattr(self, "_wheel_cal_stage", None)
-        if not widgets or stage is None:
-            return
-        events = self._wheel_cal_samples[stage]
-        expected = self._wheel_cal_expected
-        correct = sum(event["code"] == expected for event in events)
-        opposite = len(events) - correct
-        holds = [
-            (event["release"] - event["press"]) * 1000
-            for event in events if event["release"] is not None
-        ]
-        direction = "UP" if expected == KEY_VOLUMEUP else "DOWN"
-        last = events[-1] if events else None
-        last_text = (
-            ("UP" if last["code"] == KEY_VOLUMEUP else "DOWN")
-            if last else "waiting")
-        stage_raw = [
-            event for event in self._wheel_cal_raw
-            if event["stage"] == stage
-        ]
-        origin = stage_raw[0]["timestamp"] if stage_raw else 0
-        state_names = {0: "release", 1: "press", 2: "repeat"}
-        trace = "\n".join(
-            f"+{(event['timestamp'] - origin) * 1000:6.0f} ms  "
-            f"{'UP  ' if event['code'] == KEY_VOLUMEUP else 'DOWN'} "
-            f"{state_names.get(event['value'], str(event['value']))}"
-            for event in stage_raw[-8:]
-        )
-        widgets["progress"].set_fraction(
-            min(1, correct / max(1, self._wheel_cal_target)))
-        widgets["progress"].set_text(
-            f"{correct} of {self._wheel_cal_target} "
-            f"{'sweeps' if stage.startswith('fast_') else 'movements'} "
-            f"reported {direction}")
-        widgets["live"].set_text(
-            f"Expected direction: {direction}\n"
-            f"Reported: {correct} expected · {opposite} opposite · "
-            f"{len(events)} total\n"
-            f"Last report: {last_text}\n"
-            f"Completed hold durations: "
-            f"{', '.join(f'{value:.0f} ms' for value in holds[-6:]) or '—'}\n"
-            f"Raw timeline ({len(stage_raw)} events):\n{trace or 'waiting'}")
-
-    def _wheel_cal_save_capture(self, result=None):
-        """Persist a complete, human-readable physical-wheel event trace."""
-        raw = getattr(self, "_wheel_cal_raw", [])
-        origin = raw[0]["timestamp"] if raw else 0
-        state_names = {0: "release", 1: "press", 2: "repeat"}
-        payload = {
-            "version": 1,
-            "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "device": find_wheel_device(),
-            "events": [
-                {
-                    "t_ms": round((event["timestamp"] - origin) * 1000, 3),
-                    "stage": event["stage"],
-                    "direction": (
-                        "up" if event["code"] == KEY_VOLUMEUP else "down"),
-                    "state": state_names.get(
-                        event["value"], str(event["value"])),
-                    "code": event["code"],
-                    "value": event["value"],
-                }
-                for event in raw
-            ],
-            "gestures": self._wheel_cal_samples,
-            "analysis": result,
-        }
-        ensure_config_dir()
-        tmp = f"{WHEEL_CAPTURE_FILE}.{os.getpid()}.tmp"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(payload, f, indent=2)
-            os.replace(tmp, WHEEL_CAPTURE_FILE)
-            self._wheel_cal_capture_saved = True
-            return WHEEL_CAPTURE_FILE
-        except OSError as exc:
-            self.log(f"--- could not save wheel capture: {exc} ---")
-            return f"capture could not be saved ({exc})"
-
-    def _wheel_cal_cleanup(self):
-        watch = getattr(self, "_wheel_cal_watch", None)
-        if watch is not None:
-            try:
-                GLib.source_remove(watch)
-            except Exception:
-                pass
-        self._wheel_cal_watch = None
-        fd = getattr(self, "_wheel_cal_fd", None)
-        if fd is not None:
-            try:
-                fcntl.ioctl(fd, EVIOCGRAB, 0)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        self._wheel_cal_fd = None
-
-    def _on_audio_change(self, kind="devices"):
+    def _on_audio_change(self, kind: str = "devices") -> bool:
         if kind == "levels":
-            # Volume/mute only. Rebuilding the tray menu here used to run on
-            # every sink-input event (all playback), which closed an open
-            # menu and spawned a pactl storm.
             self._sync_headset_vol_slider()
             self._sync_volume_row_levels()
-            return
+            return False
         self._headset_sink_cache = None
         snapshot = self._audio_snapshot()
-        self._rebuild_tray_menu(snapshot=snapshot)
+        self.tray.rebuild_menu(snapshot=snapshot)
         self._refresh_device_toggles(snapshot=snapshot)
         self._sync_headset_vol_slider()
         self._refresh_volume_rows(snapshot=snapshot)
-        # Device re-enumerate after resume often breaks the FR link.
-        # The 8s poll still covers the quiet case; don't stack one-shots.
         self._schedule_stereo_check()
+        return False
 
-    def _schedule_stereo_check(self):
+    def _schedule_stereo_check(self) -> None:
         if getattr(self, "_stereo_check_id", None):
             return
         self._stereo_check_id = GLib.timeout_add(1500, self._stereo_check_done)
 
-    def _stereo_check_done(self):
+    def _stereo_check_done(self) -> bool:
         self._stereo_check_id = None
         self._poll_stereo_route_once()
         return False
 
-    def _refresh_device_toggles(self, snapshot=None):
-        all_sinks, _def_sink, all_sources, _def_source = (
+    def _refresh_device_toggles(self, snapshot=None) -> None:
+        all_sinks, _ds, all_sources, _dsrc = (
             snapshot if snapshot is not None else self._audio_snapshot()
         )
         box = self.dev_toggle_box
@@ -3173,7 +1563,7 @@ class App(Gtk.Window):
                 box.pack_start(cb, False, False, 0)
         box.show_all()
 
-    def _on_dev_toggle(self, cb, key, name):
+    def _on_dev_toggle(self, cb, key: str, name: str) -> None:
         hidden = set(self.settings.data[key])
         if cb.get_active():
             hidden.discard(name)
@@ -3182,77 +1572,18 @@ class App(Gtk.Window):
         self.settings.data[key] = sorted(hidden)
         self.settings.save()
         snapshot = self._audio_snapshot()
-        self._rebuild_tray_menu(snapshot=snapshot)
+        self.tray.rebuild_menu(snapshot=snapshot)
         self._refresh_volume_rows(snapshot=snapshot)
 
-    def _refresh_volume_rows(self, snapshot=None):
+    def _refresh_volume_rows(self, snapshot=None) -> None:
         if self._vol_pending or self._vol_interacting:
             return
         if snapshot is None:
             snapshot = self._audio_snapshot()
         for box in self._vol_containers:
-            self._build_volume_rows(box, snapshot=snapshot)
+            build_volume_rows(self, box, snapshot=snapshot)
 
-    def _build_volume_rows(self, container, snapshot=None):
-        all_sinks, def_sink, all_sources, def_source = (
-            snapshot if snapshot is not None else self._audio_snapshot()
-        )
-        for c in container.get_children():
-            c.destroy()
-        for kind, devs, hidden, default, setter in (
-                ("sink", all_sinks,
-                 set(self.settings.data["hidden_sinks"]),
-                 def_sink, self.audio.set_default_sink),
-                ("source", all_sources,
-                 set(self.settings.data["hidden_sources"]),
-                 def_source, self.audio.set_default_source)):
-            visible = [(name, desc) for name, desc in devs if name not in hidden]
-            group = None
-            if not any(name == default for name, _desc in visible):
-                # Hidden placeholder so no visible radio appears checked when
-                # the active default is filtered out.
-                group = Gtk.RadioButton.new_from_widget(None)
-                group.set_active(True)
-            for name, desc in visible:
-                row = Gtk.Box(spacing=8)
-                rb = Gtk.RadioButton.new_from_widget(group)
-                group = group or rb
-                rb.set_active(name == default)
-                rb.set_tooltip_text("make default")
-                rb.connect("toggled",
-                           lambda b, n=name, f=setter: b.get_active() and f(n))
-                row.pack_start(rb, False, False, 0)
-                lbl = Gtk.Label(label=desc, xalign=0)
-                lbl.set_ellipsize(Pango.EllipsizeMode.END)
-                lbl.set_size_request(180, -1)
-                row.pack_start(lbl, True, True, 0)
-                sc = Gtk.Scale.new_with_range(
-                    Gtk.Orientation.HORIZONTAL, 0, VOLUME_BOOST_MAX, 1)
-                sc.set_size_request(220, -1)
-                sc.set_value(self.audio.get_volume(kind, name) or 0)
-                sc.set_value_pos(Gtk.PositionType.RIGHT)
-                sc.add_mark(100, Gtk.PositionType.TOP, "100% HW")
-                self._guard_slider_scroll(sc)
-                sc.set_tooltip_text(
-                    "0–100% is the USB mixer. Past 100% is software gain "
-                    f"(up to {VOLUME_BOOST_MAX}%).")
-                sc.connect("button-press-event", self._on_vol_press)
-                sc.connect_after("button-release-event", self._on_vol_release)
-                sc.connect("value-changed", self._on_vol_slider, kind, name)
-                sc._g935_kind = kind
-                sc._g935_name = name
-                row._g935_scale = sc
-                row.pack_start(sc, True, True, 0)
-                container.pack_start(row, False, False, 0)
-        container.show_all()
-
-    def _sync_volume_row_levels(self):
-        """Move existing mixer sliders to the current volumes.
-
-        Does not rebuild rows, so an open tray menu and in-progress drag
-        stay put. ``handler_block`` keeps the update from writing the
-        volume back.
-        """
+    def _sync_volume_row_levels(self) -> None:
         if self._vol_interacting or self._vol_pending:
             return
         for box in self._vol_containers:
@@ -3261,68 +1592,60 @@ class App(Gtk.Window):
                 if scale is None:
                     continue
                 raw = self.audio.get_volume(scale._g935_kind, scale._g935_name)
-                if raw is None or int(scale.get_value()) == int(raw):
-                    continue
-                scale.handler_block_by_func(self._on_vol_slider)
-                scale.set_value(raw)
-                scale.handler_unblock_by_func(self._on_vol_slider)
+                if raw is not None and int(scale.get_value()) != int(raw):
+                    scale.handler_block_by_func(self._on_vol_slider)
+                    scale.set_value(raw)
+                    scale.handler_unblock_by_func(self._on_vol_slider)
+                mbtn = getattr(row, "_g935_mute_btn", None)
+                if mbtn is not None:
+                    muted = self.audio.get_mute(scale._g935_kind, scale._g935_name)
+                    if muted is not None:
+                        mbtn.set_label("🔇" if muted else "🔊")
 
-    def _on_vol_slider(self, scale, kind, name):
+    def _on_vol_slider(self, scale, kind: str, name: str) -> None:
         key = (kind, name)
         if key in self._vol_pending:
             GLib.source_remove(self._vol_pending[key])
         self._vol_pending[key] = GLib.timeout_add(
-            150, self._flush_vol, scale, kind, name)
+            120, self._flush_vol, scale, kind, name)
 
-    def _flush_vol(self, scale, kind, name):
+    def _flush_vol(self, scale, kind: str, name: str) -> bool:
         self._vol_pending.pop((kind, name), None)
         self.audio.set_volume(kind, name, scale.get_value())
         return False
 
-    def _show_mixer(self):
-        if self.mixer_win is None:
-            self.mixer_win = Gtk.Window(title="Mixer")
-            self.mixer_win.set_default_size(460, -1)
-            self.mixer_win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
-            self.mixer_win.set_position(Gtk.WindowPosition.CENTER)
-            apply_window_icon(self.mixer_win)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-            box.set_border_width(10)
-            self.mixer_win.add(box)
-            self.mixer_box = box
-            self._vol_containers.append(box)
-            self.mixer_win.connect("delete-event",
-                                   lambda w, e: (w.hide(), True)[1])
-        self._build_volume_rows(self.mixer_box)
-        self.mixer_win.show_all()
-        self.mixer_win.present()
+    # ---------- Battery health ----------
+    def _persist_health_settings(self) -> None:
+        if self.worker.via_daemon:
+            self.worker.update_health_settings(self.health.settings)
+        else:
+            self.health.save()
 
-    # ---------- battery health ----------
-    def on_track_toggle(self, sw, _pspec):
-        self.health.settings["tracking"] = sw.get_active()
-        if not sw.get_active():
-            self.health.close_segment("tracking disabled")
-        self.health.save()
-
-    def _refresh_health_display_cached(self):
+    def _refresh_health_display_cached(self) -> None:
         if self._last_batt_display is not None:
             self._refresh_health_display(*self._last_batt_display, force_ui=True)
         else:
             self._refresh_health_display(force_ui=True)
 
-    def on_spec_changed(self, spin, key):
+    def on_track_toggle(self, sw, _pspec) -> None:
+        self.health.settings["tracking"] = sw.get_active()
+        if not sw.get_active() and not self.worker.via_daemon:
+            self.health.close_segment("tracking disabled")
+        self._persist_health_settings()
+
+    def on_spec_changed(self, spin, key: str) -> None:
         v = spin.get_value()
         self.health.settings[key] = v if spin.get_digits() else int(v)
-        self.health.save()
+        self._persist_health_settings()
         self._refresh_health_display_cached()
 
-    def on_profile_changed(self, _combo):
+    def on_profile_changed(self, _combo) -> None:
         self.health.settings["runtime_profile"] = (
             "rgb_on" if self.profile_combo.get_active() == 0 else "rgb_off")
-        self.health.save()
+        self._persist_health_settings()
         self._refresh_health_display_cached()
 
-    def on_spec_reset(self, _btn):
+    def on_spec_reset(self, _btn) -> None:
         for key, sp in self.spec_spins.items():
             sp.handler_block_by_func(self.on_spec_changed)
             sp.set_value(HEALTH_DEFAULTS[key])
@@ -3332,493 +1655,41 @@ class App(Gtk.Window):
         self.profile_combo.handler_block_by_func(self.on_profile_changed)
         self.profile_combo.set_active(0)
         self.profile_combo.handler_unblock_by_func(self.on_profile_changed)
-        self.health.save()
+        self._persist_health_settings()
         self._refresh_health_display_cached()
 
-    @staticmethod
-    def _dur(seconds):
-        if seconds is None:
-            return "—"
-        seconds = int(seconds)
-        if seconds < 0:
-            seconds = 0
-        m = seconds // 60
-        if m >= 60:
-            return f"{m // 60}h{m % 60:02d}m"
-        if m > 0:
-            return f"{m}m"
-        return f"{seconds}s"
-
-    @staticmethod
-    def _dur_h(hours):
-        if hours is None:
-            return "—"
-        if hours <= 0:
-            return "0m"
-        total_m = int(round(hours * 60))
-        if total_m >= 60:
-            return f"{total_m // 60}h{total_m % 60:02d}m"
-        return f"{total_m}m"
-
-    def _rated_runtime(self):
-        key = ("rated_runtime_h_rgb_on"
-               if self.health.settings["runtime_profile"] == "rgb_on"
-               else "rated_runtime_h_rgb_off")
+    def _rated_runtime(self) -> float:
+        key = (
+            "rated_runtime_h_rgb_on"
+            if self.health.settings["runtime_profile"] == "rgb_on"
+            else "rated_runtime_h_rgb_off"
+        )
         return float(self.health.settings[key])
-
-    def _insight_color(self, tone):
-        return {
-            "good": "#2ec27e",
-            "warn": "#e5a50a",
-            "bad": "#e01b24",
-            "info": "#62a0ea",
-            "muted": "#9a9a9a",
-        }.get(tone, "#9a9a9a")
-
-    def _remain_color(self, hours, charging=False):
-        if charging:
-            return "#2ec27e"
-        if hours is None:
-            return None
-        if hours < 0.75:
-            return "#e01b24"
-        if hours < 2.0:
-            return "#e5a50a"
-        return "#2ec27e"
 
     def _refresh_health_display(self, mv=None, pct=None, state="",
                                 raw_mv=None, path_is_rail=False,
-                                force_ui=False):
+                                force_ui: bool = False) -> None:
         self._last_batt_display = (mv, pct, state, raw_mv, path_is_rail)
-        if not force_ui and not self.get_visible():
-            # Avoid recomputing 7-day battery analytics and Cairo charts every
-            # 5s while minimized to the tray; _on_window_show refreshes live.
+        on_health_tab = (
+            self.get_visible()
+            and self.stack.get_visible_child_name() == "health"
+        )
+        if not force_ui and not on_health_tab:
             self._health_ui_dirty = True
             return
         self._health_ui_dirty = False
-        h = self.health
-        rated = self._rated_runtime()
-        charging = (state == "charging") if state else None
-        if state in ("discharging",):
-            charging = False
-        # analysis() converts path mV → cell estimate when charging
-        a = h.analysis(mv=mv if mv is not None else raw_mv,
-                       rated_runtime_h=rated, charging=charging)
-        cell = a.get("cell_mv")
-        raw = raw_mv if raw_mv is not None else a.get("raw_mv")
-        if pct is None and cell is not None:
-            pct = batt_percent(cell)
+        if self.worker.via_daemon:
+            self.health.reload_if_changed()
+        render_health_display(
+            self, mv=mv, pct=pct, state=state,
+            raw_mv=raw_mv, path_is_rail=path_is_rail)
 
-        # --- Hero remaining time ---
-        remain = a.get("remain_best_h")
-        if charging:
-            remain_chg = a.get("remain_charge_h")
-            if remain_chg is not None:
-                hero = (
-                    "<span size='xx-large' weight='bold' foreground='#2ec27e'>"
-                    f"{self._dur_h(remain_chg)} to full</span>")
-            else:
-                hero = ("<span size='xx-large' weight='bold' foreground='#2ec27e'>"
-                        "Charging</span>")
-            if pct is not None:
-                hero += (f"\n<span size='large'>{pct}% at last rest"
-                         f" · cell estimate</span>")
-            learned_chg = a.get("learned_full_charge_h")
-            if learned_chg is not None:
-                hero += (f"\n<small>Learned empty-to-full "
-                         f"{self._dur_h(learned_chg)}"
-                         f" · SoC held while on charger</small>")
-            else:
-                hero += ("\n<small>SoC held while on charger — path voltage is "
-                         "not cell OCV</small>")
-        elif remain is not None:
-            color = self._remain_color(remain) or "#ffffff"
-            hero = (f"<span size='xx-large' weight='bold' foreground='{color}'>"
-                    f"{self._dur_h(remain)} left</span>")
-            src = a.get("remain_source") or "estimate"
-            bits = [f"via {src}"]
-            if a.get("remain_profile_h") is not None and src != "profile":
-                bits.append(f"profile says {self._dur_h(a['remain_profile_h'])}")
-            if a.get("remain_vs_rated_pct") is not None:
-                rel = a["remain_vs_rated_pct"]
-                sign = "+" if rel >= 0 else "−"
-                bits.append(f"{sign}{abs(rel):.0f}% vs rated at this level")
-            hero += "\n<small>" + " · ".join(bits) + "</small>"
-        elif state == "headset off":
-            hero = ("<span size='xx-large' weight='bold' foreground='#9a9a9a'>"
-                    "Headset off</span>")
-        elif mv is not None and state == "discharging":
-            hero = ("<span size='xx-large' weight='bold'>—</span>\n"
-                    "<small>collecting live drain… need ≥10 min and ≥3% drop</small>")
-        else:
-            hero = ("<span size='xx-large' weight='bold'>—</span>\n"
-                    "<small>waiting for battery data</small>")
-        self.health_remain.set_markup(hero)
-
-        # --- Status line: % · cell mV · state (+ path mV when charging) ---
-        if cell is None and raw is None:
-            self.health_status.set_markup(
-                f"<span size='large'>{GLib.markup_escape_text(state or '…')}</span>")
-        elif charging:
-            arrow = "↑"
-            cell_s = f"{cell} mV cell" if cell is not None else "cell ?"
-            path_s = f"{raw} mV path" if raw is not None else ""
-            rail = " · charge rail" if path_is_rail else ""
-            self.health_status.set_markup(
-                f"<span size='large'><b>{pct if pct is not None else '—'}%</b>  "
-                f"{cell_s}  {arrow} "
-                f"{GLib.markup_escape_text(state)}"
-                f"</span>\n<small>{GLib.markup_escape_text(path_s)}{rail} "
-                f"(not used for %)</small>")
-        else:
-            arrow = "↓" if state == "discharging" else "·"
-            show_mv = cell if cell is not None else raw
-            self.health_status.set_markup(
-                f"<span size='large'><b>{pct}%</b>  {show_mv} mV  {arrow} "
-                f"{GLib.markup_escape_text(state)}</span>")
-
-        # --- Open session strip ---
-        if h.cur:
-            seg = h.cur
-            dt = seg["t_end"] - seg["t_start"]
-            line = (f"This session: <b>{seg['type']}</b> {self._dur(dt)} · "
-                    f"{seg['pct_start']}→{seg['pct_end']}% · "
-                    f"{seg['mv_start']}→{seg['mv_end']} mV")
-            if seg["type"] == "discharge" and dt >= 600:
-                rate = (seg["pct_start"] - seg["pct_end"]) / (dt / 3600.0)
-                if rate > 0:
-                    line += f" · −{rate:.1f}%/h"
-            self.health_session.set_markup(f"<small>{line}</small>")
-        else:
-            self.health_session.set_markup(
-                "<small>No open session — samples appear once the headset is on "
-                "and tracking is enabled.</small>")
-
-        # --- Insights ---
-        insights = build_insights(a, state=state, charging=charging)
-        if insights:
-            parts = []
-            for ins in insights:
-                col = self._insight_color(ins["tone"])
-                text = GLib.markup_escape_text(ins["text"])
-                parts.append(
-                    f"<span foreground='{col}'>●</span> {text}")
-            self.health_insights.set_markup(
-                "<small>" + "\n".join(parts) + "</small>")
-        else:
-            self.health_insights.set_markup("")
-
-        # --- Wear summary: health + concrete time cost ---
-        if a.get("health_pct") is not None:
-            health_pct = a["health_pct"]
-            conf = ("early" if a["n_sessions"] < 3
-                    else f"{a['n_sessions']} sessions")
-            health_color = (
-                "#2ec27e" if health_pct >= 75 else
-                "#e5a50a" if health_pct >= 55 else
-                "#e01b24")
-            self._set_kpi(
-                self.kpi_health,
-                f"<span size='x-large' weight='bold' "
-                f"foreground='{health_color}'>≈{health_pct:.0f}%</span>",
-                conf)
-
-            learned = a.get("learned_full_runtime_h")
-            lost_h = max(0.0, rated - learned) if learned is not None else None
-            if lost_h is not None:
-                lost_color = (
-                    "#2ec27e" if lost_h < 0.25 else
-                    "#e5a50a" if lost_h < rated * 0.30 else
-                    "#e01b24")
-                lost_sub = (
-                    "meeting or exceeding rated runtime"
-                    if lost_h < (1.0 / 120.0)
-                    else f"against the selected {rated:g}h rating")
-                self._set_kpi(
-                    self.kpi_lost,
-                    f"<span size='x-large' weight='bold' "
-                    f"foreground='{lost_color}'>{self._dur_h(lost_h)}</span>",
-                    lost_sub)
-                if lost_h < (1.0 / 120.0):
-                    wear_lead = (
-                        "No measurable runtime has been lost against the selected "
-                        "rating.")
-                else:
-                    wear_lead = (
-                        f"A full charge is currently costing about "
-                        f"{self._dur_h(lost_h)} of listening time.")
-                evidence = (
-                    "This is still an early estimate from one or two qualifying "
-                    "discharges."
-                    if a["n_sessions"] < 3 else
-                    f"It is based on the median of {a['n_sessions']} qualifying "
-                    "discharge sessions, which reduces one-off load swings.")
-                self.health_wear_description.set_markup(
-                    f"<b>{wear_lead}</b> The headset projects to "
-                    f"{self._dur_h(learned)} from full versus {rated:g}h rated. "
-                    f"{evidence} Health measures usable runtime—not just voltage—"
-                    "so lighting, volume, and radio conditions can move the estimate.")
-            else:
-                self._set_kpi(
-                    self.kpi_lost,
-                    "<span size='x-large' weight='bold'>—</span>",
-                    "waiting for a full-runtime estimate")
-                self.health_wear_description.set_text(
-                    "A health estimate exists, but more continuous runtime data is "
-                    "needed before the lost time per full charge is dependable.")
-        else:
-            self._set_kpi(self.kpi_health,
-                          "<span size='x-large' weight='bold'>—</span>",
-                          "need solid sessions")
-            self._set_kpi(
-                self.kpi_lost,
-                "<span size='x-large' weight='bold'>—</span>",
-                "not enough evidence yet")
-            self.health_wear_description.set_markup(
-                "<b>Wear is still being measured.</b> Keep the panel open during "
-                "normal off-charger use. A qualifying evidence point needs about "
-                "30 minutes of use and at least an 8% drop; short sessions can join "
-                "across brief headset-off gaps. Once available, this card will show "
-                "both health percentage and the actual time lost from every full charge.")
-
-        # --- Supporting KPI cards ---
-        if a.get("learned_full_runtime_h") is not None:
-            self._set_kpi(
-                self.kpi_full,
-                f"<span size='large' weight='bold'>"
-                f"{self._dur_h(a['learned_full_runtime_h'])}</span>",
-                f"of {rated:g}h rated")
-        else:
-            self._set_kpi(self.kpi_full,
-                          "<span size='large' weight='bold'>—</span>",
-                          f"rated {rated:g}h")
-
-        if a.get("live_rate_pct_per_h") is not None:
-            sub = f"over {self._dur(a['live_rate_span_s'])}"
-            if a.get("rated_rate_pct_per_h"):
-                sub += f" · rated −{a['rated_rate_pct_per_h']:.1f}%/h"
-            self._set_kpi(
-                self.kpi_drain,
-                f"<span size='large' weight='bold'>"
-                f"−{a['live_rate_pct_per_h']:.1f}%/h</span>",
-                sub)
-        elif charging:
-            self._set_kpi(self.kpi_drain,
-                          "<span size='large' weight='bold'>—</span>",
-                          "on charger")
-        else:
-            self._set_kpi(self.kpi_drain,
-                          "<span size='large' weight='bold'>—</span>",
-                          "need ≥10 min / 3% drop")
-
-        rated_chg = a.get("rated_charge_h") or 2.0
-        if a.get("learned_full_charge_h") is not None:
-            chg_n = a.get("n_charges") or 0
-            self._set_kpi(
-                self.kpi_charge,
-                f"<span size='large' weight='bold'>"
-                f"{self._dur_h(a['learned_full_charge_h'])}</span>",
-                f"of {rated_chg:g}h rated · {chg_n} fill"
-                f"{'s' if chg_n != 1 else ''}")
-        else:
-            self._set_kpi(
-                self.kpi_charge,
-                "<span size='large' weight='bold'>—</span>",
-                f"rated {rated_chg:g}h · need 25%+ fills")
-
-        # --- Charts (use cell mV so charge-rail doesn't fake 100%) ---
-        self._update_health_charts(a, rated, mv=cell)
-
-        # --- History caption ---
-        if len(h.recent) >= 2:
-            self.history_caption.set_markup(
-                "<small>Last 7 days. The line is how full the battery was. "
-                "It falls while you wear it and rises on the charger. "
-                "Gaps are projected so the line stays continuous.</small>")
-        else:
-            self.history_caption.set_markup(
-                "<small>Samples land about once per minute while the panel is open "
-                "and tracking is on.</small>")
-
-        # --- Detail under health/compare ---
-        details = []
-        if a.get("remain_expected_adj_h") is not None and a.get("health_pct") is not None:
-            details.append(
-                f"If health holds: ~{self._dur_h(a['remain_expected_adj_h'])} left "
-                f"(rated remaining × {a['health_pct']:.0f}%).")
-        ps_peak = a.get("peak_summary")
-        if ps_peak and ps_peak.get("latest_mv"):
-            details.append(
-                f"Recent full-charge peak: {ps_peak['latest_mv']} mV "
-                f"(median {ps_peak['median_mv']:.0f} mV over {ps_peak['n']} charges"
-                f"{', ' + ps_peak['direction'] if ps_peak.get('direction') else ''}).")
-        last_fill = next(
-            (r for r in (a.get("charge_rows") or []) if r.get("full_h")),
-            None)
-        if last_fill:
-            details.append(
-                f"Last solid charge-up: {self._dur(last_fill['on_time_s'])} "
-                f"for {last_fill['pct_start']}→{last_fill['pct_end']}% "
-                f"(→ {self._dur_h(last_fill['full_h'])} empty-to-full).")
-        self.health_detail.set_markup(
-            "<small>" + GLib.markup_escape_text(" ".join(details) or " ") + "</small>")
-
-        # --- Profile narrative ---
-        ps = a["profile_summary"]
-        if not ps or ps.get("hours_logged", 0) <= 0:
-            self.health_profile.set_markup(
-                "<small>No discharge datapoints yet. Wear the headset off-charger; "
-                "samples land about once per minute and teach the profile which "
-                "voltage ranges drain faster.</small>")
-        else:
-            span = ps.get("span_mv")
-            span_s = f"{span[0]}–{span[1]} mV" if span else "—"
-            ready = ("ready — used as a voltage-shaped cross-check"
-                     if ps.get("ready") else "still building")
-            bins = a["profile"].get("bins") or {}
-            # Top / bottom rate for storytelling
-            story = ""
-            if bins:
-                lo_b = min(bins, key=bins.get)
-                hi_b = max(bins, key=bins.get)
-                story = (f" Slowest near {lo_b} mV ({bins[lo_b]:.0f} mV/h); "
-                         f"fastest near {hi_b} mV ({bins[hi_b]:.0f} mV/h).")
-            weak = a["profile"].get("weak_bins") or {}
-            extra = f" · +{len(weak)} sparse bins" if weak else ""
-            self.health_profile.set_markup(
-                f"<small><b>{ps['hours_logged']:.1f} h</b> discharge logged · "
-                f"<b>{ps.get('bins_filled', 0)}</b> solid bins · span {span_s} · "
-                f"{ps.get('n_pairs', 0)} slope windows · {ready}{extra}."
-                f"{GLib.markup_escape_text(story)}</small>")
-
-        # --- Session list (readable, not monospace dump) ---
-        rows = a.get("session_rows") or []
-        if not rows:
-            self.health_hist.set_markup(
-                "<small>No usage sessions yet. Wear the headset off-charger with "
-                "tracking on — short hops merge across ≤15 min gaps.</small>")
-        else:
-            lines = []
-            for r in rows[:8]:
-                when = time.strftime("%a %m/%d %H:%M", time.localtime(r["t_start"]))
-                dur = self._dur(r["on_time_s"])
-                drain = f"{r['pct_start']}→{r['pct_end']}%"
-                parts = f" · {r['parts']} parts" if r["parts"] > 1 else ""
-                if r["quality"] == "solid":
-                    badge_col = (self._insight_color("good")
-                                 if (r.get("pct_of_rated") or 0) >= 85
-                                 else self._insight_color("warn")
-                                 if (r.get("pct_of_rated") or 0) >= 70
-                                 else self._insight_color("bad"))
-                    tail = (f"<span foreground='{badge_col}'>"
-                            f"→ {self._dur_h(r['full_h'])} full "
-                            f"({r['pct_of_rated']:.0f}% rated)</span>")
-                else:
-                    tail = "<span foreground='#9a9a9a'>short — not in health median</span>"
-                lines.append(
-                    f"<b>{GLib.markup_escape_text(when)}</b>  {dur}{parts}  "
-                    f"{drain}  {tail}")
-            solid_n = sum(1 for r in rows if r["quality"] == "solid")
-            foot = (f"\n<span foreground='#9a9a9a'>{solid_n} solid / {len(rows)} shown · "
-                    f"solid sessions feed the health median</span>")
-            self.health_hist.set_markup(
-                "<small>" + "\n".join(lines) + foot + "</small>")
-
-        # --- Charge-up list (rest SoC before plug / after unplug) ---
-        crows = a.get("charge_rows") or []
-        if not crows:
-            self.health_charges.set_markup(
-                "<small>No charge-ups yet. Leave the panel open while you "
-                "plug in after a real drain so rest voltage is known on both "
-                "sides. Short top-ups and dock-idle after full are ignored.</small>")
-        else:
-            clines = []
-            for r in crows[:8]:
-                when = time.strftime("%a %m/%d %H:%M", time.localtime(r["t_start"]))
-                dur = self._dur(r["on_time_s"])
-                span = (
-                    f"{r['pct_start']}→{r['pct_end']}%"
-                    if r["pct_start"] is not None and r["pct_end"] is not None
-                    else "rest SoC unknown")
-                parts = f" · {r['parts']} parts" if r["parts"] > 1 else ""
-                if r["quality"] == "solid":
-                    tail = (
-                        f"<span foreground='{self._insight_color('good')}'>"
-                        f"→ {self._dur_h(r['full_h'])} empty-to-full</span>")
-                elif r["quality"] == "charging":
-                    tail = "<span foreground='#2ec27e'>on charger now</span>"
-                else:
-                    tail = "<span foreground='#9a9a9a'>short / idle — not in median</span>"
-                clines.append(
-                    f"<b>{GLib.markup_escape_text(when)}</b>  {dur}{parts}  "
-                    f"{span}  {tail}")
-            solid_c = sum(1 for r in crows if r["quality"] == "solid")
-            cfoot = (
-                f"\n<span foreground='#9a9a9a'>{solid_c} solid / {len(crows)} shown · "
-                f"uses rest voltage before plug-in and after unplug, not the "
-                f"charger rail</span>")
-            self.health_charges.set_markup(
-                "<small>" + "\n".join(clines) + cfoot + "</small>")
-
-    def _update_health_charts(self, analysis, rated, mv=None):
-        """Push latest analysis into the Cairo chart widgets."""
-        h = self.health
-        full = int(h.settings.get("full_mv", HEALTH_DEFAULTS["full_mv"]))
-        self.chart_history.set_data({
-            "series": build_level_series(
-                h.recent, batt_percent, full_mv=full),
-        })
-        self.chart_gauge.set_data({
-            "health_pct": analysis.get("health_pct"),
-            "learned_h": analysis.get("learned_full_runtime_h"),
-            "rated_h": rated,
-            "n_sessions": analysis.get("n_sessions"),
-            "effective_mah": analysis.get("effective_mah"),
-            "design_mah": analysis.get("design_mah"),
-        })
-        self.chart_expect.set_data({
-            "expected_h": analysis.get("remain_expected_h"),
-            "actual_h": analysis.get("remain_best_h"),
-            "delta_pct": analysis.get("remain_vs_rated_pct"),
-        })
-        # Session bars: qualifying wears only (these feed the health median)
-        sess_rows = []
-        for sess in merge_discharge_sessions(h.segments):
-            full_rt = session_full_runtime_h(sess)
-            if full_rt is None:
-                continue
-            label = time.strftime("%m/%d", time.localtime(sess["t_start"]))
-            sess_rows.append({"label": label, "hours": full_rt})
-        self.chart_sessions.set_data({
-            "sessions": sess_rows[-16:],
-            "rated_h": rated,
-        })
-        profile = analysis.get("profile") or {}
-        self.chart_profile.set_data({
-            "bins": profile.get("bins") or {},
-            "weak_bins": profile.get("weak_bins") or {},
-            "current_mv": mv,
-            "bin_mv": profile.get("bin_mv"),
-        })
-
-    # ---------- heartbeat / battery / connection ----------
-    def _poll_daemon_status(self):
-        """Refresh mode/mic notes if dspd appears or disappears."""
-        running = daemon_running()
-        if running != getattr(self, "_daemon_was_running", None):
-            self._daemon_was_running = running
-            self._update_mode_note()
-            self._update_mic_note()
+    # ---------- Stereo route ----------
+    def _poll_stereo_route(self) -> bool:
+        self._poll_stereo_route_once()
         return True
 
-    # ---------- stereo route (post-resume left-only fix) ----------
-    def _poll_stereo_route(self):
-        """Periodic check: EasyEffects/DTS FL linked, FR dropped after sleep."""
-        self._poll_stereo_route_once()
-        return True  # keep the 8s timer
-
-    def _poll_stereo_route_once(self):
-        """One-shot check (idle / post-audio-change). Runs pw-link off the UI thread."""
+    def _poll_stereo_route_once(self) -> bool:
         if self._stereo_fixing or self._stereo_checking:
             return False
         self._stereo_checking = True
@@ -3834,33 +1705,33 @@ class App(Gtk.Window):
         threading.Thread(target=_worker, daemon=True).start()
         return False
 
-    def _on_stereo_check_error(self, msg):
+    def _on_stereo_check_error(self, msg: str) -> bool:
         self._stereo_checking = False
         self.log(f"stereo check error: {msg}")
         return False
 
-    def _on_stereo_check_done(self, st):
+    def _on_stereo_check_done(self, st) -> bool:
         self._stereo_checking = False
         if not self._stereo_fixing:
             self._apply_stereo_status(st, auto_fix=True)
         return False
 
-    def _apply_stereo_status(self, st, auto_fix=False):
+    def _apply_stereo_status(self, st, auto_fix: bool = False) -> None:
         was_broken = self._stereo_broken
         broken = bool(st.broken)
+        if hasattr(self, "hw_stereo"):
+            self.hw_stereo.set_text(st.detail or ("Stereo OK" if st.ok else "Broken"))
 
         if not st.pw_link_available:
             self.stereo_label.set_markup("")
             self.stereo_label.hide()
-            self.stereo_label.set_tooltip_text(st.detail)
             self._stereo_broken = False
             self.stereo_banner.hide()
             return
-
         if not st.g935_present:
             self.stereo_label.show()
-            self.stereo_label.set_markup(
-                "<span foreground='gray'>🎧 —</span>")
+            self.stereo_label.set_markup("<span foreground='gray'>🎧 —</span>")
+            set_chip_tone(self.stereo_label, None)
             self.stereo_label.set_tooltip_text(st.detail)
             self._stereo_broken = False
             self.stereo_banner.hide()
@@ -3869,31 +1740,30 @@ class App(Gtk.Window):
         if broken:
             self.stereo_label.show()
             self.stereo_label.set_markup(
-                "<span foreground='#e01b24'><b>🎧 L-only</b></span>")
+                "<span foreground='#f66151'><b>🎧 L-only</b></span>")
+            set_chip_tone(self.stereo_label, "bad")
             self.stereo_label.set_tooltip_text(st.detail)
             quiet = time.monotonic() < self._stereo_dismissed_until
             if not quiet:
                 self.stereo_banner.show()
-            # Notify once per incident (not every poll)
             if not was_broken and not quiet:
                 notify_user(
                     "G935: right earcup silent",
-                    "PipeWire only linked the left channel (often after sleep). "
-                    "Opening Fix…",
+                    "PipeWire only linked the left channel (often after sleep). Repairing…",
                     urgency="critical",
                 )
                 self.log(f"STEREO BROKEN: {st.detail}")
             self._stereo_broken = True
             if auto_fix and not quiet:
-                # Auto-repair immediately — same as the manual pw-link fix
                 GLib.idle_add(self._do_stereo_fix, st)
         else:
             self.stereo_label.show()
             self.stereo_label.set_markup(
                 "<span foreground='#2ec27e'>🎧 stereo</span>")
+            set_chip_tone(self.stereo_label, "ok")
             tip = st.detail
             if st.fr_port and st.fr_port.endswith(":playback_2"):
-                tip += " (right port named playback_2 — normal after some resumes)"
+                tip += " (right port named playback_2)"
             self.stereo_label.set_tooltip_text(tip)
             if was_broken:
                 self.log(f"STEREO OK: {st.detail}")
@@ -3902,153 +1772,197 @@ class App(Gtk.Window):
             self.stereo_banner.hide()
             self._stereo_dismissed_until = 0.0
 
-        # Refresh tray so "Fix stereo" appears when needed
         if was_broken != self._stereo_broken:
-            self._rebuild_tray_menu()
+            self.tray.rebuild_menu()
 
-    def _do_stereo_fix(self, st=None):
+    def _do_stereo_fix(self, st=None) -> bool:
         if self._stereo_fixing:
             return False
         self._stereo_fixing = True
-        try:
-            ok, msg = fix_stereo(st)
-            self.log(f"stereo fix: {msg}")
 
-            def _recheck():
-                try:
-                    after = inspect_stereo()
-                    # Update UI without a second "restored" notify from was_broken
-                    healed = after.ok and self._stereo_broken
-                    if after.ok:
-                        self._stereo_broken = False
-                        self.stereo_label.set_markup(
-                            "<span foreground='#2ec27e'>🎧 stereo</span>")
-                        self.stereo_label.set_tooltip_text(after.detail or msg)
-                        self.stereo_banner.hide()
-                        self._stereo_dismissed_until = 0.0
-                        self._rebuild_tray_menu()
-                        if healed or ok:
-                            notify_user("G935: stereo fixed", msg)
-                    else:
-                        self._apply_stereo_status(after, auto_fix=False)
-                        if not ok:
-                            notify_user(
-                                "G935: stereo fix failed",
-                                msg + " — try restarting EasyEffects.",
-                                urgency="critical",
-                            )
-                finally:
-                    self._stereo_fixing = False
-                return False
+        def _worker():
+            try:
+                ok, msg = fix_stereo(st)
+            except Exception as exc:
+                GLib.idle_add(self._on_stereo_fix_error, str(exc))
+                return
+            GLib.idle_add(self._on_stereo_fix_done, ok, msg)
 
-            GLib.timeout_add(400, _recheck)
-        except Exception as e:
-            self._stereo_fixing = False
-            self.log(f"stereo fix error: {e}")
-            notify_user("G935: stereo fix error", str(e), urgency="critical")
+        threading.Thread(target=_worker, daemon=True).start()
         return False
 
-    def _on_stereo_banner_response(self, bar, response_id):
+    def _on_stereo_fix_error(self, err: str) -> bool:
+        self._stereo_fixing = False
+        self.log(f"stereo fix error: {err}")
+        notify_user("G935: stereo fix error", err, urgency="critical")
+        return False
+
+    def _on_stereo_fix_done(self, ok: bool, msg: str) -> bool:
+        self.log(f"stereo fix: {msg}")
+
+        def _recheck():
+            def _bg():
+                after = inspect_stereo()
+                GLib.idle_add(self._finish_stereo_recheck, ok, msg, after)
+            threading.Thread(target=_bg, daemon=True).start()
+            return False
+
+        GLib.timeout_add(400, _recheck)
+        return False
+
+    def _finish_stereo_recheck(self, ok: bool, msg: str, after) -> bool:
+        try:
+            healed = after.ok and self._stereo_broken
+            if after.ok:
+                self._stereo_broken = False
+                self.stereo_label.set_markup(
+                    "<span foreground='#2ec27e'>🎧 stereo</span>")
+                set_chip_tone(self.stereo_label, "ok")
+                self.stereo_label.set_tooltip_text(after.detail or msg)
+                if hasattr(self, "hw_stereo"):
+                    self.hw_stereo.set_text(after.detail or msg)
+                self.stereo_banner.hide()
+                self._stereo_dismissed_until = 0.0
+                self.tray.rebuild_menu()
+                if healed or ok:
+                    notify_user("G935: stereo fixed", msg)
+            else:
+                self._apply_stereo_status(after, auto_fix=False)
+                if not ok:
+                    notify_user(
+                        "G935: stereo fix failed",
+                        msg + " — try restarting EasyEffects.",
+                        urgency="critical",
+                    )
+        finally:
+            self._stereo_fixing = False
+        return False
+
+    def _on_stereo_banner_response(self, bar, response_id) -> None:
         if response_id == Gtk.ResponseType.APPLY:
             self._do_stereo_fix()
         elif response_id == Gtk.ResponseType.CLOSE:
-            # Quiet for 10 minutes unless it heals and breaks again
             self._stereo_dismissed_until = time.monotonic() + 600
             bar.hide()
 
-    def on_fix_stereo(self, *_):
+    def on_fix_stereo(self, *_) -> None:
         self._stereo_dismissed_until = 0.0
         self._do_stereo_fix()
 
-    def heartbeat(self):
+    # ---------- Heartbeat, daemon events & battery ----------
+    def _poll_daemon_status(self) -> bool:
+        if not self.worker.via_daemon:
+            self.worker.try_upgrade_to_daemon()
+        running = self.worker.via_daemon or daemon_running()
+        if running != getattr(self, "_daemon_was_running", None):
+            self._daemon_was_running = running
+            self._update_mode_note()
+            self._update_mic_note()
+            self._update_mode_chip()
+            if hasattr(self, "hw_values") and "transport_link" in self.hw_values:
+                self.hw_values["transport_link"].set_text(self.worker.transport_label)
+        return True
+
+    def heartbeat(self) -> bool:
         if not self.discovered:
             self._start_discovery()
-        else:
+        elif not self.worker.via_daemon:
+            # When connected to g935-dspd, the daemon pushes live battery events.
             self.send("battery", 0, cb=self.got_battery)
         if self.profile["has_boom_mic"]:
             self._refresh_hostmic()
         return True
 
-    def got_battery(self, status, reply):
+    def _on_daemon_presence(self, connected: bool) -> None:
+        if connected:
+            self._mark_connected(reassert_if_was_off=True)
+        else:
+            self._mark_disconnected()
+
+    def _on_daemon_battery(self, payload: dict) -> None:
+        mv = payload.get("mv")
+        flags = payload.get("flags", 0)
+        state = payload.get("state", "unknown")
+        charging = payload.get("charging")
+        cell = payload.get("cell_mv")
+        pct = payload.get("pct")
+        rail = bool(payload.get("path_is_rail", False))
+        self._apply_battery_ui(mv, flags, state, charging, cell, pct, rail)
+        self._mark_connected(reassert_if_was_off=True)
+
+    def _apply_battery_ui(self, raw, flags, state, charging, cell, pct, rail) -> None:
+        icon = "🔌" if charging else ("❓" if charging is None else "🔋")
+        self._refresh_health_display(
+            cell, pct, state, raw_mv=raw, path_is_rail=rail)
+        pct_s = f"{pct}%" if pct is not None else "—%"
+        if charging:
+            self.batt_label.set_markup(
+                f"{icon} <b>{pct_s}</b> <span size='small'>Charging</span>")
+            set_chip_tone(self.batt_label, "ok")
+            self.batt_label.set_tooltip_text(
+                f"SoC from last off-charger rest"
+                f"{f' ({cell} mV, {pct}%)' if cell is not None else ' (unknown)'}."
+                f" ADC path {raw} mV while charging (flags {flags:#04x}).")
+        else:
+            self.batt_label.set_markup(f"{icon} <b>{pct_s}</b>")
+            tone = (
+                "bad" if pct is not None and pct <= 10 else
+                "warn" if pct is not None and pct <= 25 else None
+            )
+            set_chip_tone(self.batt_label, tone)
+            self.batt_label.set_tooltip_text(
+                f"{cell} mV, {state} (flags {flags:#04x})")
+        self.tray.update_battery(f"{icon} {pct_s} · {state}")
+
+    def _mark_connected(self, reassert_if_was_off: bool = True) -> None:
+        if self.connected is not True:
+            was_off = self.connected is False
+            just_discovered = self._just_discovered
+            self._just_discovered = False
+            self.connected = True
+            self.conn_label.set_markup(
+                "<span foreground='#2ec27e'>●</span> <b>Connected</b>")
+            set_chip_tone(self.conn_label, "ok")
+            self.conn_label.set_tooltip_text("Headset online")
+            if reassert_if_was_off and was_off and not just_discovered:
+                self.log("--- headset powered on: re-applying panel state ---")
+                self._assert_device_state(initial=False)
+
+    def got_battery(self, status, reply) -> None:
         if status == "ACK":
             self._battery_presence.observe(True)
-            # 0x8010 fn 1 is not software-mode readback on this firmware.
-            # Periodically reassert the saved DSP target so a flat soundstage
-            # heals, but not on every 5s poll — that doubled HID++ traffic
-            # and made presence TIMEOUTs look like power-off (death spiral).
             if self.dsp_sw.get_active():
                 now = time.monotonic()
-                last = getattr(self, "_last_dsp_heal", 0.0)
-                if now - last >= 30.0:
+                if now - getattr(self, "_last_dsp_heal", 0.0) >= 30.0:
                     self._last_dsp_heal = now
                     self.send("gkeys", 2, "01")
             mv = (reply[4] << 8) | reply[5]
             flags = reply[6]
             state, charging = batt_state(flags)
-            # Feed tracker first so last_rest_mv is current, then interpret
             if charging is not None:
                 self.health.add_sample(time.time(), mv, charging)
-            if charging is None:
+                reading = self.health.reading(mv, charging)
+            else:
                 reading = {
                     "raw_mv": mv, "cell_mv": mv, "pct": batt_percent(mv),
                     "charging": None, "path_is_rail": False,
                 }
-            else:
-                reading = self.health.reading(mv, charging)
-            pct = reading["pct"]
-            cell = reading["cell_mv"]
-            raw = reading["raw_mv"]
-            rail = reading.get("path_is_rail", False)
-            icon = "🔌" if charging else ("❓" if charging is None else "🔋")
-            self._refresh_health_display(
-                cell, pct, state, raw_mv=raw, path_is_rail=rail)
-            pct_s = f"{pct}%" if pct is not None else "—%"
-            if charging:
-                path_note = f"path {raw} mV" + (" rail" if rail else "")
-                cell_s = f"~{cell} mV cell" if cell is not None else "cell ?"
-                self.batt_label.set_markup(
-                    f"{icon} <b>{pct_s}</b>  "
-                    f"<span size='small'>Charging</span>")
-                self.batt_label.set_tooltip_text(
-                    f"SoC from last off-charger rest"
-                    f"{f' ({cell} mV, {pct}%)' if cell is not None else ' (unknown)'}."
-                    f" ADC path {raw} mV while charging is not open-circuit "
-                    f"cell voltage (flags {flags:#04x}).")
-            else:
-                self.batt_label.set_markup(
-                    f"{icon} <b>{pct_s}</b>")
-                self.batt_label.set_tooltip_text(
-                    f"{cell} mV, {state} (flags {flags:#04x})")
-            self._update_tray_battery(f"{icon} {pct_s} · {state}")
-            self._check_battery_alerts(pct, charging)
-            if self.connected is not True:
-                was_off = self.connected is False
-                just_discovered = self._just_discovered
-                self._just_discovered = False
-                self.connected = True
-                self.conn_label.set_markup(
-                    "<span foreground='#2ec27e'>●</span> <b>Connected</b>")
-                self.conn_label.set_tooltip_text("headset on")
-                if was_off and not just_discovered:
-                    # power-on wipes on-device state - re-assert panel settings
-                    self.log("--- headset powered on: re-applying panel state ---")
-                    self._assert_device_state(initial=False)
+            self._apply_battery_ui(
+                reading["raw_mv"], flags, state, charging,
+                reading["cell_mv"], reading["pct"],
+                reading.get("path_is_rail", False))
+            self._check_battery_alerts(reading["pct"], charging)
+            self._mark_connected(reassert_if_was_off=True)
         elif status == "GONE":
-            # on_link(False) already handled disconnect cleanly.
             return
         elif self._battery_presence.observe(False) is False:
             self._mark_disconnected()
         else:
-            # A single missed reply is normally receiver contention/noise, not
-            # a power cycle. Keep the current state and avoid replaying
-            # lighting/EQ on the next successful battery poll.
             self.log(
-                f"--- battery poll missed "
-                f"({self._battery_presence.misses}/"
+                f"--- battery poll missed ({self._battery_presence.misses}/"
                 f"{self._battery_presence.miss_limit}); keeping state ---")
 
-    def _check_battery_alerts(self, pct, charging):
-        """Desktop notify once per low/critical threshold while discharging."""
+    def _check_battery_alerts(self, pct, charging) -> None:
         for alert in self._batt_alerts.update(pct, charging):
             prev_id = self._batt_notify_ids.get(alert.level)
             ok, new_id = notify_user_with_id(
@@ -4058,32 +1972,36 @@ class App(Gtk.Window):
                 self._batt_notify_ids[alert.level] = new_id
             self.log(
                 f"BATT ALERT {alert.level}: {alert.body}"
-                + ("" if ok else " (notify-send failed — check libnotify / DBus)"))
+                + ("" if ok else " (notify-send failed)"))
 
-    def _mark_disconnected(self):
+    def _mark_disconnected(self) -> None:
         self._battery_presence.reset()
-        self.health.mark_offline()
+        if not self.worker.via_daemon:
+            self.health.mark_offline()
         self._refresh_health_display(None, None, "headset off")
-        self._update_tray_battery("headset off")
+        self.tray.update_battery("headset off")
         if self.connected is not False:
             self.connected = False
             self.conn_label.set_markup(
                 "<span foreground='gray'>●</span> Offline")
-            self.conn_label.set_tooltip_text("headset off / unreachable")
+            set_chip_tone(self.conn_label, None)
+            self.conn_label.set_tooltip_text("Headset off / unreachable")
             self.batt_label.set_markup("🔋 —")
+            set_chip_tone(self.batt_label, None)
             self.log("--- headset unreachable (powered off?) ---")
 
 
-def error_dialog(text):
-    dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR,
-                            buttons=Gtk.ButtonsType.CLOSE, text=text)
+def error_dialog(text: str) -> None:
+    dlg = Gtk.MessageDialog(
+        message_type=Gtk.MessageType.ERROR,
+        buttons=Gtk.ButtonsType.CLOSE,
+        text=text,
+    )
     dlg.run()
     dlg.destroy()
 
 
 def acquire_single_instance():
-    """flock guard: two instances would fight over the hidraw node (and show
-    two tray icons). Returns the held lock fd, or None if already running."""
     rundir = runtime_dir()
     os.makedirs(rundir, exist_ok=True)
     fd = os.open(panel_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
@@ -4095,7 +2013,7 @@ def acquire_single_instance():
     return fd
 
 
-def main():
+def main() -> None:
     global ALSA_USBID, MIC_SWITCH_NAME
     args = argparse.ArgumentParser(description="G935 Control")
     args.add_argument(
@@ -4104,7 +2022,6 @@ def main():
     opts = args.parse_args()
     install_app_css()
     if opts.tray and panel_running():
-        # A second --tray start exits quietly without popping open the window.
         return
     if not opts.tray and notify_running_instance():
         return
@@ -4114,59 +2031,58 @@ def main():
             return
         error_dialog("Another instance is already running (check the tray).")
         return
-    # Own the present-socket before the window build. A second --tray start
-    # in that gap used to miss the socket, lose the lock, and pop a dialog.
     try:
         ipc_sock = bind_listener()
     except OSError:
         ipc_sock = None
+
     found = find_headset(known_pids=set(DEVICE_PROFILES))
     if not found:
-        # HidWorker rescans; battery history and settings should still open.
         path, pid, name = None, 0x0A87, "G935"
     else:
         path, pid, name = found
+
     if found and pid not in DEVICE_PROFILES:
-        # vendor page 0xFF43 also matches Logitech mice/keyboards/receivers;
-        # don't silently start probing whatever was found
-        dlg = Gtk.MessageDialog(message_type=Gtk.MessageType.QUESTION,
-                                buttons=Gtk.ButtonsType.YES_NO,
-                                text=f'Found "{name}" (PID {pid:04x}) — not a known '
-                                     "headset.\nThis tool is only tested on the "
-                                     "Logitech G935. Probe it anyway?")
+        dlg = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text=(
+                f'Found "{name}" (PID {pid:04x}) — not a known headset.\n'
+                "This tool is only tested on the Logitech G935. Probe it anyway?"
+            ),
+        )
         resp = dlg.run()
         dlg.destroy()
         if resp != Gtk.ResponseType.YES:
             return
+
     prof = {**GENERIC_PROFILE, **DEVICE_PROFILES.get(pid, {"name": name})}
     if prof["alsa_usbid"]:
         ALSA_USBID, MIC_SWITCH_NAME = prof["alsa_usbid"], prof["mic_switch_name"]
-    # Probe permissions before building the full UI (worker opens later).
-    # --tray (login autostart) must not block on a dialog: seat ACLs often
-    # land after autostart, and HidWorker retries EACCES every second.
-    if path is not None:
+
+    # Skip direct hidraw permission check when daemon owns hardware or --tray.
+    if path is not None and not daemon_running():
         try:
             probe = open_hidraw(path)
             os.close(probe)
         except PermissionError:
             if not opts.tray:
-                error_dialog(f"No permission to open {path}.\n\n"
-                             "Install the udev rule from this repo:\n"
-                             "  sudo cp 99-g935.rules /etc/udev/rules.d/\n"
-                             "  sudo udevadm control --reload && sudo udevadm trigger\n"
-                             "then unplug/replug the receiver.\n\n"
-                             f"(Looking for hidraw access on {path}, PID {pid:04x}.)")
+                error_dialog(
+                    f"No permission to open {path}.\n\n"
+                    "Install the udev rule from this repo:\n"
+                    "  ./install.sh --udev\n"
+                    "then unplug/replug the receiver.")
                 return
         except OSError as e:
             if not opts.tray:
-                error_dialog(f"Could not open {path}:\n{e}\n\n"
-                             "Was the receiver unplugged?")
+                error_dialog(f"Could not open {path}:\n{e}")
                 return
+
     win = App(path, pid, name, start_in_tray=opts.tray)
     win.connect("destroy", win.on_quit)
     win.listen_for_activation(ipc_sock)
     win.show_all()
-    if opts.tray and (win.indicator or win._tray_waiting):
+    if opts.tray and (win.tray.indicator or win.tray.waiting):
         win.hide()
     else:
         win.present()
