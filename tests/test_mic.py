@@ -37,13 +37,14 @@ class MicHandlerTests(unittest.TestCase):
 
     def test_pulse_turns_on_only_after_hold(self):
         h, switch, boom = self._handler(boom_down=True)
-        t0 = 1_000.0
         h._needs_unmute = True
         h.poll(fd=None)
-        h.tick(fd=None, now=t0)  # deadline is time.time()+1.5, not t0
-        # Use the real deadline: tick before it must not unmute
+        # Use the real monotonic deadline (independent of host uptime)
         deadline = h._pulse_deadline
         self.assertIsNotNone(deadline)
+        h.tick(fd=None, now=deadline - 0.5)
+        self.assertEqual(switch.on, False)
+        self.assertIsNotNone(h._pulse_deadline)
         h.tick(fd=None, now=deadline - 0.01)
         self.assertEqual(switch.on, False)
         h.tick(fd=None, now=deadline)
