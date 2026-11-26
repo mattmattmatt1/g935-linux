@@ -92,15 +92,15 @@ def parse_pw_link_list(text: str) -> dict[str, list[str]]:
             continue
         if line.startswith(" ") or line.startswith("\t"):
             s = line.strip()
-            m = re.match(r"\|->\s+(\S+)", s)
+            m = re.match(r"\|->\s+(.+)", s)
             if m and current:
-                peer = m.group(1)
+                peer = m.group(1).strip()
                 graph.setdefault(current, []).append(peer)
                 graph.setdefault(peer, [])
                 continue
-            m = re.match(r"\|<-\s+(\S+)", s)
+            m = re.match(r"\|<-\s+(.+)", s)
             if m and current:
-                peer = m.group(1)
+                peer = m.group(1).strip()
                 graph.setdefault(peer, []).append(current)
                 graph.setdefault(current, [])
             continue
@@ -130,10 +130,9 @@ def find_g935_playback_ports(input_ports: Iterable[str]) -> tuple[str | None, st
             fl = p
         elif p.endswith(":playback_FR"):
             fr = p
-        elif p.endswith(":playback_2") or re.search(r":playback_\d+$", p):
-            # Numeric playback_N (N!= typical FL name) — treat as right candidate
-            if not p.endswith(":playback_FL"):
-                fr_fallback = p
+        elif p.endswith(":playback_2"):
+            # PipeWire sometimes exposes the orphaned right channel as playback_2
+            fr_fallback = p
     if fr is None:
         fr = fr_fallback
     return fl, fr
@@ -330,18 +329,19 @@ def fix_stereo(status: StereoStatus | None = None) -> tuple[bool, str]:
     return False, after.detail + (" — " + "; ".join(parts) if parts else "")
 
 
-def notify_user(summary: str, body: str = "", urgency: str = "normal",
-                replace_id: int | None = None) -> bool:
-    """Desktop notification via notify-send when available.
+def notify_user_with_id(summary: str, body: str = "", urgency: str = "normal",
+                        replace_id: int | None = None) -> tuple[bool, int | None]:
+    """Desktop notification via notify-send, returning (ok, server_notification_id).
 
-    Returns True if notify-send ran successfully. Failures are logged (the
-    previous silent swallow made missing battery alerts hard to debug).
+    Only pass a ``replace_id`` previously returned by the notification server;
+    invented IDs trigger warnings in KDE Plasma's notification manager.
     """
     if not shutil.which("notify-send"):
         log.warning("notify-send not found — install libnotify-bin for desktop alerts")
-        return False
+        return False, None
     cmd = [
         "notify-send",
+        "--print-id",
         f"--urgency={urgency}",
         "--app-name=G935 Control",
         "--icon=audio-headset",
@@ -352,15 +352,28 @@ def notify_user(summary: str, body: str = "", urgency: str = "normal",
     ]
     if body:
         cmd.append(body)
-    if replace_id is not None:
+    if replace_id is not None and int(replace_id) > 0:
         cmd[1:1] = [f"--replace-id={int(replace_id)}"]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=3, text=True)
     except (OSError, subprocess.TimeoutExpired) as e:
         log.warning("notify-send failed: %s", e)
-        return False
+        return False, None
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}"
         log.warning("notify-send failed: %s", err)
-        return False
-    return True
+        return False, None
+    out = (r.stdout or "").strip()
+    try:
+        nid = int(out) if out else None
+    except ValueError:
+        nid = None
+    return True, nid
+
+
+def notify_user(summary: str, body: str = "", urgency: str = "normal",
+                replace_id: int | None = None) -> bool:
+    """Desktop notification via notify-send when available."""
+    ok, _nid = notify_user_with_id(
+        summary, body=body, urgency=urgency, replace_id=replace_id)
+    return ok

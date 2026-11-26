@@ -56,24 +56,43 @@ MEDIUM_ROLL_GAP_S = 1.50
 # Apply a computed gesture as a short series of real 1% changes.  Jumping
 # directly to the final percentage makes an otherwise-correct fast roll feel
 # like a binary switch and gives mixers no useful intermediate feedback.
-# The G935 exposes a real USB hardware mixer. Keep control transfers at or
-# below 40/s even if input events arrive much faster.
-RAMP_INTERVAL_S = 0.025
-REVERSAL_BURST_WINDOW_S = 0.12
+# The G935 exposes a real USB hardware mixer on EP0 (shared with HID++).
+# Pace writes after each pactl completion and pause briefly across direction
+# reversals so rapid back-and-forth cannot wedge the USB receiver.
+RAMP_INTERVAL_S = 0.040
+REVERSAL_SETTLE_S = 0.060
+REVERSAL_BURST_WINDOW_S = 0.25
 REVERSAL_BURST_LIMIT = 3
 REVERSAL_COOLDOWN_S = 0.35
 RETRY_S = 5.0
 
 _PERCENT_RE = re.compile(r"(\d+)%")
 _AUDIO_ENV = {**os.environ, "LC_ALL": "C"}
+_UI_CACHE: tuple[str, int, int, dict] | None = None
 
 
 def _load_ui_data():
+    global _UI_CACHE
+    path = os.path.join(config_dir(), "ui.json")
     try:
-        with open(os.path.join(config_dir(), "ui.json")) as f:
-            return json.load(f)
+        st = os.stat(path)
+    except OSError:
+        _UI_CACHE = None
+        return {}
+    if (_UI_CACHE is not None
+            and _UI_CACHE[0] == path
+            and _UI_CACHE[1] == st.st_mtime_ns
+            and _UI_CACHE[2] == st.st_size):
+        return _UI_CACHE[3]
+    try:
+        with open(path) as f:
+            data = json.load(f)
     except (OSError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        data = {}
+    _UI_CACHE = (path, st.st_mtime_ns, st.st_size, data)
+    return data
 
 
 def clamp_volume_boost(pct):
@@ -353,6 +372,7 @@ class VolumeWheel:
         self.last_raw_press = 0.0
         self.reversal_burst = 0
         self.suppressed_until = 0.0
+        self.reversal_settle_until = 0.0
         self.ramp_current = None
         self.ramp_target = None
         self.next_ramp_step = 0.0
@@ -425,6 +445,7 @@ class VolumeWheel:
         self.last_raw_press = 0.0
         self.reversal_burst = 0
         self.suppressed_until = 0.0
+        self.reversal_settle_until = 0.0
         self.ramp_current = None
         self.ramp_target = None
         self.next_ramp_step = 0.0
@@ -467,16 +488,24 @@ class VolumeWheel:
                     self.held_code = code
                     self.held_effective_code = None
                     continue
-                raw_gap = (
-                    None if not self.last_raw_press
-                    else event_time - self.last_raw_press
-                )
+                if not self.last_raw_press:
+                    raw_gap = None
+                else:
+                    # Measure from release as well as press so reversing right
+                    # after a held sweep still counts as a rapid reversal.
+                    ref = (
+                        self.last_release
+                        if self.last_release >= self.last_raw_press
+                        else self.last_raw_press
+                    )
+                    raw_gap = event_time - ref
                 if (self.last_raw_code is not None
                         and code != self.last_raw_code
                         and raw_gap is not None
                         and 0 <= raw_gap <= REVERSAL_BURST_WINDOW_S):
                     self.reversal_burst += 1
-                elif raw_gap is None or raw_gap > REVERSAL_BURST_WINDOW_S:
+                elif (raw_gap is None or raw_gap < 0
+                        or raw_gap > REVERSAL_BURST_WINDOW_S):
                     self.reversal_burst = 0
                 self.last_raw_code = code
                 self.last_raw_press = event_time
@@ -484,6 +513,7 @@ class VolumeWheel:
                     self.suppressed_until = now + REVERSAL_COOLDOWN_S
                     self.reversal_burst = 0
                     self._stop_motion()
+                    delta = 0
                     self.log.warning(
                         "earcup wheel: rapid reversal burst suppressed")
                 if now < self.suppressed_until:
@@ -498,16 +528,22 @@ class VolumeWheel:
                 if (self.last_effective_code is not None
                         and code != self.last_effective_code
                         and direction_gap is not None
-                        and direction_gap < calibration["direction_guard"]):
+                        and 0 <= direction_gap < calibration["direction_guard"]):
                     # Stop old momentum immediately. Optional protection drops
                     # this uncertain reversal; it never turns it into another
                     # step in the old direction.
                     self._stop_motion()
+                    delta = 0
                     self.held_code = code
                     continue
                 if (self.last_effective_code is not None
                         and code != self.last_effective_code):
                     self._stop_motion()
+                    delta = 0
+                    self.reversal_settle_until = max(
+                        self.reversal_settle_until,
+                        now + REVERSAL_SETTLE_S,
+                    )
                 effective_code = code
                 self.last_effective_code = code
                 self.last_activation = event_time
@@ -556,6 +592,7 @@ class VolumeWheel:
         """
         if self.fd is None:
             return
+        injected = now is not None
         now = time.monotonic() if now is None else now
         if (self.held_effective_code is not None
                 and now >= self.next_hold_step
@@ -574,7 +611,7 @@ class VolumeWheel:
             else:
                 interval = calibration["hold_interval"]
             self.next_hold_step = now + interval
-        self._advance_ramp(now)
+        self._advance_ramp(now, injected=injected)
 
     def seconds_until_tick(self, now=None):
         """Return the daemon wait needed for the next ramp/hold action."""
@@ -682,24 +719,32 @@ class VolumeWheel:
                 earliest = (
                     now if self.last_volume_write is None
                     else self.last_volume_write + RAMP_INTERVAL_S)
-                self.next_ramp_step = max(now, earliest)
+                self.next_ramp_step = max(
+                    now, earliest, self.reversal_settle_until)
             self.failures = 0
         except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             self._volume_failure(exc)
 
-    def _advance_ramp(self, now):
+    def _advance_ramp(self, now, injected=False):
         if self.ramp_current is None or self.ramp_target is None:
             return
         if now < self.next_ramp_step:
             return
         old = self.ramp_current
         target = self.ramp_target
-        value = old + (1 if target > old else -1)
+        # Coalesce by at most 2% when queued far behind so fast sweeps stay
+        # responsive while keeping USB mixer control transfers ≤25/s.
+        diff = target - old
+        step = 1 if abs(diff) <= 3 else 2
+        value = old + (step if diff > 0 else -step)
         try:
             self._set_volume(value)
+            # Measure cooldown AFTER the blocking pactl/USB mixer transfer
+            # completes so slow transfers never trigger a 0 ms spin loop.
+            done = now if injected else max(now, time.monotonic())
             self.ramp_current = value
-            self.last_volume_write = now
-            self.next_ramp_step = now + RAMP_INTERVAL_S
+            self.last_volume_write = done
+            self.next_ramp_step = done + RAMP_INTERVAL_S
             self.failures = 0
             self.log.debug(
                 "earcup wheel ramp: %d%% -> %d%% (target %d%%)",

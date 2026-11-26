@@ -303,6 +303,42 @@ class VolumeWheelTests(unittest.TestCase):
             os.close(w._write)
             w.close()
 
+    def test_held_reversal_burst_suppresses(self):
+        """Reversing shortly after releasing 300 ms holds still trips breaker."""
+        w = self._wheel(50)
+        try:
+            t = 2.0
+            for i in range(REVERSAL_BURST_LIMIT + 1):
+                code = KEY_VOLUMEUP if i % 2 == 0 else KEY_VOLUMEDOWN
+                self._feed(
+                    w,
+                    _key_event(t, code, 1),
+                    _key_event(t + 0.30, code, 0),
+                )
+                t += 0.35  # 50 ms after release, 350 ms after previous press
+            self.assertGreater(w.suppressed_until, 0)
+        finally:
+            os.close(w._write)
+            w.close()
+
+    def test_same_buffer_reversal_applies_new_direction(self):
+        """UP press followed by DOWN press in one read cancels UP and moves DOWN."""
+        w = self._wheel(50)
+        try:
+            self._feed(
+                w,
+                _key_event(1.0, KEY_VOLUMEUP, 1),
+                _key_event(1.05, KEY_VOLUMEUP, 0),
+                _key_event(1.10, KEY_VOLUMEDOWN, 1),
+                _key_event(1.15, KEY_VOLUMEDOWN, 0),
+            )
+            self._flush(w)
+            self.assertEqual(w._pactl.sets, [49])
+            self.assertEqual(w._pactl.vol, 49)
+        finally:
+            os.close(w._write)
+            w.close()
+
     def test_three_failures_release_grab(self):
         w = self._wheel(40)
         try:

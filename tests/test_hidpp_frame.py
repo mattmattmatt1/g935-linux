@@ -199,6 +199,64 @@ class TransactionLockTests(unittest.TestCase):
                     os.close(r)
                     os.close(w)
 
+    def test_transact_drains_stale_reply_before_write(self):
+        """A stale ACK already sitting in fd must not satisfy a new transact."""
+        import socket
+        from g935.hidpp import transact
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                # DGRAM socketpair preserves per-report boundaries like hidraw.
+                sr, sw = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                sr.setblocking(False)
+                r, w = sr.fileno(), sw.fileno()
+                mic_seen = []
+                stale = bytes.fromhex("11ff080b0e1001") + b"\x00" * 13
+                fresh = bytes.fromhex("11ff080b0f5001") + b"\x00" * 13
+                sw.send(bytes.fromhex("0801"))
+                sw.send(stale)
+                try:
+                    def fake_write(_fd, _rpt):
+                        sw.send(fresh)
+                        return len(_rpt)
+
+                    with mock.patch("g935.hidpp.os.write", side_effect=fake_write):
+                        st, rep = transact(
+                            r, "11ff080b", timeout=0.5,
+                            on_non_hidpp=lambda b: mic_seen.append(bytes(b)))
+                    self.assertEqual(st, "ACK")
+                    self.assertEqual(rep[:7], fresh[:7])
+                    self.assertEqual(mic_seen, [bytes.fromhex("0801")])
+                finally:
+                    sr.close()
+                    sw.close()
+
+    def test_transact_retries_write_on_eagain(self):
+        from g935.hidpp import transact
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch("g935.hidpp.runtime_dir", return_value=td):
+                r, w = os.pipe()
+                os.set_blocking(r, False)
+                reply = bytes.fromhex("11ff050b03") + b"\x00" * 15
+                calls = {"n": 0}
+                real_write = os.write
+
+                def flaky_write(_fd, rpt):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        raise OSError(errno.EAGAIN, "busy")
+                    real_write(w, reply)
+                    return len(rpt)
+
+                try:
+                    with mock.patch("g935.hidpp.os.write", side_effect=flaky_write):
+                        st, rep = transact(r, "11ff050b", timeout=0.5)
+                    self.assertEqual(calls["n"], 2)
+                    self.assertEqual(st, "ACK")
+                    self.assertEqual(rep[:5], reply[:5])
+                finally:
+                    os.close(r)
+                    os.close(w)
+
 
 if __name__ == "__main__":
     unittest.main()

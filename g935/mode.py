@@ -30,7 +30,7 @@ def save_mode(mode: str) -> None:
         raise ValueError(f"mode must be one of {sorted(VALID_MODES)}, got {mode!r}")
     ensure_config_dir()
     path = mode_file()
-    tmp = path + ".tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         f.write(mode + "\n")
     os.replace(tmp, path)

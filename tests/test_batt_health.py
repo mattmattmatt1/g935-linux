@@ -712,6 +712,36 @@ class ChargeUpTests(unittest.TestCase):
         texts = " ".join(i["text"] for i in ins)
         self.assertIn("to full", texts)
 
+    def test_reload_if_changed_picks_up_panel_writes(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "health.json")
+            daemon_h = HealthTracker(path=p, auto_save_scrub=False)
+            panel_h = HealthTracker(path=p)
+            t0 = 1_700_000_000
+            for i in range(4):
+                panel_h.add_sample(t0 + i * 5, 3900 - i * 2, False)
+            panel_h.close_segment("panel close")
+            self.assertEqual(len(daemon_h.segments), 0)
+            self.assertTrue(daemon_h.reload_if_changed())
+            self.assertEqual(len(daemon_h.segments), 1)
+            self.assertFalse(daemon_h.reload_if_changed())
+
+    def test_charging_debounce_does_not_pollute_discharge_mv_end(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "health.json")
+            h = HealthTracker(path=p)
+            t0 = 1_700_000_000
+            for i in range(4):
+                h.add_sample(t0 + i * 5, 3800, False)
+            # First charging rail spike (pending_flip=1) must not raise mv_end
+            h.add_sample(t0 + 20, 4370, True)
+            self.assertEqual(h.cur["type"], "discharge")
+            self.assertEqual(h.cur["mv_end"], 3800)
+            # Second charging sample confirms flip and closes clean discharge
+            h.add_sample(t0 + 25, 4370, True)
+            self.assertEqual(len(h.segments), 1)
+            self.assertEqual(h.segments[0]["mv_end"], 3800)
+
 
 if __name__ == "__main__":
     unittest.main()

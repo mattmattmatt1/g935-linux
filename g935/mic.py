@@ -47,10 +47,10 @@ def read_host_mic_switch(usbid: str = DEFAULT_USBID,
     try:
         out = subprocess.run(
             ["amixer", "-c", card, "cget", "name=" + switch_name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=2,
             env={**os.environ, "LC_ALL": "C"},
         ).stdout
-    except FileNotFoundError:
+    except (FileNotFoundError, subprocess.SubprocessError):
         return None
     for line in out.splitlines():
         if ": values=" in line:
@@ -67,10 +67,12 @@ def set_host_mic_switch(on: bool, usbid: str = DEFAULT_USBID,
         subprocess.run(
             ["amixer", "-q", "-c", card, "cset",
              "name=" + switch_name, "on" if on else "off"],
-            check=False, env={**os.environ, "LC_ALL": "C"},
+            check=False, timeout=2, env={**os.environ, "LC_ALL": "C"},
         )
     except FileNotFoundError:
         log.warning("amixer not found — install alsa-utils for mic handling")
+    except subprocess.SubprocessError as exc:
+        log.warning("amixer failed: %s", exc)
 
 
 def read_boom(fd) -> bool | None:
@@ -140,12 +142,12 @@ class MicHandler:
     def seconds_until_tick(self, now=None):
         if self._pulse_deadline is None:
             return None
-        now = time.time() if now is None else now
+        now = time.monotonic() if now is None else now
         return max(0.0, self._pulse_deadline - now)
 
     def start_unmute_pulse(self, now=None, hold_s: float = UNMUTE_HOLD_S) -> None:
         """Host switch off; ``tick`` turns it back on after hold_s."""
-        now = time.time() if now is None else now
+        now = time.monotonic() if now is None else now
         log.info("unmute pulse: switch off, hold %.1fs, on", hold_s)
         self._set_switch(False, usbid=self.usbid, switch_name=self.switch_name)
         self._pulse_deadline = now + hold_s
@@ -154,7 +156,7 @@ class MicHandler:
         """Complete a pending unmute pulse once the hold has elapsed."""
         if self._pulse_deadline is None:
             return
-        now = time.time() if now is None else now
+        now = time.monotonic() if now is None else now
         if now < self._pulse_deadline:
             return
         self._pulse_deadline = None

@@ -20,6 +20,7 @@ import errno
 import logging
 import os
 import select
+import signal
 import sys
 import time
 
@@ -28,22 +29,27 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from g935.battery import RECENT_DECIM_S, HealthTracker, batt_state
+from g935.battery import HealthTracker, batt_state
 from g935.daemon_status import acquire_daemon_lock, panel_running
 from g935.hidpp import (
     G935_PID, PollPresence, drain_idle, find_device_by_pid, open_hidraw,
     transact,
 )
-from g935.bindings import BINDINGS_VERSION, normalize_bindings
+from g935.bindings import normalize_bindings
 from g935.mic import MicHandler
 from g935.mode import load_mode
-from g935.paths import config_dir
-from g935.volume_wheel import VolumeWheel
+from g935.volume_wheel import VolumeWheel, _load_ui_data
 
 log = logging.getLogger("g935.dspd")
 
-POLL_S = 5
+POLL_S = 5.0
 MIC_POLL_S = 0.25
+# Sample battery faster than SEG_GAP_S (30s) when the panel is closed so
+# segments stay open, median smoothing works, and health.json is saved every
+# SAVE_EVERY_S instead of dropping 1-sample segments every minute.
+HEALTH_POLL_S = 15.0
+DSP_ENABLE_DELAY_S = 2.0
+DSP_ENABLE_ATTEMPTS = 5
 # 3 misses (~15s) was too tight: a reconnect assert storm from the panel makes
 # consecutive presence TIMEOUTs look like power-off, which re-triggers enable
 # and loops. 6 misses ≈ 30s of sustained silence before declaring offline.
@@ -61,27 +67,21 @@ ALSA_USBID = "046d:0a87"
 
 
 def enable_dsp(fd) -> bool:
-    for attempt in range(5):
+    for attempt in range(DSP_ENABLE_ATTEMPTS):
         status, detail = transact(fd, ENABLE)
         if status == "ACK":
             log.info("DSP soundstage enabled")
             return True
         extra = f" code {detail:#04x}" if status == "ERR" and detail is not None else ""
         log.warning("enable attempt %d: %s%s", attempt + 1, status, extra)
-        time.sleep(2)
+        time.sleep(DSP_ENABLE_DELAY_S)
     log.error("giving up until next power-on")
     return False
 
 
 def _g0_tap_binding():
     """G0 tap from ui.json so the mute key follows the panel when it is closed."""
-    import json
-    path = os.path.join(config_dir(), "ui.json")
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        data = {}
+    data = _load_ui_data()
     try:
         version = int(data.get("bindings_version", 1))
     except (TypeError, ValueError):
@@ -101,133 +101,208 @@ def main() -> None:
         log.error("another g935-dspd is already running")
         sys.exit(1)
 
+    stop_requested = False
+
+    def _on_signal(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
     mic = MicHandler(
         usbid=ALSA_USBID, mode_loader=load_mode,
         button_gate=panel_running, button_binding=_g0_tap_binding)
     wheel = VolumeWheel(log.getChild("wheel"))
-    health = HealthTracker()
+    # Do not write health.json on startup — the panel may already own it.
+    health = HealthTracker(auto_save_scrub=False)
     presence = PollPresence(
         miss_limit=MISSED_POLLS_OFFLINE, grace_s=POST_ENABLE_GRACE_S)
     fd = None
     next_poll = 0.0
     next_health = 0.0
+    dsp_attempts_left = 0
+    next_dsp_try = 0.0
     denied_logged = False
+    panel_was_running = panel_running()
 
-    while True:
-        if fd is None:
-            dev = find_device_by_pid(G935_PID)
-            if dev is None:
-                presence.reset()
-                time.sleep(POLL_S)
-                continue
-            try:
-                fd = open_hidraw(dev)
-                if denied_logged:
-                    log.info("opened %s (ACL ready)", dev)
-                    denied_logged = False
-                else:
-                    log.info("opened %s", dev)
-            except OSError as e:
-                if e.errno in (errno.EACCES, errno.EPERM):
-                    if not denied_logged:
-                        log.warning(
-                            "open %s: permission denied "
-                            "(waiting for udev/seat ACL)", dev)
-                        denied_logged = True
+    try:
+        while not stop_requested:
+            if fd is None:
+                dev = find_device_by_pid(G935_PID)
+                if dev is None:
+                    presence.reset()
+                    dsp_attempts_left = 0
+                    time.sleep(POLL_S)
+                    continue
+                try:
+                    fd = open_hidraw(dev)
+                    if denied_logged:
+                        log.info("opened %s (ACL ready)", dev)
+                        denied_logged = False
                     else:
-                        log.debug("open %s: permission denied", dev)
-                else:
-                    log.warning("open %s: %s", dev, e)
-                time.sleep(POLL_S)
-                continue
-        try:
-            wheel.maintain()
-            now = time.time()
-            if now >= next_poll:
-                status, _ = transact(
-                    fd, PRESENCE_GET,
-                    on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
-                    timeout=1.5,
-                )
-                next_poll = now + POLL_S
-                if status == "GONE":
-                    raise OSError("device gone during presence poll")
-                transition = presence.observe(status == "ACK")
-                if transition is True:
-                    mode = load_mode()
-                    log.info("headset detected (power-on), mode=%s", mode)
-                    if mode == "ghub":
-                        time.sleep(2)
-                        enable_dsp(fd)
-                        # Panel will reassert lighting/EQ on the same bus;
-                        # hold grace so TIMEOUT streaks do not re-enter power-on.
+                        log.info("opened %s", dev)
+                except OSError as e:
+                    if e.errno in (errno.EACCES, errno.EPERM):
+                        if not denied_logged:
+                            log.warning(
+                                "open %s: permission denied "
+                                "(waiting for udev/seat ACL)", dev)
+                            denied_logged = True
+                        else:
+                            log.debug("open %s: permission denied", dev)
+                    else:
+                        log.warning("open %s: %s", dev, e)
+                    time.sleep(POLL_S)
+                    continue
+            try:
+                wheel.maintain()
+                mono = time.monotonic()
+
+                # Non-blocking DSP enable retries so the wheel and mic keep
+                # running during the post-power-on delay.
+                if dsp_attempts_left > 0 and mono >= next_dsp_try:
+                    status, detail = transact(
+                        fd, ENABLE,
+                        on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
+                    )
+                    if status == "GONE":
+                        raise OSError("device gone during DSP enable")
+                    if status == "ACK":
+                        log.info("DSP soundstage enabled")
+                        dsp_attempts_left = 0
                         presence.note_activity(POST_ENABLE_GRACE_S)
-                        # Power-on with boom up may carry the device flag.
                         mic.mark_needs_unmute()
                     else:
-                        log.info("hardware mode — leaving headset stock")
-                        presence.note_activity(POST_ENABLE_GRACE_S)
-                elif transition is False:
-                    log.info(
-                        "headset unavailable after %d missed polls",
-                        MISSED_POLLS_OFFLINE,
-                    )
-                    mic.reset()
-                    # The panel owns health.json while it is open. Saving
-                    # the daemon's older snapshot here deletes its samples.
-                    if not panel_running():
-                        health.mark_offline()
-                elif (presence.connected
-                        and not panel_running()
-                        and now >= next_health):
-                    next_health = now + RECENT_DECIM_S
-                    batt_st, reply = transact(
-                        fd, BATTERY_GET,
+                        attempt_no = DSP_ENABLE_ATTEMPTS - dsp_attempts_left + 1
+                        extra = (
+                            f" code {detail:#04x}"
+                            if status == "ERR" and detail is not None else ""
+                        )
+                        log.warning(
+                            "enable attempt %d: %s%s",
+                            attempt_no, status, extra)
+                        dsp_attempts_left -= 1
+                        if dsp_attempts_left > 0:
+                            next_dsp_try = mono + DSP_ENABLE_DELAY_S
+                        else:
+                            log.error("giving up until next power-on")
+                            presence.note_activity(POST_ENABLE_GRACE_S)
+                            mic.mark_needs_unmute()
+
+                if mono >= next_poll:
+                    status, _ = transact(
+                        fd, PRESENCE_GET,
                         on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
                         timeout=1.5,
                     )
-                    if batt_st == "ACK" and reply is not None and len(reply) > 6:
-                        mv = (reply[4] << 8) | reply[5]
-                        _state, charging = batt_state(reply[6])
-                        if charging is not None:
-                            health.add_sample(now, mv, charging)
-                    elif batt_st == "GONE":
-                        raise OSError("device gone during battery sample")
+                    next_poll = mono + POLL_S
+                    if status == "GONE":
+                        raise OSError("device gone during presence poll")
+                    transition = presence.observe(status == "ACK")
+                    if transition is True:
+                        mode = load_mode()
+                        log.info("headset detected (power-on), mode=%s", mode)
+                        if mode == "ghub":
+                            dsp_attempts_left = DSP_ENABLE_ATTEMPTS
+                            next_dsp_try = mono + DSP_ENABLE_DELAY_S
+                            presence.note_activity(POST_ENABLE_GRACE_S)
+                        else:
+                            log.info("hardware mode — leaving headset stock")
+                            dsp_attempts_left = 0
+                            presence.note_activity(POST_ENABLE_GRACE_S)
+                    elif transition is False:
+                        log.info(
+                            "headset unavailable after %d missed polls",
+                            MISSED_POLLS_OFFLINE,
+                        )
+                        dsp_attempts_left = 0
+                        mic.reset()
+                        # The panel owns health.json while it is open.
+                        if not panel_running():
+                            health.reload_if_changed()
+                            health.mark_offline()
+                    elif presence.connected:
+                        p_run = panel_running()
+                        if p_run:
+                            # Release our open segment in memory without saving;
+                            # panel owns health.json while open.
+                            health.cur = None
+                            health.cur_mvs = []
+                            health.last_t = 0
+                            health.dirty = False
+                        elif mono >= next_health:
+                            health.reload_if_changed()
+                            next_health = mono + HEALTH_POLL_S
+                            batt_st, reply = transact(
+                                fd, BATTERY_GET,
+                                on_non_hidpp=lambda buf: mic.handle_report(buf, fd),
+                                timeout=1.5,
+                            )
+                            if batt_st == "ACK" and reply is not None and len(reply) > 6:
+                                mv = (reply[4] << 8) | reply[5]
+                                _state, charging = batt_state(reply[6])
+                                if charging is not None:
+                                    health.add_sample(time.time(), mv, charging)
+                            elif batt_st == "GONE":
+                                raise OSError("device gone during battery sample")
+                        panel_was_running = p_run
 
-            wait = max(0.0, min(next_poll, time.time() + MIC_POLL_S) - time.time())
-            wheel_wait = wheel.seconds_until_tick()
-            if wheel_wait is not None:
-                wait = min(wait, wheel_wait)
-            mic_wait = mic.seconds_until_tick()
-            if mic_wait is not None:
-                wait = min(wait, mic_wait)
-            readers = [fd]
-            if wheel.fileno() is not None:
-                readers.append(wheel.fileno())
-            r, _, _ = select.select(readers, [], [], wait)
-            if wheel.fileno() is not None and wheel.fileno() in r:
-                wheel.handle_ready()
-            wheel.tick()
-            if fd in r:
-                if not drain_idle(
-                        fd,
-                        on_non_hidpp=lambda buf: mic.handle_report(buf, fd)):
-                    raise OSError("device gone during idle drain")
-            if presence.connected:
-                mic.poll(fd)
-                mic.tick(fd)
-        except OSError:
+                now_m = time.monotonic()
+                wait = max(0.0, min(next_poll - now_m, MIC_POLL_S))
+                if dsp_attempts_left > 0:
+                    wait = min(wait, max(0.0, next_dsp_try - now_m))
+                wheel_wait = wheel.seconds_until_tick(now_m)
+                if wheel_wait is not None:
+                    wait = min(wait, wheel_wait)
+                mic_wait = mic.seconds_until_tick(now_m)
+                if mic_wait is not None:
+                    wait = min(wait, mic_wait)
+                readers = [fd]
+                if wheel.fileno() is not None:
+                    readers.append(wheel.fileno())
+                try:
+                    r, _, _ = select.select(readers, [], [], wait)
+                except InterruptedError:
+                    continue
+                if wheel.fileno() is not None and wheel.fileno() in r:
+                    wheel.handle_ready()
+                wheel.tick()
+                if fd in r:
+                    if not drain_idle(
+                            fd,
+                            on_non_hidpp=lambda buf: mic.handle_report(buf, fd)):
+                        raise OSError("device gone during idle drain")
+                if presence.connected:
+                    mic.poll(fd)
+                    mic.tick(fd)
+            except OSError:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+                dsp_attempts_left = 0
+                presence.reset()
+                mic.reset()
+                if not panel_running():
+                    health.reload_if_changed()
+                    health.mark_offline()
+                log.info("receiver gone, rescanning")
+                time.sleep(1)
+    finally:
+        wheel.close("daemon stopping")
+        if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
-            fd = None
-            presence.reset()
-            mic.reset()
-            if not panel_running():
-                health.mark_offline()
-            log.info("receiver gone, rescanning")
-            time.sleep(1)
+        if not panel_running() and (health.dirty or health.cur is not None):
+            if not health.reload_if_changed():
+                if health.cur is not None:
+                    health.close_segment("daemon stop")
+                elif health.dirty:
+                    health.save()
 
 
 if __name__ == "__main__":

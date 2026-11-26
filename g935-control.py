@@ -25,6 +25,7 @@ import fcntl
 import json
 import os
 import sys
+import threading
 import time
 
 # Allow `python3 g935-control.py` from a git checkout without install.
@@ -62,15 +63,12 @@ from g935.battery import (
     HEALTH_DEFAULTS, BatteryAlerts, HealthTracker, batt_percent, batt_state,
     build_insights, merge_discharge_sessions, session_full_runtime_h,
 )
-from g935.chart_data import (
-    build_day_summaries, build_expected_overlay,
-    build_history_runs, build_level_series,
-)
+from g935.chart_data import build_level_series
 from g935.charts import (
     ChargeHistoryChart, DrainProfileChart, ExpectActualChart,
     HealthGaugeChart, SessionRuntimeChart,
 )
-from g935.daemon_status import daemon_running, panel_lock_path
+from g935.daemon_status import daemon_running, panel_lock_path, panel_running
 from g935.features import (
     DEVICE_TYPES, FEATURE_LABELS, LED_EFFECTS, LIGHT_MODES,
     build_light_params, format_frequency, parse_device_info, parse_eq_info,
@@ -88,7 +86,7 @@ from g935.mode import load_mode, save_mode
 from g935.panel_ipc import bind_listener, notify_running_instance
 from g935.paths import config_dir, ensure_config_dir, runtime_dir
 from g935.stereo_route import (
-    fix_stereo, inspect_stereo, is_g935_sink, notify_user,
+    fix_stereo, inspect_stereo, is_g935_sink, notify_user, notify_user_with_id,
 )
 from g935.tray_scroll import tray_scroll_notches
 from g935.volume_wheel import (
@@ -410,6 +408,7 @@ class App(Gtk.Window):
         self._tray_scroll_acc = 0
         self._tray_menu_sig = None
         self._headset_sink_cache = None
+        self._last_known_g935_sink = None
         self._vol_pending = {}    # (kind, name) -> debounce source id
         self._vol_containers = []
         self._vol_interacting = False
@@ -419,6 +418,12 @@ class App(Gtk.Window):
         self._gkey_count = 0
         self._gkey_control = None  # 0x8010 fn1 byte; not software-mode
         self._g0_down = False
+        self._g0_flash_src = None
+        self._just_discovered = False
+        self._last_batt_display = None
+        self._health_ui_dirty = False
+        self._batt_notify_ids = {}
+        self._stereo_checking = False
         self._device_firmware = []
         self._device_name_parts = bytearray()
         self._device_name_count = 0
@@ -1167,6 +1172,7 @@ class App(Gtk.Window):
         self._setup_tray()
         self._ipc_sock = None
         self.connect("delete-event", self.on_delete_event)
+        self.connect("show", self._on_window_show)
         GLib.idle_add(self._on_audio_change)   # first tray/settings population
         GLib.idle_add(self._poll_stereo_route_once)  # first stereo check
 
@@ -1612,9 +1618,7 @@ class App(Gtk.Window):
             present = attr in self.features
             widget.set_no_show_all(not present)
             widget.set_visible(present)
-        if "lighting" in self.features and not self.zone_widgets:
-            self.send("lighting", 0, cb=self._got_light_info)
-        elif "lighting" in self.features:
+        if "lighting" in self.features:
             self.send("lighting", 0, cb=self._got_light_info)
         if "eq" in self.features:
             self.send("eq", 0, cb=self._got_eq_info)
@@ -1627,6 +1631,7 @@ class App(Gtk.Window):
         self.power_frame.set_visible("battery" in self.features)
         self._update_feature_summary()
         self._probe_device_identity()
+        self._just_discovered = True
         self._assert_device_state(initial=True)
 
     def _got_light_info(self, status, reply):
@@ -1890,6 +1895,8 @@ class App(Gtk.Window):
             return
         remaining = self._device_name_count - start
         chunk = reply[4:4 + min(16, remaining)]
+        if not chunk:
+            return
         self._device_name_parts.extend(chunk)
         self._request_device_name_chunk(start + len(chunk))
 
@@ -1910,7 +1917,7 @@ class App(Gtk.Window):
         self._apply_saved_lighting()
         if initial:
             self.send("sidetone", 0, cb=self.got_sidetone)
-            self.send("eq", 2, "01", cb=self.got_eq)
+            # EQ is read by _got_eq_info once band count/range are confirmed.
         else:
             self._apply_sidetone()
             self._apply_eq(persistence=0)
@@ -2038,7 +2045,7 @@ class App(Gtk.Window):
         self._hold_src = GLib.timeout_add(50, self._hold_tick)
 
     def _hold_tick(self):
-        for key in self._holds.due(time.time()):
+        for key in self._holds.due(time.monotonic()):
             self._fire_binding(key, "hold")
         if self._holds.pending():
             return True
@@ -2067,6 +2074,8 @@ class App(Gtk.Window):
             cur = _read_host_mic()
             if cur is None:
                 return False, "host mic switch unknown"
+            if not cur and self.profile["has_boom_mic"] and self.worker._boom is False:
+                return False, "ignored — boom is up"
             _set_host_mic(not cur)
             self._refresh_hostmic()
             return True, "muted" if cur else "unmuted"
@@ -2103,25 +2112,29 @@ class App(Gtk.Window):
         changed = self._gkey_mask ^ mask
         events = []
         count = self._gkey_count or len(HID_KEYS)
+        now = time.monotonic()
         for i in range(min(count, len(HID_KEYS))):
             bit = 1 << i
             down = bool(mask & bit)
             self.gkey_labels[HID_KEYS[i]].set_sensitive(down)
+            key = key_for_index(i)
             if changed & bit:
                 events.append(f"G{i + 1} {'down' if down else 'up'}")
-                key = key_for_index(i)
                 if key:
                     if down:
-                        # A second "down" with no up is a new click
-                        # (press-only firmware), not a stuck key.
-                        if not (changed & bit):
-                            if self._holds.release(key) == "tap":
-                                self._fire_binding(key, "tap")
-                        self._holds.press(key, time.time())
+                        self._holds.press(key, now)
                         self._arm_hold_check()
                     else:
                         if self._holds.release(key) == "tap":
                             self._fire_binding(key, "tap")
+            elif changed == 0 and down and key:
+                # A repeated identical "down" with no intervening release is
+                # a new click on press-only firmware, not a stuck key.
+                events.append(f"G{i + 1} down")
+                if self._holds.release(key) == "tap":
+                    self._fire_binding(key, "tap")
+                self._holds.press(key, now)
+                self._arm_hold_check()
         self._gkey_mask = mask
         if events:
             text = ", ".join(events)
@@ -2172,14 +2185,40 @@ class App(Gtk.Window):
             self._set_mic_status("🎤 <b>live</b>", "🎤 live (boom down)")
             self.log("--- boom lowered: unmuted (hardware mode) ---")
 
+    def _clear_g0_flash(self):
+        self._g0_flash_src = None
+        if not self._g0_down and "g0" in self.gkey_labels:
+            self.gkey_labels["g0"].set_sensitive(False)
+        return False
+
     def on_mic_event(self, bits):
         button = bool(bits & BUTTON) and not bits & (BOOM_UP | BOOM_DOWN)
-        if button != self._g0_down:
-            self._g0_down = button
-            self._on_g0_edge(button)
+        hold_set = self._bindings["g0"].hold.action != "none"
         if button:
+            # 0x08 often sends press-only (08 01) without a release report.
+            # When no hold is bound, fire on every press so G0 never sticks.
+            if not hold_set:
+                self._g0_down = False
+                if "g0" in self.gkey_labels:
+                    self.gkey_labels["g0"].set_sensitive(True)
+                    if self._g0_flash_src is not None:
+                        GLib.source_remove(self._g0_flash_src)
+                    self._g0_flash_src = GLib.timeout_add(
+                        200, self._clear_g0_flash)
+                if self.dsp_sw.get_active():
+                    self._fire_binding("g0", "tap")
+            else:
+                if self._g0_down:
+                    # Press-only repeat while hold is bound: flush prior tap.
+                    if self._holds.release("g0") == "tap":
+                        self._fire_binding("g0", "tap")
+                self._g0_down = True
+                self._on_g0_edge(True)
             self.log("--- G0 (earcup key) ---")
             GLib.timeout_add(300, lambda: (self._refresh_hostmic(), False)[1])
+        elif self._g0_down:
+            self._g0_down = False
+            self._on_g0_edge(False)
 
     def _on_g0_edge(self, down):
         if "g0" in self.gkey_labels:
@@ -2188,11 +2227,10 @@ class App(Gtk.Window):
             return
         hold_set = self._bindings["g0"].hold.action != "none"
         if down:
-            self._holds.press("g0", time.time())
+            self._holds.press("g0", time.monotonic())
             if hold_set:
                 self._arm_hold_check()
             else:
-                # 0x08 often sends press only. No hold bound → tap now.
                 self._fire_binding("g0", "tap")
         elif hold_set and self._holds.release("g0") == "tap":
             self._fire_binding("g0", "tap")
@@ -2299,7 +2337,11 @@ class App(Gtk.Window):
         widgets = self.zone_widgets[zone]
         mode = widgets["mode"].get_active()
         rgba = widgets["color"].get_rgba()
-        r, g, b = (int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255))
+        r, g, b = (
+            round(rgba.red * 255),
+            round(rgba.green * 255),
+            round(rgba.blue * 255),
+        )
         return build_light_params(
             zone, mode, (r, g, b),
             period_ms=int(widgets["period"].get_value()),
@@ -2316,8 +2358,8 @@ class App(Gtk.Window):
         rgba = widgets["color"].get_rgba()
         self.settings.data["lighting"][str(zone)] = {
             "mode": widgets["mode"].get_active(),
-            "color": "#%02X%02X%02X" % (int(rgba.red * 255), int(rgba.green * 255),
-                                        int(rgba.blue * 255)),
+            "color": "#%02X%02X%02X" % (round(rgba.red * 255), round(rgba.green * 255),
+                                        round(rgba.blue * 255)),
             "period": int(widgets["period"].get_value()),
             "intensity": int(widgets["intensity"].get_value()),
             "waveform": widgets["waveform"].get_active(),
@@ -2461,26 +2503,39 @@ class App(Gtk.Window):
         if self.tray_batt_item:
             self.tray_batt_item.set_label(self._tray_header_label())
 
-    def _tray_menu_signature(self):
+    def _audio_snapshot(self):
+        return (
+            self.audio.list_sinks(),
+            self.audio.default_sink(),
+            self.audio.list_sources(),
+            self.audio.default_source(),
+        )
+
+    def _tray_menu_signature(self, snapshot=None):
         """Identity of the menu. Volume changes are not part of it."""
+        all_sinks, def_sink, all_sources, def_source = (
+            snapshot if snapshot is not None else self._audio_snapshot()
+        )
         hidden_sinks = set(self.settings.data["hidden_sinks"])
         hidden_sources = set(self.settings.data["hidden_sources"])
         sinks = tuple(
-            (name, desc) for name, desc in self.audio.list_sinks()
+            (name, desc) for name, desc in all_sinks
             if name not in hidden_sinks)
         sources = tuple(
-            (name, desc) for name, desc in self.audio.list_sources()
+            (name, desc) for name, desc in all_sources
             if name not in hidden_sources)
         return (
-            sinks, self.audio.default_sink(),
-            sources, self.audio.default_source(),
+            sinks, def_sink,
+            sources, def_source,
             bool(getattr(self, "_stereo_broken", False)),
         )
 
-    def _rebuild_tray_menu(self):
+    def _rebuild_tray_menu(self, snapshot=None):
         if not self.indicator:
             return
-        signature = self._tray_menu_signature()
+        if snapshot is None:
+            snapshot = self._audio_snapshot()
+        signature = self._tray_menu_signature(snapshot)
         if signature == self._tray_menu_sig and self.tray_batt_item:
             self.tray_batt_item.set_label(self._tray_header_label())
             return
@@ -2492,15 +2547,16 @@ class App(Gtk.Window):
         menu.append(self.tray_batt_item)
         menu.append(Gtk.SeparatorMenuItem())
 
+        all_sinks, def_sink, all_sources, def_source = snapshot
         hidden_sinks = set(self.settings.data["hidden_sinks"])
         hidden_sources = set(self.settings.data["hidden_sources"])
         for kind, devs, hidden, default, setter in (
-                ("Output", self.audio.list_sinks(),
+                ("Output", all_sinks,
                  hidden_sinks,
-                 self.audio.default_sink(), self.audio.set_default_sink),
-                ("Input", self.audio.list_sources(),
+                 def_sink, self.audio.set_default_sink),
+                ("Input", all_sources,
                  hidden_sources,
-                 self.audio.default_source(), self.audio.set_default_source)):
+                 def_source, self.audio.set_default_source)):
             hdr = Gtk.MenuItem(label=kind)
             hdr.set_sensitive(False)
             menu.append(hdr)
@@ -2542,10 +2598,19 @@ class App(Gtk.Window):
         self.indicator.set_menu(menu)
 
     def on_delete_event(self, *_):
-        if self.indicator:          # hide to tray, keep running
+        if self.indicator or self._tray_waiting:  # hide to tray, keep running
             self.hide()
             return True
         return False                # no tray: normal close -> destroy -> quit
+
+    def _on_window_show(self, *_):
+        if self._health_ui_dirty:
+            self._health_ui_dirty = False
+            if self._last_batt_display is not None:
+                self._refresh_health_display(
+                    *self._last_batt_display, force_ui=True)
+            else:
+                self._refresh_health_display(None, None, "…", force_ui=True)
 
     def listen_for_activation(self, sock=None):
         if sock is not None:
@@ -2602,11 +2667,18 @@ class App(Gtk.Window):
         cached = self._headset_sink_cache
         if cached is not None and now < cached[0]:
             return cached[1]
+        listed, sinks = self.audio.list_sinks_checked()
         name = None
-        for sink_name, desc in self.audio.list_sinks():
-            if is_g935_sink(sink_name, desc):
-                name = sink_name
-                break
+        if listed:
+            for sink_name, desc in sinks:
+                if is_g935_sink(sink_name, desc):
+                    name = sink_name
+                    self._last_known_g935_sink = sink_name
+                    break
+        elif self._last_known_g935_sink:
+            # A failed pactl list does not mean the headset left; keep the
+            # last real G935 node instead of jumping to HDMI/speakers.
+            name = self._last_known_g935_sink
         if name is None:
             name = self.audio.default_sink()
         self._headset_sink_cache = (now + 2.0, name)
@@ -2917,6 +2989,7 @@ class App(Gtk.Window):
 
     def _wheel_cal_on_io(self, fd, condition):
         if condition & (GLib.IO_HUP | GLib.IO_ERR):
+            self._wheel_cal_watch = None
             self._wheel_cal_widgets["live"].set_text(
                 "Wheel device disconnected. Reconnect it and restart calibration.")
             return False
@@ -3019,7 +3092,7 @@ class App(Gtk.Window):
             "analysis": result,
         }
         ensure_config_dir()
-        tmp = WHEEL_CAPTURE_FILE + ".tmp"
+        tmp = f"{WHEEL_CAPTURE_FILE}.{os.getpid()}.tmp"
         try:
             with open(tmp, "w") as f:
                 json.dump(payload, f, indent=2)
@@ -3027,7 +3100,7 @@ class App(Gtk.Window):
             self._wheel_cal_capture_saved = True
             return WHEEL_CAPTURE_FILE
         except OSError as exc:
-            log.warning("could not save wheel capture: %s", exc)
+            self.log(f"--- could not save wheel capture: {exc} ---")
             return f"capture could not be saved ({exc})"
 
     def _wheel_cal_cleanup(self):
@@ -3059,10 +3132,11 @@ class App(Gtk.Window):
             self._sync_volume_row_levels()
             return
         self._headset_sink_cache = None
-        self._rebuild_tray_menu()
-        self._refresh_device_toggles()
+        snapshot = self._audio_snapshot()
+        self._rebuild_tray_menu(snapshot=snapshot)
+        self._refresh_device_toggles(snapshot=snapshot)
         self._sync_headset_vol_slider()
-        self._refresh_volume_rows()
+        self._refresh_volume_rows(snapshot=snapshot)
         # Device re-enumerate after resume often breaks the FR link.
         # The 8s poll still covers the quiet case; don't stack one-shots.
         self._schedule_stereo_check()
@@ -3077,13 +3151,16 @@ class App(Gtk.Window):
         self._poll_stereo_route_once()
         return False
 
-    def _refresh_device_toggles(self):
+    def _refresh_device_toggles(self, snapshot=None):
+        all_sinks, _def_sink, all_sources, _def_source = (
+            snapshot if snapshot is not None else self._audio_snapshot()
+        )
         box = self.dev_toggle_box
         for c in box.get_children():
             c.destroy()
         for kind_lbl, devs, key in (
-                ("Outputs", self.audio.list_sinks(), "hidden_sinks"),
-                ("Inputs", self.audio.list_sources(), "hidden_sources")):
+                ("Outputs", all_sinks, "hidden_sinks"),
+                ("Inputs", all_sources, "hidden_sources")):
             hdr = Gtk.Label(xalign=0)
             hdr.set_markup(f"<b>{kind_lbl}</b>")
             box.pack_start(hdr, False, False, 2)
@@ -3104,30 +3181,42 @@ class App(Gtk.Window):
             hidden.add(name)
         self.settings.data[key] = sorted(hidden)
         self.settings.save()
-        self._rebuild_tray_menu()
-        self._refresh_volume_rows()
+        snapshot = self._audio_snapshot()
+        self._rebuild_tray_menu(snapshot=snapshot)
+        self._refresh_volume_rows(snapshot=snapshot)
 
-    def _refresh_volume_rows(self):
+    def _refresh_volume_rows(self, snapshot=None):
         if self._vol_pending or self._vol_interacting:
             return
+        if snapshot is None:
+            snapshot = self._audio_snapshot()
         for box in self._vol_containers:
-            self._build_volume_rows(box)
+            self._build_volume_rows(box, snapshot=snapshot)
 
-    def _build_volume_rows(self, container):
+    def _build_volume_rows(self, container, snapshot=None):
+        all_sinks, def_sink, all_sources, def_source = (
+            snapshot if snapshot is not None else self._audio_snapshot()
+        )
         for c in container.get_children():
             c.destroy()
         for kind, devs, hidden, default, setter in (
-                ("sink", self.audio.list_sinks(),
+                ("sink", all_sinks,
                  set(self.settings.data["hidden_sinks"]),
-                 self.audio.default_sink(), self.audio.set_default_sink),
-                ("source", self.audio.list_sources(),
+                 def_sink, self.audio.set_default_sink),
+                ("source", all_sources,
                  set(self.settings.data["hidden_sources"]),
-                 self.audio.default_source(), self.audio.set_default_source)):
-            for name, desc in devs:
-                if name in hidden:
-                    continue
+                 def_source, self.audio.set_default_source)):
+            visible = [(name, desc) for name, desc in devs if name not in hidden]
+            group = None
+            if not any(name == default for name, _desc in visible):
+                # Hidden placeholder so no visible radio appears checked when
+                # the active default is filtered out.
+                group = Gtk.RadioButton.new_from_widget(None)
+                group.set_active(True)
+            for name, desc in visible:
                 row = Gtk.Box(spacing=8)
-                rb = Gtk.CheckButton()
+                rb = Gtk.RadioButton.new_from_widget(group)
+                group = group or rb
                 rb.set_active(name == default)
                 rb.set_tooltip_text("make default")
                 rb.connect("toggled",
@@ -3215,17 +3304,23 @@ class App(Gtk.Window):
             self.health.close_segment("tracking disabled")
         self.health.save()
 
+    def _refresh_health_display_cached(self):
+        if self._last_batt_display is not None:
+            self._refresh_health_display(*self._last_batt_display, force_ui=True)
+        else:
+            self._refresh_health_display(force_ui=True)
+
     def on_spec_changed(self, spin, key):
         v = spin.get_value()
         self.health.settings[key] = v if spin.get_digits() else int(v)
         self.health.save()
-        self._refresh_health_display()
+        self._refresh_health_display_cached()
 
     def on_profile_changed(self, _combo):
         self.health.settings["runtime_profile"] = (
             "rgb_on" if self.profile_combo.get_active() == 0 else "rgb_off")
         self.health.save()
-        self._refresh_health_display()
+        self._refresh_health_display_cached()
 
     def on_spec_reset(self, _btn):
         for key, sp in self.spec_spins.items():
@@ -3238,7 +3333,7 @@ class App(Gtk.Window):
         self.profile_combo.set_active(0)
         self.profile_combo.handler_unblock_by_func(self.on_profile_changed)
         self.health.save()
-        self._refresh_health_display()
+        self._refresh_health_display_cached()
 
     @staticmethod
     def _dur(seconds):
@@ -3292,7 +3387,15 @@ class App(Gtk.Window):
         return "#2ec27e"
 
     def _refresh_health_display(self, mv=None, pct=None, state="",
-                                raw_mv=None, path_is_rail=False):
+                                raw_mv=None, path_is_rail=False,
+                                force_ui=False):
+        self._last_batt_display = (mv, pct, state, raw_mv, path_is_rail)
+        if not force_ui and not self.get_visible():
+            # Avoid recomputing 7-day battery analytics and Cairo charts every
+            # 5s while minimized to the tray; _on_window_show refreshes live.
+            self._health_ui_dirty = True
+            return
+        self._health_ui_dirty = False
         h = self.health
         rated = self._rated_runtime()
         charging = (state == "charging") if state else None
@@ -3661,18 +3764,9 @@ class App(Gtk.Window):
         """Push latest analysis into the Cairo chart widgets."""
         h = self.health
         full = int(h.settings.get("full_mv", HEALTH_DEFAULTS["full_mv"]))
-        runs = build_history_runs(h.recent, batt_percent, full_mv=full)
-        last_run = runs[-1] if runs else []
-        expected_line = (
-            build_expected_overlay(last_run, rated)
-            if last_run and any(not chg for _t, _p, chg in last_run) else None)
         self.chart_history.set_data({
             "series": build_level_series(
                 h.recent, batt_percent, full_mv=full),
-            "summaries": build_day_summaries(
-                h.recent, batt_percent, full_mv=full),
-            "runs": runs,
-            "expected_points": expected_line,
         })
         self.chart_gauge.set_data({
             "health_pct": analysis.get("health_pct"),
@@ -3724,15 +3818,31 @@ class App(Gtk.Window):
         return True  # keep the 8s timer
 
     def _poll_stereo_route_once(self):
-        """One-shot check (idle / post-audio-change). Returns False for GLib."""
-        if self._stereo_fixing:
+        """One-shot check (idle / post-audio-change). Runs pw-link off the UI thread."""
+        if self._stereo_fixing or self._stereo_checking:
             return False
-        try:
-            st = inspect_stereo()
-        except Exception as e:
-            self.log(f"stereo check error: {e}")
-            return False
-        self._apply_stereo_status(st, auto_fix=True)
+        self._stereo_checking = True
+
+        def _worker():
+            try:
+                st = inspect_stereo()
+            except Exception as e:
+                GLib.idle_add(self._on_stereo_check_error, str(e))
+                return
+            GLib.idle_add(self._on_stereo_check_done, st)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return False
+
+    def _on_stereo_check_error(self, msg):
+        self._stereo_checking = False
+        self.log(f"stereo check error: {msg}")
+        return False
+
+    def _on_stereo_check_done(self, st):
+        self._stereo_checking = False
+        if not self._stereo_fixing:
+            self._apply_stereo_status(st, auto_fix=True)
         return False
 
     def _apply_stereo_status(self, st, auto_fix=False):
@@ -3761,7 +3871,7 @@ class App(Gtk.Window):
             self.stereo_label.set_markup(
                 "<span foreground='#e01b24'><b>🎧 L-only</b></span>")
             self.stereo_label.set_tooltip_text(st.detail)
-            quiet = time.time() < self._stereo_dismissed_until
+            quiet = time.monotonic() < self._stereo_dismissed_until
             if not quiet:
                 self.stereo_banner.show()
             # Notify once per incident (not every poll)
@@ -3843,7 +3953,7 @@ class App(Gtk.Window):
             self._do_stereo_fix()
         elif response_id == Gtk.ResponseType.CLOSE:
             # Quiet for 10 minutes unless it heals and breaks again
-            self._stereo_dismissed_until = time.time() + 600
+            self._stereo_dismissed_until = time.monotonic() + 600
             bar.hide()
 
     def on_fix_stereo(self, *_):
@@ -3867,7 +3977,7 @@ class App(Gtk.Window):
             # heals, but not on every 5s poll — that doubled HID++ traffic
             # and made presence TIMEOUTs look like power-off (death spiral).
             if self.dsp_sw.get_active():
-                now = time.time()
+                now = time.monotonic()
                 last = getattr(self, "_last_dsp_heal", 0.0)
                 if now - last >= 30.0:
                     self._last_dsp_heal = now
@@ -3913,14 +4023,19 @@ class App(Gtk.Window):
             self._check_battery_alerts(pct, charging)
             if self.connected is not True:
                 was_off = self.connected is False
+                just_discovered = self._just_discovered
+                self._just_discovered = False
                 self.connected = True
                 self.conn_label.set_markup(
                     "<span foreground='#2ec27e'>●</span> <b>Connected</b>")
                 self.conn_label.set_tooltip_text("headset on")
-                if was_off:
+                if was_off and not just_discovered:
                     # power-on wipes on-device state - re-assert panel settings
                     self.log("--- headset powered on: re-applying panel state ---")
                     self._assert_device_state(initial=False)
+        elif status == "GONE":
+            # on_link(False) already handled disconnect cleanly.
+            return
         elif self._battery_presence.observe(False) is False:
             self._mark_disconnected()
         else:
@@ -3935,11 +4050,12 @@ class App(Gtk.Window):
     def _check_battery_alerts(self, pct, charging):
         """Desktop notify once per low/critical threshold while discharging."""
         for alert in self._batt_alerts.update(pct, charging):
-            # Stable replace ids so repeated cycles update the same toast slot
-            rid = 93510 if alert.level == "low" else 93505
-            ok = notify_user(
+            prev_id = self._batt_notify_ids.get(alert.level)
+            ok, new_id = notify_user_with_id(
                 alert.summary, alert.body, urgency=alert.urgency,
-                replace_id=rid)
+                replace_id=prev_id)
+            if ok and new_id:
+                self._batt_notify_ids[alert.level] = new_id
             self.log(
                 f"BATT ALERT {alert.level}: {alert.body}"
                 + ("" if ok else " (notify-send failed — check libnotify / DBus)"))
@@ -3987,12 +4103,14 @@ def main():
         help="start hidden in the system tray")
     opts = args.parse_args()
     install_app_css()
-    if notify_running_instance():
+    if opts.tray and panel_running():
+        # A second --tray start exits quietly without popping open the window.
+        return
+    if not opts.tray and notify_running_instance():
         return
     lock = acquire_single_instance()
     if lock is None:
-        if opts.tray:
-            notify_running_instance()
+        if opts.tray or notify_running_instance():
             return
         error_dialog("Another instance is already running (check the tray).")
         return

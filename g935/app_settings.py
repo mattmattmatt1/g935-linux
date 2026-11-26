@@ -16,6 +16,10 @@ from g935.volume_wheel import (
 
 UI_FILE = os.path.join(config_dir(), "ui.json")
 
+
+def ui_file() -> str:
+    return os.path.join(config_dir(), "ui.json")
+
 UI_DEFAULTS = {
     "hidden_sinks": [], "hidden_sources": [], "lighting": {},
     "wheel_enabled": True, "wheel_step": DEFAULT_STEP,
@@ -38,9 +42,10 @@ class AppSettings:
     """ui.json: audio-device visibility + saved lighting state. Loaded once,
     saved atomically on change (same pattern as HealthTracker)."""
 
-    def __init__(self):
+    def __init__(self, path=None):
+        self.path = path or ui_file()
         try:
-            with open(UI_FILE) as f:
+            with open(self.path) as f:
                 data = json.load(f)
         except (OSError, ValueError):
             data = {}
@@ -83,7 +88,7 @@ class AppSettings:
 
     def save(self):
         ensure_config_dir()
-        tmp = UI_FILE + ".tmp"
+        tmp = f"{self.path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
             json.dump({"version": 1, **self.data}, f)
-        os.replace(tmp, UI_FILE)
+        os.replace(tmp, self.path)

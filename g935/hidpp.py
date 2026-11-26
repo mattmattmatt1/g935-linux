@@ -173,6 +173,36 @@ def hidraw_error(exc: OSError) -> str:
     return "TIMEOUT"
 
 
+def _drain_fd_unlocked(fd, on_non_hidpp=None, on_hidpp_notification=None):
+    """Read all currently-buffered reports on fd. Caller must hold the lock.
+
+    Returns True if fd is still live, False if gone.
+    """
+    while True:
+        try:
+            r, _, _ = select.select([fd], [], [], 0)
+        except (OSError, ValueError):
+            return False
+        if not r:
+            return True
+        try:
+            buf = os.read(fd, 64)
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                continue
+            # False only when the node is gone. A rejected report
+            # (EINVAL) must not make the daemon close the fd.
+            return hidraw_error(exc) != "GONE"
+        if len(buf) < 2:
+            continue
+        if buf[0] != 0x11:
+            if on_non_hidpp is not None:
+                on_non_hidpp(buf)
+        elif (on_hidpp_notification is not None
+                and is_hidpp_notification(buf)):
+            on_hidpp_notification(buf)
+
+
 def drain_idle(fd, on_non_hidpp=None, on_hidpp_notification=None):
     """Read pending reports only when no HID++ transaction owns the bus.
 
@@ -183,29 +213,9 @@ def drain_idle(fd, on_non_hidpp=None, on_hidpp_notification=None):
     if lock_fd is None:
         return True
     try:
-        while True:
-            try:
-                r, _, _ = select.select([fd], [], [], 0)
-            except (OSError, ValueError):
-                return False
-            if not r:
-                return True
-            try:
-                buf = os.read(fd, 64)
-            except OSError as exc:
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
-                    continue
-                # False only when the node is gone. A rejected report
-                # (EINVAL) must not make the daemon close the fd.
-                return hidraw_error(exc) != "GONE"
-            if len(buf) < 2:
-                continue
-            if buf[0] != 0x11:
-                if on_non_hidpp is not None:
-                    on_non_hidpp(buf)
-            elif (on_hidpp_notification is not None
-                    and is_hidpp_notification(buf)):
-                on_hidpp_notification(buf)
+        return _drain_fd_unlocked(
+            fd, on_non_hidpp=on_non_hidpp,
+            on_hidpp_notification=on_hidpp_notification)
     finally:
         _release_transaction_lock(lock_fd)
 
@@ -228,14 +238,37 @@ def transact(fd, hx, timeout=1.0, on_non_hidpp=None,
     feat, fnsw = rpt[2], rpt[3]
     lock_fd = _acquire_transaction_lock()
     try:
-        try:
-            os.write(fd, rpt)
-        except OSError as exc:
-            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+        # Flush stale replies left in this fd's hidraw ring buffer by the
+        # other process (panel/daemon share the receiver and each open fd gets
+        # a copy of every incoming report). Forwarding callbacks preserves any
+        # queued mic or G-key events.
+        if not _drain_fd_unlocked(
+                fd, on_non_hidpp=on_non_hidpp,
+                on_hidpp_notification=on_hidpp_notification):
+            return "GONE", None
+        deadline = time.monotonic() + timeout
+        written = False
+        while time.monotonic() < deadline:
+            try:
+                os.write(fd, rpt)
+                written = True
+                break
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    wait = min(0.05, deadline - time.monotonic())
+                    if wait <= 0:
+                        break
+                    try:
+                        select.select([], [fd], [], wait)
+                    except OSError as sel_exc:
+                        if sel_exc.errno not in (errno.EAGAIN, errno.EINTR):
+                            return hidraw_error(sel_exc), None
+                    continue
                 return hidraw_error(exc), None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            wait = deadline - time.time()
+        if not written:
+            return "TIMEOUT", None
+        while time.monotonic() < deadline:
+            wait = deadline - time.monotonic()
             if wait <= 0:
                 break
             try:
@@ -304,13 +337,13 @@ class PollPresence:
         duration = self.grace_s if grace_s is None else float(grace_s)
         if duration <= 0:
             return
-        t = time.time() if now is None else float(now)
+        t = time.monotonic() if now is None else float(now)
         until = t + duration
         if until > self._grace_until:
             self._grace_until = until
 
     def observe(self, reachable: bool, now: float | None = None):
-        t = time.time() if now is None else float(now)
+        t = time.monotonic() if now is None else float(now)
         if reachable:
             self.misses = 0
             if not self.connected:
@@ -373,41 +406,110 @@ class HidWorker(threading.Thread):
         self._stop = False
         self._linked = False
         self._ever_linked = False  # only fire on_link(True) after a prior loss
+        r_fd, w_fd = os.pipe()
+        os.set_blocking(r_fd, False)
+        os.set_blocking(w_fd, False)
+        self._wake_r = r_fd
+        self._wake_w = w_fd
+
+    def _wake(self):
+        try:
+            os.write(self._wake_w, b"\x01")
+        except OSError:
+            pass
+
+    def _clear_wake(self):
+        try:
+            while True:
+                if not os.read(self._wake_r, 64):
+                    break
+        except OSError:
+            pass
 
     def submit(self, hx, done_cb=None):
         self.q.put((hx.replace(" ", "").lower(), done_cb))
+        self._wake()
 
     def stop(self):
         self._stop = True
         self.q.put(None)  # wake the queue
+        self._wake()
+
+    def _flush_queue_gone(self):
+        while True:
+            try:
+                item = self.q.get_nowait()
+            except queue.Empty:
+                return
+            if item is None:
+                continue
+            hx, done_cb = item
+            self.idle_add(self.log_cb, hx, "GONE", None)
+            if done_cb:
+                self.idle_add(done_cb, "GONE", None)
 
     def run(self):
-        while not self._stop:
-            if self.fd is None:
-                if not self._ensure_open():
-                    time.sleep(self.RESCAN_S)
+        next_boom = 0.0
+        try:
+            while not self._stop:
+                if self.fd is None:
+                    if not self._ensure_open():
+                        self._flush_queue_gone()
+                        try:
+                            r, _, _ = select.select(
+                                [self._wake_r], [], [], self.RESCAN_S)
+                            if r:
+                                self._clear_wake()
+                        except (OSError, ValueError):
+                            time.sleep(self.RESCAN_S)
+                        continue
+                # Process any already-queued commands first.
+                try:
+                    item = self.q.get_nowait()
+                except queue.Empty:
+                    item = None
+                else:
+                    if item is None:
+                        if self._stop:
+                            break
+                        continue
+                    hx, done_cb = item
+                    status, reply = self._transact(hx)
+                    if status == "GONE":
+                        self._handle_gone()
+                    self.idle_add(self.log_cb, hx, status, reply)
+                    if done_cb:
+                        self.idle_add(done_cb, status, reply)
+                    if status == "GONE":
+                        continue
                     continue
-            try:
-                item = self.q.get(timeout=self.MIC_POLL_S)
-            except queue.Empty:
-                if not self._drain():
-                    continue
-            else:
-                if item is None:
-                    if self._stop:
-                        break
-                    continue
-                hx, done_cb = item
-                status, reply = self._transact(hx)
-                if status == "GONE":
+
+                now = time.monotonic()
+                wait = max(0.0, next_boom - now) if next_boom else 0.0
+                if wait == 0.0:
+                    self._poll_boom()
+                    if self.fd is None:
+                        continue
+                    next_boom = time.monotonic() + self.MIC_POLL_S
+                    wait = self.MIC_POLL_S
+                try:
+                    r, _, _ = select.select(
+                        [self.fd, self._wake_r], [], [], wait)
+                except (OSError, ValueError):
                     self._handle_gone()
-                self.idle_add(self.log_cb, hx, status, reply)
-                if done_cb:
-                    self.idle_add(done_cb, status, reply)
-                if status == "GONE":
                     continue
-            self._poll_boom()
-        self._close_fd()
+                if self._wake_r in r:
+                    self._clear_wake()
+                if self.fd in r:
+                    if not self._drain():
+                        continue
+        finally:
+            self._close_fd()
+            for pfd in (self._wake_r, self._wake_w):
+                try:
+                    os.close(pfd)
+                except OSError:
+                    pass
 
     def _ensure_open(self) -> bool:
         path = self.path

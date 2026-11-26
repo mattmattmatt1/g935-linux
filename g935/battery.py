@@ -389,14 +389,16 @@ def session_full_runtime_h(session, min_hours=MERGE_MIN_HOURS, min_pct=MERGE_MIN
     return 100.0 * dt_h / dpct
 
 
-def _filter_runtime_outliers(runtimes, rated_runtime_h):
+def _filter_runtime_outliers(runtimes, rated_runtime_h,
+                             lo_mult=RUNTIME_OUTLIER_LO,
+                             hi_mult=RUNTIME_OUTLIER_HI):
     """Drop wild extrapolations that are implausible vs the rated spec."""
     if not runtimes:
         return []
     if not rated_runtime_h or rated_runtime_h <= 0:
         return list(runtimes)
-    lo = rated_runtime_h * RUNTIME_OUTLIER_LO
-    hi = rated_runtime_h * RUNTIME_OUTLIER_HI
+    lo = rated_runtime_h * lo_mult
+    hi = rated_runtime_h * hi_mult
     kept = [r for r in runtimes if lo <= r <= hi]
     return kept if kept else list(runtimes)  # if all outliers, keep raw
 
@@ -952,14 +954,20 @@ def session_full_charge_h(sit, min_minutes=CHARGE_MIN_MINUTES,
 
 
 def learned_full_charge_h(recent, n_recent=N_RECENT_CHARGES,
-                          rated_charge_h=None):
+                          rated_charge_h=None, merged_sits=None):
     """(median empty-to-full hours, n) from rest-before/after charge sits."""
+    sits = (
+        merged_sits if merged_sits is not None
+        else merge_charge_sits(extract_charge_sits(recent))
+    )
     runtimes = []
-    for sit in merge_charge_sits(extract_charge_sits(recent)):
+    for sit in sits:
         h = session_full_charge_h(sit)
         if h is not None:
             runtimes.append(h)
-    runtimes = _filter_runtime_outliers(runtimes, rated_charge_h)
+    runtimes = _filter_runtime_outliers(
+        runtimes, rated_charge_h,
+        lo_mult=CHARGE_OUTLIER_LO, hi_mult=CHARGE_OUTLIER_HI)
     if not runtimes:
         return None, 0
     used = runtimes[-n_recent:]
@@ -974,10 +982,13 @@ def remaining_charge_h(start_pct, elapsed_s, full_charge_h):
     return max(0.0, need - max(0.0, elapsed_s) / 3600.0)
 
 
-def charge_list_rows(recent, rated_charge_h, limit=8):
+def charge_list_rows(recent, rated_charge_h, limit=8, merged_sits=None):
     """Newest-first charge sits for the Battery Health list."""
     rows = []
-    sits = merge_charge_sits(extract_charge_sits(recent))
+    sits = (
+        merged_sits if merged_sits is not None
+        else merge_charge_sits(extract_charge_sits(recent))
+    )
     for sit in reversed(sits[-limit * 2:]):
         full = session_full_charge_h(sit)
         dpct = None
@@ -1092,11 +1103,12 @@ def runtime_analysis(segments, recent, rated_runtime_h, mv=None, settings=None):
 
     rated_charge_h = float(
         settings.get("rated_charge_h", HEALTH_DEFAULTS["rated_charge_h"]))
-    learned_charge_h, n_charges = learned_full_charge_h(
-        recent, rated_charge_h=rated_charge_h)
-    charge_rows = charge_list_rows(recent, rated_charge_h)
-    open_charge = None
     merged_charges = merge_charge_sits(extract_charge_sits(recent))
+    learned_charge_h, n_charges = learned_full_charge_h(
+        recent, rated_charge_h=rated_charge_h, merged_sits=merged_charges)
+    charge_rows = charge_list_rows(
+        recent, rated_charge_h, merged_sits=merged_charges)
+    open_charge = None
     if merged_charges and merged_charges[-1].get("open"):
         open_charge = merged_charges[-1]
     remain_charge = None
@@ -1151,9 +1163,21 @@ class HealthTracker:
     rail). SoC % and peak OCV use last resting cell voltage instead.
     """
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, auto_save_scrub=True):
         self.path = path or health_file()
-        data = self._load()
+        self._file_sig = None
+        self._apply_loaded(self._load())
+        if self._peaks_scrubbed and auto_save_scrub:
+            self.save()
+
+    def _stat_sig(self):
+        try:
+            st = os.stat(self.path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _apply_loaded(self, data):
         self.settings = data["settings"]
         self.segments = data["segments"]
         full = int(self.settings.get("full_mv", HEALTH_DEFAULTS["full_mv"]))
@@ -1166,15 +1190,22 @@ class HealthTracker:
         self.cur_mvs = []
         self.pending_flip = 0
         self.last_t = 0
-        self.last_recent_t = 0
+        self.last_recent_t = int(self.recent[-1][0]) if self.recent else 0
         self.last_save = time.time()
         self.dirty = False
         self.last_rest_mv = self._infer_last_rest()
         # After a charge that only saw rail voltages, capture peak from rest
         self.pending_peak_from_rest = False
         self.post_charge_mvs = []
-        if self._peaks_scrubbed:
-            self.save()
+        self._file_sig = self._stat_sig()
+
+    def reload_if_changed(self) -> bool:
+        """Reload health.json if another process updated it on disk."""
+        sig = self._stat_sig()
+        if sig == self._file_sig:
+            return False
+        self._apply_loaded(self._load())
+        return True
 
     def _full_mv(self):
         return int(self.settings.get("full_mv", HEALTH_DEFAULTS["full_mv"]))
@@ -1229,6 +1260,18 @@ class HealthTracker:
             if self.pending_flip >= SEG_DEBOUNCE:
                 self.close_segment("flag flip")
                 self._open(seg_type, t, mv)
+            else:
+                # Hold off mutating cur_mvs / mv_end during an unconfirmed
+                # flag flip so a plug-in rail spike never poisons the closing
+                # discharge segment.
+                if t - self.last_recent_t >= RECENT_DECIM_S:
+                    self.recent.append([int(t), int(mv), 1 if charging else 0])
+                    del self.recent[:-RECENT_MAX]
+                    self.last_recent_t = t
+                    self.dirty = True
+                if self.dirty and t - self.last_save > SAVE_EVERY_S:
+                    self.save()
+                return
         else:
             self.pending_flip = 0
 
@@ -1373,10 +1416,11 @@ class HealthTracker:
             "peak_charge_mv": self.peaks,
             "recent": self.recent,
         }
-        tmp = self.path + ".tmp"
+        tmp = f"{self.path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, self.path)
+        self._file_sig = self._stat_sig()
         self.last_save = time.time()
         self.dirty = False
 

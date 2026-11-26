@@ -6,6 +6,7 @@ when possible and fall back to a clean palette.
 """
 from __future__ import annotations
 
+import datetime
 import math
 import time
 
@@ -428,10 +429,13 @@ class ChargeHistoryChart(_ChartBase):
             _pango_fit(cr, label, label_x, label_y,
                        size=10, color=pal["text"], align="right")
 
-        # Midnight ticks for each day in the window.
-        midnight = time.mktime(time.localtime(t0)[:3] + (0, 0, 0, 0, 0, -1))
+        # Midnight ticks for each local calendar day in the window (DST-safe).
+        lt0 = time.localtime(t0)
+        day = datetime.date(lt0.tm_year, lt0.tm_mon, lt0.tm_mday)
+        midnight = time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 0, -1))
         if midnight < t0:
-            midnight += 86400
+            day += datetime.timedelta(days=1)
+            midnight = time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 0, -1))
         while midnight <= t1:
             x = box["x"] + (midnight - t0) / span * box["w"]
             _set_source(cr, pal["grid"], 0.2)
@@ -442,7 +446,8 @@ class ChargeHistoryChart(_ChartBase):
             label = time.strftime("%a %d", time.localtime(midnight)).replace(" 0", " ")
             _pango_fit(cr, label, x + 4, box["y"] + box["h"] + 16,
                        size=8.5, color=pal["muted"])
-            midnight += 86400
+            day += datetime.timedelta(days=1)
+            midnight = time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 0, -1))
 
         self._legend_swatch(
             cr, box["x"] + box["w"] - 150, box["y"] + 10,

@@ -63,16 +63,26 @@ class AudioControl:
             threading.Thread(target=self._subscribe_loop, daemon=True).start()
 
     @classmethod
-    def _run(cls, *args):
+    def _run_checked(cls, *args) -> tuple[bool, str]:
         try:
-            return subprocess.run(["pactl", *args], capture_output=True,
-                                  text=True, env=cls._ENV).stdout
-        except FileNotFoundError:
-            return ""
+            res = subprocess.run(
+                ["pactl", *args], capture_output=True, text=True,
+                timeout=2, env=cls._ENV)
+            return res.returncode == 0, res.stdout or ""
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return False, ""
 
-    def _list(self, kind):
+    @classmethod
+    def _run(cls, *args):
+        _ok, out = cls._run_checked(*args)
+        return out
+
+    def _list_checked(self, kind) -> tuple[bool, list[tuple[str, str]]]:
+        ok, out = self._run_checked("list", kind)
+        if not ok:
+            return False, []
         devs, name = [], None
-        for line in self._run("list", kind).splitlines():
+        for line in out.splitlines():
             line = line.strip()
             if line.startswith("Name:"):
                 name = line.split(":", 1)[1].strip()
@@ -80,18 +90,24 @@ class AudioControl:
                 if "easyeffects" not in name and not name.endswith(".monitor"):
                     devs.append((name, line.split(":", 1)[1].strip()))
                 name = None
+        return True, devs
+
+    def _list(self, kind):
+        _ok, devs = self._list_checked(kind)
         return devs
 
-    def list_sinks(self):   return self._list("sinks")
-    def list_sources(self): return self._list("sources")
-    def default_sink(self):   return self._run("get-default-sink").strip()
-    def default_source(self): return self._run("get-default-source").strip()
+    def list_sinks(self):           return self._list("sinks")
+    def list_sinks_checked(self):   return self._list_checked("sinks")
+    def list_sources(self):         return self._list("sources")
+    def default_sink(self):         return self._run("get-default-sink").strip()
+    def default_source(self):       return self._run("get-default-source").strip()
     def set_default_sink(self, name):   self._run("set-default-sink", name)
     def set_default_source(self, name): self._run("set-default-source", name)
 
     def get_volume(self, kind, name):
-        m = re.search(r"(\d+)%", self._run(f"get-{kind}-volume", name))
-        return int(m.group(1)) if m else None
+        vals = [int(v) for v in re.findall(
+            r"(\d+)%", self._run(f"get-{kind}-volume", name))]
+        return round(sum(vals) / len(vals)) if vals else None
 
     def set_volume(self, kind, name, pct):
         # %-form applies to all channels (some sinks are 8ch)

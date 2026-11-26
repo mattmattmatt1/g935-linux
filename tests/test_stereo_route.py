@@ -69,6 +69,51 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(fl.endswith(":playback_FL"))
         self.assertTrue(fr.endswith(":playback_2"))
 
+    def test_parse_links_with_spaces_in_port_name(self):
+        text = (
+            "ee_soe_output_level:output_FL\n"
+            "  |-> G935 Gaming Headset:playback_FL\n"
+            "G935 Gaming Headset:playback_FL\n"
+            "  |<- ee_soe_output_level:output_FL\n"
+            "G935 Gaming Headset:playback_FR\n"
+        )
+        g = parse_pw_link_list(text)
+        self.assertIn(
+            "G935 Gaming Headset:playback_FL",
+            g["ee_soe_output_level:output_FL"],
+        )
+        st = analyze_stereo(
+            g, ["G935 Gaming Headset:playback_FL", "G935 Gaming Headset:playback_FR"])
+        self.assertTrue(st.broken)
+        self.assertEqual(
+            st.missing,
+            [("ee_soe_output_level:output_FR", "G935 Gaming Headset:playback_FR")],
+        )
+
+    def test_find_ports_ignores_surround_numeric_channels(self):
+        ports = [
+            "Logitech_G935:playback_FL",
+            "Logitech_G935:playback_3",
+        ]
+        fl, fr = find_g935_playback_ports(ports)
+        self.assertEqual(fl, "Logitech_G935:playback_FL")
+        self.assertIsNone(fr)
+
+    def test_notify_user_with_id_uses_print_id(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from g935.stereo_route import notify_user_with_id
+
+        with mock.patch("g935.stereo_route.shutil.which", return_value="/usr/bin/notify-send"), \
+             mock.patch("g935.stereo_route.subprocess.run",
+                        return_value=SimpleNamespace(returncode=0, stdout="42\n", stderr="")) as run:
+            ok, nid = notify_user_with_id("Title", "Body", urgency="critical")
+        self.assertTrue(ok)
+        self.assertEqual(nid, 42)
+        cmd = run.call_args[0][0]
+        self.assertIn("--print-id", cmd)
+        self.assertFalse(any(a.startswith("--replace-id=") for a in cmd))
+
 
 class AnalyzeTests(unittest.TestCase):
     def test_broken_detects_missing_fr(self):
